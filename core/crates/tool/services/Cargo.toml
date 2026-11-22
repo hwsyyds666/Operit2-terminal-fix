@@ -1,0 +1,63 @@
+[package]
+name = "operit-tools"
+version = "2.0.0-preview.17"
+edition.workspace = true
+license.workspace = true
+publish = true
+description = "Tool execution, package management, MCP, and skill integrations for Operit."
+readme = "README.md"
+repository = "https://github.com/AAswordman/Operit2"
+documentation = "https://docs.rs/operit-tools"
+
+[features]
+default = ["javascript"]
+javascript = []
+
+[dependencies]
+operit-vfs = { version = "0.1.0", path = "../../foundation/vfs" }
+async-trait.workspace = true
+aes = "0.8"
+base64.workspace = true
+chrono.workspace = true
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+futures-util.workspace = true
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+json5.workspace = true
+md-5 = "0.10"
+operit-host-api = { version = "0.1.0", path = "../../foundation/host-api" }
+operit-edge-contract = { path = "../../../../edge/sdk/contract" }
+operit-link = { path = "../../foundation/link" }
+operit-rslink-runtime = { path = "../../rslink/runtime" }
+operit-model = { version = "2.0.0-preview.17", path = "../../foundation/model" }
+operit-plugin-sdk = { version = "2.0.0-preview.17", path = "../../plugin/sdk" }
+operit-route-macros = { path = "../../node/route-macros" }
+operit-store = { version = "0.1.0", path = "../../persistence/store" }
+operit-util = { version = "2.0.0-preview.17", path = "../../foundation/util" }
+regex.workspace = true
+serde.workspace = true
+serde_bytes = "0.11"
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }
+url = "2"
+uuid.workspace = true
+zip.workspace = true
+
+[build-dependencies]
+syn = { version = "2", features = ["full", "visit"] }
+operit-plugin-sdk-codegen = { version = "=2.0.0-preview.17", path = "../../plugin/codegen" }
+
+[dev-dependencies]
+syn = { version = "2", features = ["full", "visit"] }
+operit-js-bridge = { path = "../../plugin/javascript-bridge" }
+
+[[test]]
+name = "native_filesystem_boundary"
+path = "build_support/native_filesystem.rs"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+operit-host-native-terminal = { path = "../../../../hosts/common/operit-host-native-terminal" }
+operit-host-native-storage = { path = "../../../../hosts/common/operit-host-native-storage" }
+operit-host-native-scheduler = { path = "../../../../hosts/common/operit-host-native-scheduler" }
+operit-host-native-filesystem = { path = "../../../../hosts/common/operit-host-native-filesystem" }

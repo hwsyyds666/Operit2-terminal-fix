@@ -1,0 +1,633 @@
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use crate::tools::packTool::RuntimePackageManager::RuntimePackageManager;
+use crate::tools::AIToolHandler::AIToolHandler;
+use operit_plugin_sdk::execution_result::decode_js_execution_result_value;
+pub use operit_plugin_sdk::javascript::{
+    JsExecutionEngine, JsExecutionProvider, JsPackageExecutor, JsPackageRuntime,
+    JsPackageToolCallRequest, JsPackageToolCallResult, ToolPkgMainRegistrationCapture,
+};
+use operit_plugin_sdk::javascript::{
+    JsToolNameResolutionRequest, JsToolPkgIpcRequest, JsToolPkgResourceRequest,
+};
+use operit_util::LocaleUtils::LocaleUtils;
+use operit_util::OperitPaths;
+use operit_util::AppLogger::AppLogger;
+use operit_host_api::HostRuntimeTaskSchedulerHost;
+use serde_json::Value;
+
+const TOOLPKG_IPC_DISPATCH_FUNCTION_NAME: &str = "__operit_toolpkg_runtime_dispatch__";
+const TOOLPKG_IPC_DISPATCH_FUNCTION_SOURCE: &str = r#"
+async function(params) {
+    var payload = params.__operit_toolpkg_ipc_payload;
+    var channel = params.__operit_toolpkg_ipc_channel;
+    if (channel === '$route') return await globalThis.__operitInvokeToolPkgRouteLocal(payload);
+    return await globalThis.__operitInvokeToolPkgIpcLocal(
+        channel, payload, params.__operit_toolpkg_ipc_caller_context_key
+    );
+}
+"#;
+
+/// Adapts the Operit package manager to the SDK JavaScript package contract.
+#[derive(Clone)]
+pub struct PackageManagerJsRuntime {
+    package_manager: Arc<std::sync::Mutex<RuntimePackageManager>>,
+    tool_handler: AIToolHandler,
+}
+
+impl PackageManagerJsRuntime {
+    /// Creates an SDK package runtime backed by the shared package manager.
+    pub fn new(
+        package_manager: Arc<std::sync::Mutex<RuntimePackageManager>>,
+        tool_handler: AIToolHandler,
+    ) -> Self {
+        Self {
+            package_manager,
+            tool_handler,
+        }
+    }
+}
+
+impl JsPackageRuntime for PackageManagerJsRuntime {
+    /// Returns the current host language for package JavaScript.
+    fn package_language(&self) -> Result<String, String> {
+        let host = self.tool_handler.systemOperationHost()
+            .ok_or("SystemOperationHost is required to resolve system language")?;
+        let language = host.getSystemLanguageCode().map_err(|error| error.to_string())?;
+        let language = LocaleUtils::resolve_supported_language_code(&language);
+        let language = language.trim();
+        if language.is_empty() {
+            return Err("Host returned an empty package language".to_string());
+        }
+        Ok(language.to_string())
+    }
+
+    /// Selects one enabled executable declaration and its exact owning runtime under one short-lived lock.
+    fn select_tool(
+        &self,
+        package_name: &str,
+        function_name: &str,
+    ) -> Result<operit_plugin_sdk::javascript::JsPackageToolSelection, String> {
+        let manager = self
+            .package_manager
+            .lock()
+            .map_err(|error| error.to_string())?;
+        manager.packageRegistryReadiness().require_ready()?;
+        if !manager.isPackageEnabled(package_name) {
+            return Err(format!("Package is disabled: {package_name}"));
+        }
+        let definition = manager.selectPackageTool(package_name, function_name)?;
+        Ok(operit_plugin_sdk::javascript::JsPackageToolSelection {
+            api_version: manager.packageApiVersion(package_name)
+                .ok_or_else(|| format!("Package not registered: {package_name}"))?.to_string(),
+            definition,
+            active_state_id: manager.getActivePackageStateId(package_name),
+            toolpkg_runtime: manager.resolveToolPkgSubpackageRuntimeInternal(package_name),
+        })
+    }
+
+    /// Creates the owned package engine outside the registry lock so native context authentication can inspect the real catalog.
+    fn toolpkg_execution_engine(
+        &self,
+        context_key: &str,
+        container_package_name: &str,
+    ) -> Result<Arc<dyn JsExecutionEngine>, String> {
+        let engines = self
+            .package_manager
+            .lock()
+            .map_err(|error| error.to_string())?
+            .toolPkgManager()
+            .clone();
+        // Only the Arc-backed engine registry crosses the lock boundary. Engine
+        // creation can re-enter the package catalog, so never hold its lock here.
+        engines.getToolPkgExecutionEngine(context_key, container_package_name)
+    }
+}
+
+/// Materializes one ToolPkg resource through the concrete package manager.
+#[allow(non_snake_case)]
+pub fn materializeToolPkgResource(
+    toolHandler: &AIToolHandler,
+    request: JsToolPkgResourceRequest,
+) -> Result<String, String> {
+    let target = requiredText(
+        &request.package_name_or_subpackage_id,
+        "ToolPkg resource target",
+    )?;
+    let resourceKey = requiredText(&request.resource_key, "ToolPkg resource key")?;
+    let packageManager = toolHandler.getOrCreatePackageManager();
+    let guard = packageManager
+        .lock()
+        .expect("package manager mutex poisoned");
+    let outputFileName = match request.output_file_name {
+        Some(value) => requiredText(&value, "ToolPkg resource output file name")?,
+        None => guard
+            .getToolPkgResourceOutputFileName(&target, &resourceKey, true)
+            .ok_or_else(|| {
+                format!("ToolPkg resource output file name is not declared: {target}/{resourceKey}")
+            })?,
+    };
+    let safeName = outputFileName
+        .rsplit(['/', '\\'])
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "ToolPkg resource output file name is invalid".to_string())?;
+    let filesystem = toolHandler.getContext().vfs()?;
+    let outputDir = OperitPaths::toolPkgResourceExportsDir(request.internal)?;
+    let outputDirPath = outputDir
+        .to_str()
+        .ok_or_else(|| "ToolPkg resource export directory is not valid UTF-8".to_string())?;
+    filesystem
+        .makeDirectory(outputDirPath, true)
+        .map_err(|error| error.to_string())?;
+    let outputFile = outputDir.join(safeName);
+
+    let copied = if guard.getToolPkgContainerRuntime(&target).is_some() {
+        guard.copyToolPkgResourceToFile(&target, &resourceKey, &outputFile)
+    } else if let Some(runtime) = guard.resolveToolPkgSubpackageRuntimeInternal(&target) {
+        guard.copyToolPkgResourceToFileBySubpackageId(
+            &runtime.subpackageId,
+            &resourceKey,
+            &outputFile,
+            true,
+        )
+    } else if guard
+        .findPreferredPackageNameForSubpackageId(&target, true)
+        .is_some()
+    {
+        guard.copyToolPkgResourceToFileBySubpackageId(&target, &resourceKey, &outputFile, true)
+    } else {
+        return Err(format!("ToolPkg resource target not found: {target}"));
+    };
+    if !copied {
+        return Err(format!(
+            "ToolPkg resource not found: {target}/{resourceKey}"
+        ));
+    }
+    let storageDirectory = if request.internal {
+        OperitPaths::RUNTIME_TOOLPKG_RESOURCE_EXPORTS_INTERNAL_DIR_PATH
+    } else {
+        OperitPaths::RUNTIME_TOOLPKG_RESOURCE_EXPORTS_DIR_PATH
+    };
+    let relativeDirectory = storageDirectory
+        .strip_prefix(operit_util::RuntimeStorageLayout::RUNTIME_ROOT_PATH_PREFIX)
+        .expect("ToolPkg exports must belong to runtime storage");
+    let exportRoot =
+        operit_vfs::VfsPath::joinVfsPath("/operitapp/data", relativeDirectory)?;
+    operit_vfs::VfsPath::joinVfsPath(&exportRoot, safeName)
+}
+
+/// Resolves one JavaScript tool name through concrete package state.
+#[allow(non_snake_case)]
+pub fn resolveJsToolName(
+    toolHandler: &AIToolHandler,
+    request: JsToolNameResolutionRequest,
+) -> Result<String, String> {
+    let toolName = requiredText(&request.tool_name, "Tool name")?;
+    if toolName.contains(':') {
+        return Ok(toolName);
+    }
+    let packageManager = toolHandler.getOrCreatePackageManager();
+    let guard = packageManager
+        .lock()
+        .expect("package manager mutex poisoned");
+    let packageName = match (request.package_name, request.subpackage_id) {
+        (Some(packageName), None) => {
+            let packageName = requiredText(&packageName, "Package name")?;
+            if guard.getPackageTools(&packageName).is_none() {
+                return Err(format!("Package not found: {packageName}"));
+            }
+            packageName
+        }
+        (None, Some(subpackageId)) => {
+            let subpackageId = requiredText(&subpackageId, "ToolPkg subpackage id")?;
+            guard
+                .findPreferredPackageNameForSubpackageId(&subpackageId, request.prefer_imported)
+                .ok_or_else(|| format!("ToolPkg subpackage not found: {subpackageId}"))?
+        }
+        (None, None) => return Ok(toolName),
+        (Some(_), Some(_)) => {
+            return Err("Tool resolution accepts either package_name or subpackage_id".to_string())
+        }
+    };
+    Ok(format!("{packageName}:{toolName}"))
+}
+
+/// Captures non-overlapping target phases using one Host monotonic clock.
+struct IpcTargetTiming {
+    enabled: bool,
+    scheduler: Arc<dyn HostRuntimeTaskSchedulerHost>,
+    trace_id: String,
+    started: u64,
+    previous: u64,
+    phases: Vec<(&'static str, u64)>,
+}
+
+impl IpcTargetTiming {
+    /// Captures a phase boundary only while IPC timing is enabled.
+    fn mark(&mut self, phase: &'static str) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let now = self.scheduler.monotonicTimeMillis().map_err(|error| error.to_string())?;
+        self.phases.push((phase, now.saturating_sub(self.previous)));
+        self.previous = now;
+        Ok(())
+    }
+}
+
+/// Invokes one IPC target with opt-in target and JavaScript stage diagnostics.
+#[allow(non_snake_case)]
+pub async fn invokeToolPkgIpc(
+    toolHandler: &AIToolHandler,
+    request: JsToolPkgIpcRequest,
+) -> Result<Value, String> {
+    let scheduler = toolHandler.getContext().hostRuntimeTaskSchedulerHost
+        .ok_or("HostRuntimeTaskSchedulerHost is required for ToolPkg IPC timing")?;
+    let enabled = std::env::var_os("OPERIT_PROFILE_COMPOSE_STAGES").is_some();
+    let started = if enabled {
+        scheduler.monotonicTimeMillis().map_err(|error| error.to_string())?
+    } else {
+        0
+    };
+    let mut timing = IpcTargetTiming {
+        enabled,
+        scheduler,
+        trace_id: if enabled { uuid::Uuid::new_v4().simple().to_string() } else { String::new() },
+        started,
+        previous: started,
+        phases: Vec::new(),
+    };
+    let identity = enabled.then(|| (request.package_target.clone(), request.channel.clone()));
+    let result = invokeToolPkgIpcMeasured(toolHandler, request, &mut timing).await;
+    if let Some((package, channel)) = identity {
+        timing.mark("finishMs")?;
+        let phases = timing.phases.iter()
+            .map(|(phase, elapsed)| format!("{phase}={elapsed}"))
+            .collect::<Vec<_>>().join(" ");
+        if result.is_ok() {
+            eprintln!(
+                "event=compose_ipc_timing kind=target traceId={} operation={} wallMillis={} elapsedMs={} {}",
+                timing.trace_id, channel,
+                operit_host_api::TimeUtils::currentTimeMillis(),
+                timing.previous.saturating_sub(timing.started), phases,
+            );
+        }
+        if let Err(error) = &result {
+            AppLogger::e("ToolPkg", &format!(
+                "event=toolpkg_ipc_target traceId={} package={} channel={} elapsedMs={} outcome=error {} error={error}",
+                timing.trace_id, package, channel, timing.previous.saturating_sub(timing.started), phases,
+            ));
+        }
+    }
+    result
+}
+
+/// Executes the owned target request while exposing only timing boundaries to its observer.
+#[allow(non_snake_case)]
+async fn invokeToolPkgIpcMeasured(
+    toolHandler: &AIToolHandler,
+    request: JsToolPkgIpcRequest,
+    timing: &mut IpcTargetTiming,
+) -> Result<Value, String> {
+    let packageTarget = requiredText(&request.package_target, "ToolPkg IPC package target")?;
+    let channel = requiredText(&request.channel, "ToolPkg IPC channel")?;
+    let requestedRuntime = request
+        .target_runtime
+        .map(|value| value.trim().to_ascii_lowercase());
+    let targetContextKey = match request.target_context_key {
+        Some(value) => requiredText(&value, "ToolPkg IPC target context key")?,
+        None if requestedRuntime
+            .as_deref()
+            .is_none_or(|value| value == "main") =>
+        {
+            format!("toolpkg_main:{packageTarget}")
+        }
+        None => {
+            return Err(format!(
+                "ToolPkg IPC target context key is required for runtime {}",
+                requestedRuntime.as_deref().unwrap_or_default()
+            ))
+        }
+    };
+    let inferredRuntime = inferToolPkgRuntime(&targetContextKey)?;
+    let targetRuntime = match requestedRuntime {
+        Some(value) => {
+            if value != inferredRuntime {
+                return Err(format!(
+                    "ToolPkg IPC runtime does not match context key: {value} != {inferredRuntime}"
+                ));
+            }
+            value
+        }
+        None => inferredRuntime,
+    };
+    let mainContextKey = format!("toolpkg_main:{packageTarget}");
+    let isMainTarget = targetRuntime == "main";
+    if isMainTarget && !targetContextKey.eq_ignore_ascii_case(&mainContextKey) {
+        return Err(format!(
+            "ToolPkg IPC main context key is invalid: {targetContextKey}"
+        ));
+    }
+    // Accepted main aliases must resolve to the single container-owned realm.
+    let targetContextKey = if isMainTarget { mainContextKey } else { targetContextKey };
+    timing.mark("validationMs")?;
+    let (manager, scriptPath, scriptRead, publicMethod) = RuntimePackageManager::withReadyObserved(
+        toolHandler.getOrCreatePackageManager(),
+        |manager| {
+            let containerRuntime = manager
+                .getToolPkgContainerRuntime(&packageTarget)
+                .ok_or_else(|| format!("ToolPkg container not found: {packageTarget}"))?;
+            if !manager.isPackageEnabled(&packageTarget) {
+                return Err(format!("ToolPkg package is disabled: {packageTarget}"));
+            }
+            let mut publicMethod = None;
+            if let Some(callerName) = request.dependency_caller.as_deref() {
+                if !isMainTarget || callerName == packageTarget {
+                    return Err(
+                        "Dependency APIs require a distinct prerequisite main runtime".to_string(),
+                    );
+                }
+                let caller = manager
+                    .getToolPkgContainerRuntime(callerName)
+                    .ok_or_else(|| format!("Dependency caller not found: {callerName}"))?;
+                publicMethod = Some(validateDependencyCall(
+                    &caller,
+                    &containerRuntime,
+                    manager.isPackageEnabled(callerName),
+                    manager.isPackageEnabled(&packageTarget),
+                    &channel,
+                )?);
+            }
+            let scriptPath = if isMainTarget {
+                requiredText(&containerRuntime.mainEntry, "ToolPkg main entry")?
+            } else {
+                String::new()
+            };
+            let scriptRead = manager.mainScript(containerRuntime);
+            Ok((
+                manager.toolPkgManager().clone(),
+                scriptPath,
+                scriptRead,
+                publicMethod,
+            ))
+        },
+        |phase| timing.mark(phase),
+    )
+    .await?;
+    let (engine, _lease) = if isMainTarget {
+        let (engine, lease) = manager
+            .leaseToolPkgMainExecutionEngine(&packageTarget)?;
+        (engine, Some(lease))
+    } else {
+        let engine = manager
+            .findToolPkgExecutionEngine(&targetContextKey, &packageTarget)
+            .ok_or_else(|| format!("ToolPkg runtime is not active: {targetContextKey}"))?;
+        (engine, None)
+    };
+    timing.mark("engineAcquireMs")?;
+    let script = if isMainTarget {
+        scriptRead.await?
+    } else {
+        String::new()
+    };
+    timing.mark("scriptReadMs")?;
+    if !manager
+        .findToolPkgExecutionEngine(&targetContextKey, &packageTarget)
+        .is_some_and(|current| Arc::ptr_eq(&current, &engine))
+    {
+        return Err("ToolPkg execution context has been released or replaced".to_string());
+    }
+    timing.mark("engineValidateMs")?;
+    let mut params = BTreeMap::new();
+    if timing.enabled {
+        params.insert("__operit_ipc_trace_id".to_string(), Value::String(timing.trace_id.clone()));
+    }
+    params.insert(
+        "__operit_ui_package_name".to_string(),
+        Value::String(packageTarget.clone()),
+    );
+    params.insert(
+        "toolPkgId".to_string(),
+        Value::String(packageTarget.clone()),
+    );
+    params.insert(
+        "containerPackageName".to_string(),
+        Value::String(packageTarget),
+    );
+    params.insert(
+        "__operit_execution_context_key".to_string(),
+        Value::String(targetContextKey),
+    );
+    params.insert(
+        "__operit_toolpkg_runtime_kind".to_string(),
+        Value::String(targetRuntime),
+    );
+    params.insert(
+        "__operit_script_screen".to_string(),
+        Value::String(scriptPath),
+    );
+    params.insert(
+        "__operit_inline_function_name".to_string(),
+        Value::String(TOOLPKG_IPC_DISPATCH_FUNCTION_NAME.to_string()),
+    );
+    params.insert(
+        "__operit_inline_function_source".to_string(),
+        Value::String(TOOLPKG_IPC_DISPATCH_FUNCTION_SOURCE.trim().to_string()),
+    );
+    params.insert(
+        "__operit_toolpkg_ipc_channel".to_string(),
+        Value::String(channel),
+    );
+    params.insert(
+        "__operit_toolpkg_ipc_caller_context_key".to_string(),
+        Value::String(request.caller_context_key.trim().to_string()),
+    );
+    let functionName = match publicMethod {
+        Some(method) => {
+            params.remove("__operit_inline_function_name");
+            params.remove("__operit_inline_function_source");
+            if let Some(source) = method.functionSource {
+                params.insert(
+                    "__operit_inline_function_name".to_string(),
+                    Value::String(method.function.clone()),
+                );
+                params.insert(
+                    "__operit_inline_function_source".to_string(),
+                    Value::String(source),
+                );
+            }
+            params.insert("payload".to_string(), request.payload);
+            params.insert(
+                "callerPackage".to_string(),
+                Value::String(
+                    request
+                        .dependency_caller
+                        .clone()
+                        .ok_or_else(|| "Public API caller is required".to_string())?,
+                ),
+            );
+            method.function
+        }
+        None => {
+            params.insert("__operit_toolpkg_ipc_payload".to_string(), request.payload);
+            TOOLPKG_IPC_DISPATCH_FUNCTION_NAME.to_string()
+        }
+    };
+    timing.mark("paramsMs")?;
+    let execution = engine.execute_script_function_async(
+        script,
+        functionName,
+        params,
+        BTreeMap::new(),
+        None,
+        true,
+    );
+    let result = execution.await;
+    timing.mark("executeMs")?;
+    let result = result.map_err(|error| error.to_string())?;
+    let decoded = decode_js_execution_result_value(result.as_deref()).map_err(|error| error.to_string());
+    timing.mark("decodeMs")?;
+    decoded
+}
+
+/// Checks public dependency access against the authenticated caller and installed contracts.
+#[allow(non_snake_case)]
+fn validateDependencyCall(
+    caller: &operit_plugin_sdk::toolpkg::ToolPkgParser::ToolPkgContainerRuntime,
+    provider: &operit_plugin_sdk::toolpkg::ToolPkgParser::ToolPkgContainerRuntime,
+    callerEnabled: bool,
+    providerEnabled: bool,
+    method: &str,
+) -> Result<operit_plugin_sdk::toolpkg::ToolPkgParser::ToolPkgRegisteredFunctionHook, String> {
+    if !callerEnabled || !providerEnabled {
+        return Err("Dependency caller and provider must both be enabled".to_string());
+    }
+    let requirement = caller
+        .requires
+        .iter()
+        .chain(caller.optionalRequires.iter())
+        .find(|item| item.id == provider.packageName)
+        .ok_or_else(|| {
+            format!(
+                "{} does not declare dependency {}",
+                caller.packageName, provider.packageName
+            )
+        })?;
+    for (bound, minimum) in [
+        (&requirement.minVersion, true),
+        (&requirement.maxVersion, false),
+    ] {
+        if let Some(bound) = bound {
+            let comparison = operit_util::GithubReleaseUtil::GithubReleaseUtil::compareVersions(
+                &provider.version,
+                bound,
+            )?;
+            if (minimum && comparison < 0) || (!minimum && comparison > 0) {
+                return Err(format!(
+                    "Dependency version mismatch: {}",
+                    provider.packageName
+                ));
+            }
+        }
+    }
+    if provider.publicApi.is_none() {
+        return Err(format!(
+            "{} does not publish public_api",
+            provider.packageName
+        ));
+    }
+    provider
+        .publicApis
+        .iter()
+        .find(|item| item.id == method)
+        .cloned()
+        .ok_or_else(|| format!("Public API not found: {}/{method}", provider.packageName))
+}
+
+/// Resolves the ToolPkg runtime kind encoded by a context key.
+#[allow(non_snake_case)]
+fn inferToolPkgRuntime(contextKey: &str) -> Result<String, String> {
+    let normalized = contextKey.trim().to_ascii_lowercase();
+    if normalized.starts_with("toolpkg_main:") {
+        return Ok("main".to_string());
+    }
+    if normalized.starts_with("toolpkg_provider:") {
+        return Ok("provider".to_string());
+    }
+    if normalized.starts_with("toolpkg_compose:")
+        || normalized.starts_with("toolpkg_compose_dsl:")
+        || normalized.starts_with("toolpkg_xml_render:")
+    {
+        return Ok("ui".to_string());
+    }
+    if normalized.starts_with("toolpkg_sandbox:") {
+        return Ok("sandbox".to_string());
+    }
+    Err(format!(
+        "ToolPkg context key has an unknown runtime: {contextKey}"
+    ))
+}
+
+/// Returns one trimmed non-empty contract string.
+#[allow(non_snake_case)]
+fn requiredText(value: &str, fieldName: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{fieldName} is required"));
+    }
+    Ok(trimmed.to_string())
+}
+
+#[cfg(test)]
+mod dependency_api_tests {
+    use super::validateDependencyCall;
+    use operit_plugin_sdk::toolpkg::ToolPkgParser::{
+        ToolPkgContainerRuntime, ToolPkgManifestRequirement, ToolPkgRegisteredFunctionHook,
+    };
+
+    /// Verifies enabled state, declared version bounds, and explicit exports independently.
+    #[test]
+    fn enforces_public_dependency_contract() {
+        let mut caller = ToolPkgContainerRuntime {
+            packageName: "consumer".to_string(),
+            requires: vec![ToolPkgManifestRequirement {
+                id: "provider".to_string(),
+                minVersion: Some("1.0.0".to_string()),
+                maxVersion: Some("1.2.0".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut provider = ToolPkgContainerRuntime {
+            packageName: "provider".to_string(),
+            version: "1.1.0".to_string(),
+            publicApi: Some("api.ts".to_string()),
+            publicApis: vec![ToolPkgRegisteredFunctionHook {
+                id: "run".to_string(),
+                function: "runExport".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            validateDependencyCall(&caller, &provider, true, true, "run")
+                .unwrap()
+                .function,
+            "runExport"
+        );
+        assert!(validateDependencyCall(&caller, &provider, false, true, "run").is_err());
+        assert!(validateDependencyCall(&caller, &provider, true, false, "run").is_err());
+        assert!(validateDependencyCall(&caller, &provider, true, true, "private").is_err());
+        provider.version = "1.3.0".to_string();
+        assert!(validateDependencyCall(&caller, &provider, true, true, "run").is_err());
+        provider.version = "1.1.0".to_string();
+        provider.publicApi = None;
+        assert!(validateDependencyCall(&caller, &provider, true, true, "run").is_err());
+        provider.publicApi = Some("api.ts".to_string());
+        caller.requires.clear();
+        assert!(validateDependencyCall(&caller, &provider, true, true, "run").is_err());
+    }
+}

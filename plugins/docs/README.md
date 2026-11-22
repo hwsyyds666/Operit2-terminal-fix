@@ -1,0 +1,23 @@
+# Plugin Docs
+
+Notes for Operit2 plugin authors live here.
+
+- `package_builder/`: documentation resources included into the bundled `Operit 插件开发套件` Skill.
+- [Plugin creation workflow](package_builder/PLUGIN_CREATION_WORKFLOW.md): current authoring, path validation, installation, same-id updates, testing, and publication.
+
+- [ToolPkg v1 compatibility](V1_COMPATIBILITY.md): contract ownership, runtime adapters, checks, and remaining capability gaps.
+
+- [Prerequisite public APIs](PUBLIC_API.md): manifest-declared single-file clients, explicit public handlers, dependency calls, and the v1 workflow adapter.
+
+- [Device tools (v2)](DEVICE_TOOLS.md): execute canonical tools and plugin tools on an explicit Core device, with discovery, deadlines and cancellation.
+
+- [Edge hardware integration](edge-plugin-guide.md): native device calls, duplex channels, configuration and local input.
+- [Device scene protocol](edge-scene.md): saved display configuration, assets, limits and local animation.
+
+- [WebSocket (v2)](WEBSOCKET.md): engine-owned text connections through the shared networking Host, including ordered events and resource disposal.
+
+- [Waifu plugin](../packages/external/waifu/README.md): reusable sentence streaming, emotion images and prompt profiles through declared plugin dependencies.
+
+- [Plugin page navigation](UI_NAVIGATION.md): use `ctx.navigate` for application pages and workspace tabs, including composition-owned asynchronous callbacks.
+
+- [Tool approval presentation](TOOL_PERMISSIONS.md): pending approval hooks, request-scoped decisions, and the optional classic permission overlay.

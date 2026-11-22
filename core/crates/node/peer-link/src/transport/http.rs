@@ -1,0 +1,470 @@
+//! HTTP 全双工承载：一个持续响应体接收消息，POST 发送消息；不是 WS 回退。
+//! 连接标识仅用于关联 HTTP 请求，不作为节点身份或配对授权。
+use super::{
+    http_outbox::HttpOutbox,
+    inbox::{hostTask, Inbox},
+    stream::{ByteConnection, FramedPeerConnection},
+};
+use crate::{PeerConnection, PeerEndpoint, PeerListener, PeerTransport};
+use async_trait::async_trait;
+use bytes::Bytes;
+use futures_util::Stream;
+use http_body_util::{BodyExt, Full, Limited, StreamBody};
+use operit_host_api::{
+    HostError, HostManager::HostManager, HostRuntimeTaskSchedulerHost, HttpHost, HttpRequestData,
+    HttpServer::*,
+};
+use std::{
+    collections::BTreeMap,
+    pin::Pin,
+    sync::{Arc, Mutex as StdMutex, Weak},
+    task::{Context, Poll},
+};
+use tokio::sync::{mpsc, oneshot, Mutex};
+
+const CONNECTION_HEADER: &str = "x-operit-link-connection";
+fn request(url: String, method: &str, id: &str, body: Vec<u8>) -> HttpRequestData {
+    HttpRequestData {
+        url,
+        method: method.into(),
+        headers: vec![
+            (CONNECTION_HEADER.into(), id.into()),
+            ("content-type".into(), "application/octet-stream".into()),
+        ],
+        body,
+        formFields: vec![],
+        fileParts: vec![],
+        connectTimeoutSeconds: 15,
+        readTimeoutSeconds: if method == "GET" { 0 } else { 15 },
+        followRedirects: false,
+        ignoreSsl: false,
+        proxyHost: String::new(),
+        proxyPort: 0,
+    }
+}
+struct Client {
+    host: Arc<dyn HttpHost>,
+    id: String,
+    url: String,
+    inbox: Arc<Inbox>,
+    outbox: Arc<HttpOutbox>,
+}
+impl Drop for Client {
+    /// Stops the sender and releases its streaming GET when the connection is dropped.
+    fn drop(&mut self) {
+        self.outbox.finish(Ok(()));
+        let _ = self.host.closeHttpByteStream(&self.id);
+    }
+}
+#[async_trait]
+impl ByteConnection for Client {
+    /// Queues ordered frames for the connection's single clocked HTTP sender.
+    async fn write(&self, bytes: &[u8]) -> Result<(), String> {
+        self.outbox.write(bytes).await
+    }
+    async fn read(&self) -> Result<Option<Vec<u8>>, String> {
+        self.inbox.read().await
+    }
+    /// Stops queued writes and wakes the receiver when this connection is explicitly closed.
+    async fn close(&self) {
+        self.outbox.finish(Ok(()));
+        let _ = self.host.closeHttpByteStream(&self.id);
+    }
+}
+
+/// Sends one frozen batch at a time, allowing subsequent frames to accumulate during HTTP I/O.
+async fn sendBatches(
+    outbox: &HttpOutbox,
+    scheduler: &Arc<dyn HostRuntimeTaskSchedulerHost>,
+    host: &Arc<dyn HttpHost>,
+    id: &str,
+    url: &str,
+) -> Result<(), String> {
+    while let Some(bytes) = outbox.nextBatch(scheduler.as_ref()).await? {
+        let host = host.clone();
+        let request = request(url.to_owned(), "POST", id, bytes);
+        let result = hostTask(scheduler, move || host.executeHttpRequest(request)).await?;
+        if result.statusCode != 204 {
+            return Err(format!("HTTP Link send failed: {}", result.statusCode));
+        }
+    }
+    Ok(())
+}
+
+/// Opens the receiving GET and installs one Host-owned sender for ordered POST batches.
+pub(super) async fn connect(
+    host: &HostManager,
+    source: PeerEndpoint,
+    target: PeerEndpoint,
+    maxMessageBytes: usize,
+) -> Result<Arc<dyn PeerConnection>, String> {
+    let provider = host.httpHost.clone().ok_or("HTTP Host is not installed")?;
+    let scheduler = host
+        .hostRuntimeTaskSchedulerHost
+        .clone()
+        .ok_or("Host task scheduler is not installed")?;
+    let inbox = Inbox::new(maxMessageBytes);
+    let outbox = HttpOutbox::new(maxMessageBytes + 4, inbox.clone());
+    let client = Arc::new(Client {
+        host: provider.clone(),
+        id: uuid::Uuid::new_v4().to_string(),
+        url: target.address.clone(),
+        inbox: inbox.clone(),
+        outbox: outbox.clone(),
+    });
+    let (tx, rx) = oneshot::channel();
+    let opened = Arc::new(StdMutex::new(Some(tx)));
+    let success = opened.clone();
+    let failed = opened.clone();
+    let data = inbox.clone();
+    provider
+        .openHttpByteStream(
+            client.id.clone(),
+            request(client.url.clone(), "GET", &client.id, vec![]),
+            Arc::new(move || {
+                if let Some(tx) = success.lock().unwrap().take() {
+                    let _ = tx.send(Ok(()));
+                }
+            }),
+            Arc::new(move |bytes| data.put(bytes)),
+            Arc::new(move |result| {
+                if let Some(tx) = failed.lock().unwrap().take() {
+                    let _ = tx.send(Err(result
+                        .clone()
+                        .err()
+                        .unwrap_or("HTTP stream closed before opening".into())));
+                }
+                outbox.finish(result);
+            }),
+        )
+        .map_err(|e| e.to_string())?;
+    rx.await
+        .map_err(|_| "HTTP opening cancelled".to_string())??;
+    let http = client.host.clone();
+    let tasks = scheduler.clone();
+    let id = client.id.clone();
+    let url = client.url.clone();
+    let outbox = client.outbox.clone();
+    scheduler
+        .scheduleHostRuntimeAsyncTask(
+            "peer-http-sender",
+            Box::new(move || {
+                Box::pin(async move {
+                    let result = sendBatches(&outbox, &tasks, &http, &id, &url).await;
+                    outbox.finish(result);
+                    let _ = http.closeHttpByteStream(&id);
+                })
+            }),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(FramedPeerConnection::new(
+        source,
+        target,
+        PeerTransport::Http,
+        client,
+        maxMessageBytes,
+    ))
+}
+struct Server {
+    remote: Option<std::net::SocketAddr>,
+    incoming: Arc<Inbox>,
+    outgoing: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+}
+#[async_trait]
+impl ByteConnection for Server {
+    /// Returns the concrete Host-bound transport address.
+    fn remoteAddress(&self) -> Option<std::net::SocketAddr> {
+        self.remote
+    }
+    async fn write(&self, bytes: &[u8]) -> Result<(), String> {
+        self.incoming.status()?;
+        let tx = self
+            .outgoing
+            .lock()
+            .await
+            .clone()
+            .ok_or("HTTP Link closed")?;
+        tx.send(bytes.to_vec())
+            .await
+            .map_err(|_| "HTTP response stream closed".into())
+    }
+    async fn read(&self) -> Result<Option<Vec<u8>>, String> {
+        self.incoming.read().await
+    }
+    async fn close(&self) {
+        self.incoming.finish(Ok(()));
+        self.outgoing.lock().await.take();
+    }
+}
+type Connections = Arc<StdMutex<BTreeMap<String, Weak<Server>>>>;
+struct ResponseStream {
+    rx: mpsc::Receiver<Vec<u8>>,
+    id: String,
+    connections: Connections,
+}
+impl Stream for ResponseStream {
+    type Item = Result<http_body::Frame<Bytes>, HostError>;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.rx
+            .poll_recv(cx)
+            .map(|v| v.map(|bytes| Ok(http_body::Frame::data(Bytes::from(bytes)))))
+    }
+}
+impl Drop for ResponseStream {
+    fn drop(&mut self) {
+        if let Some(connection) = self
+            .connections
+            .lock()
+            .unwrap()
+            .remove(&self.id)
+            .and_then(|v| v.upgrade())
+        {
+            connection.incoming.finish(Ok(()));
+        }
+    }
+}
+pub(super) fn response(status: u16) -> ServerResponse {
+    let mut result = ServerResponse::new(
+        Full::new(Bytes::new())
+            .map_err(|never| match never {})
+            .boxed_unsync(),
+    );
+    *result.status_mut() = http::StatusCode::from_u16(status).unwrap();
+    result
+}
+/// Builds HTTP connection endpoints from the actual shared Host binding.
+pub(super) async fn listen(
+    registry: &super::network::ServerRegistry,
+    host: &HostManager,
+    source: PeerEndpoint,
+    maxMessageBytes: usize,
+) -> Result<Arc<dyn PeerListener>, String> {
+    let address = source.address.clone();
+    let connections: Connections = Arc::new(StdMutex::new(BTreeMap::new()));
+    let (accept, rx) = mpsc::channel(32);
+    let handler = move |boundAddress: &str| {
+        let mut source = source;
+        source.address = boundAddress.to_owned();
+        let handler: HttpServerHandler = Arc::new(move |request| {
+            let connections = connections.clone();
+            let accept = accept.clone();
+            let source = source.clone();
+            Box::pin(async move {
+                let Some(id) = request
+                    .headers()
+                    .get(CONNECTION_HEADER)
+                    .and_then(|v| v.to_str().ok())
+                    .filter(|v| uuid::Uuid::parse_str(v).is_ok())
+                    .map(str::to_owned)
+                else {
+                    return response(400);
+                };
+                match *request.method() {
+                    http::Method::GET => {
+                        let Ok(slot) = accept.try_reserve_owned() else {
+                            return response(503);
+                        };
+                        let (tx, rx) = mpsc::channel(32);
+                        let connection = Arc::new(Server {
+                            remote: request
+                                .extensions()
+                                .get::<operit_host_api::HttpServer::RemoteAddress>()
+                                .map(|v| v.0),
+                            incoming: Inbox::new(maxMessageBytes),
+                            outgoing: Mutex::new(Some(tx)),
+                        });
+                        {
+                            let mut entries = connections.lock().unwrap();
+                            if entries.contains_key(&id) {
+                                return response(409);
+                            }
+                            if entries.len() >= 128 {
+                                return response(503);
+                            }
+                            entries.insert(id.clone(), Arc::downgrade(&connection));
+                        }
+                        let body = ResponseStream {
+                            rx,
+                            id,
+                            connections,
+                        };
+                        slot.send(FramedPeerConnection::new(
+                            source,
+                            PeerEndpoint {
+                                nodeId: String::new(),
+                                address: String::new(),
+                            },
+                            PeerTransport::Http,
+                            connection,
+                            maxMessageBytes,
+                        ) as Arc<dyn PeerConnection>);
+                        let mut result = ServerResponse::new(StreamBody::new(body).boxed_unsync());
+                        result
+                            .headers_mut()
+                            .insert("content-type", "application/octet-stream".parse().unwrap());
+                        result
+                            .headers_mut()
+                            .insert("cache-control", "no-store".parse().unwrap());
+                        result
+                    }
+                    http::Method::POST => {
+                        let connection =
+                            connections.lock().unwrap().get(&id).and_then(Weak::upgrade);
+                        let Some(connection) = connection else {
+                            return response(404);
+                        };
+                        let bytes = match Limited::new(request.into_body(), maxMessageBytes + 4)
+                            .collect()
+                            .await
+                        {
+                            Ok(body) => body.to_bytes(),
+                            Err(_) => return response(413),
+                        };
+                        connection.incoming.put(bytes.to_vec());
+                        if connection.incoming.status().is_err() {
+                            response(410)
+                        } else {
+                            response(204)
+                        }
+                    }
+                    _ => response(405),
+                }
+            })
+        });
+        browserHttpHandler(handler)
+    };
+    super::network::serve(
+        registry, host, &address, PeerTransport::Http, rx,
+        |address| super::network::Handler::Http(handler(address)),
+    ).await
+}
+
+/// Allows credential-free browser Link requests without bypassing runtime authentication.
+fn browserHttpHandler(handler: HttpServerHandler) -> HttpServerHandler {
+    Arc::new(move |request| {
+        let handler = handler.clone();
+        Box::pin(async move {
+            let mut result = if request.method() == http::Method::OPTIONS {
+                browserPreflight(&request)
+            } else {
+                handler(request).await
+            };
+            // Link authentication is carried in encrypted messages, not cookies.
+            // CORS only grants access to this transport, never to runtime objects.
+            result.headers_mut().insert(
+                "access-control-allow-origin",
+                http::HeaderValue::from_static("*"),
+            );
+            result
+        })
+    })
+}
+
+/// Validates the exact methods and headers used by the binary HTTP Link carrier.
+fn browserPreflight(request: &ServerRequest) -> ServerResponse {
+    let method = request
+        .headers()
+        .get("access-control-request-method")
+        .and_then(|value| value.to_str().ok());
+    if !matches!(method, Some("GET" | "POST")) {
+        return response(405);
+    }
+    if let Some(headers) = request.headers().get("access-control-request-headers") {
+        let Ok(headers) = headers.to_str() else {
+            return response(400);
+        };
+        if !headers.split(',').map(str::trim).all(|name| {
+            name.eq_ignore_ascii_case("content-type")
+                || name.eq_ignore_ascii_case(CONNECTION_HEADER)
+        }) {
+            return response(400);
+        }
+    }
+    let mut result = response(204);
+    result.headers_mut().insert(
+        "access-control-allow-methods",
+        http::HeaderValue::from_static("GET, POST"),
+    );
+    result.headers_mut().insert(
+        "access-control-allow-headers",
+        http::HeaderValue::from_static("content-type, x-operit-link-connection"),
+    );
+    result
+}
+
+#[cfg(test)]
+mod browser_cors_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Creates a browser preflight without opening a Link connection.
+    fn preflight(method: &str, headers: &str) -> ServerRequest {
+        http::Request::builder()
+            .method("OPTIONS")
+            .uri("/link")
+            .header("origin", "https://operit.example")
+            .header("access-control-request-method", method)
+            .header("access-control-request-headers", headers)
+            .body(
+                Full::new(Bytes::new())
+                    .map_err(|never| match never {})
+                    .boxed_unsync(),
+            )
+            .unwrap()
+    }
+
+    /// Accepts binary Link preflights without invoking runtime or allocating a connection.
+    #[tokio::test]
+    async fn browser_preflight_does_not_dispatch_pairing() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let recorded = calls.clone();
+        let handler = browserHttpHandler(Arc::new(move |_| {
+            recorded.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { response(401) })
+        }));
+        for method in ["GET", "POST"] {
+            let result = handler(preflight(method, "Content-Type, X-Operit-Link-Connection")).await;
+            assert_eq!(result.status(), 204);
+            assert_eq!(result.headers()["access-control-allow-origin"], "*");
+            assert_eq!(
+                result.headers()["access-control-allow-methods"],
+                "GET, POST"
+            );
+            assert!(!result
+                .headers()
+                .contains_key("access-control-allow-credentials"));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            handler(preflight("DELETE", "content-type")).await.status(),
+            405
+        );
+        assert_eq!(
+            handler(preflight("POST", "authorization")).await.status(),
+            400
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Preserves the observed peer address and authentication rejection for actual requests.
+    #[tokio::test]
+    async fn browser_request_keeps_runtime_authentication_and_remote_address() {
+        let remote = "127.0.0.1:12456".parse().unwrap();
+        let handler = browserHttpHandler(Arc::new(move |request| {
+            assert_eq!(
+                request.extensions().get::<RemoteAddress>().unwrap().0,
+                remote
+            );
+            Box::pin(async { response(401) })
+        }));
+        let mut request = preflight("POST", "content-type");
+        *request.method_mut() = http::Method::POST;
+        request.extensions_mut().insert(RemoteAddress(remote));
+        let result = handler(request).await;
+        assert_eq!(result.status(), 401);
+        assert_eq!(result.headers()["access-control-allow-origin"], "*");
+        assert!(!result
+            .headers()
+            .contains_key("access-control-allow-credentials"));
+    }
+}

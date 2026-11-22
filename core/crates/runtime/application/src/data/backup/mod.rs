@@ -1,0 +1,22 @@
+#[path = "CharacterPluginLayout.rs"]
+pub(crate) mod CharacterPluginLayout;
+#[path = "CharacterPluginLegacyData.rs"]
+pub(crate) mod CharacterPluginLegacyData;
+#[path = "CharacterPluginMigration.rs"]
+pub(crate) mod CharacterPluginMigration;
+#[path = "Operit1LmdbReader.rs"]
+pub(crate) mod Operit1LmdbReader;
+#[path = "Operit1RoomSchemaMigration.rs"]
+pub(crate) mod Operit1RoomSchemaMigration;
+#[path = "operit1/Operit1SnapshotArchive.rs"]
+pub(crate) mod Operit1SnapshotArchive;
+#[path = "Operit1SnapshotImportManager.rs"]
+pub mod Operit1SnapshotImportManager;
+#[path = "RawSnapshotBackupManager.rs"]
+pub mod RawSnapshotBackupManager;
+#[cfg(test)]
+#[path = "RawSnapshotDiagnosticTests.rs"]
+mod raw_snapshot_diagnostic_tests;
+
+pub use Operit1SnapshotImportManager::*;
+pub use RawSnapshotBackupManager::*;

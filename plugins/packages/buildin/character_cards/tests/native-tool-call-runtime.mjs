@@ -1,0 +1,120 @@
+import { compileComposeModule } from "../../../../../plugins/tools/compile_compose_module.mjs";
+import { productionBootstrap, bootstrapLibrarySource, installTestJavaScriptCompiler } from '../../../../../tools/tests/fixtures/production_bootstrap.mjs';
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import vm from "node:vm";
+
+const root = new URL("../../../../../", import.meta.url);
+const require = createRequire(import.meta.url);
+const { buildSync } = require("esbuild");
+
+/** Reads the exact production source used by the native JavaScript execution boundary. */
+export function nativeToolSource(relative) { return readFileSync(new URL(relative, root), "utf8").replaceAll("\r\n", "\n"); }
+
+/** Bundles the current plugin module for the actual native module factory, not a replacement tool implementation. */
+export function toolModuleScript(relative) {
+  const entry = fileURLToPath(new URL("../" + relative, import.meta.url));
+  const result = buildSync({ entryPoints: [entry], bundle: true, format: "cjs", platform: "neutral", target: "es2020", write: false });
+  assert.equal(result.outputFiles.length, 1);
+  return result.outputFiles[0].text;
+}
+
+/** Supplies temporary runtime metadata for production bootstrap detachment and SDK getters. */
+export function nativeToolParameters(participantId) {
+  return {
+    __operit_package_lang: "zh",
+    __operit_package_state: "fixture.state",
+    __operit_package_caller_name: "Fixture Speaker",
+    __operit_package_chat_id: "fixture.chat",
+    __operit_package_caller_participant_id: participantId,
+    __operit_package_caller_owner: "com.operit.character_cards",
+    __operit_package_name: "character_memory_tools",
+    __operit_package_api_version: "2.0.0",
+    __operit_environment_owner: "com.operit.character_cards",
+    __operit_toolpkg_runtime_kind: "sandbox",
+    __operit_toolpkg_api_version: "2.0.0",
+    __operit_execution_context_key: "toolpkg_main:com.operit.character_cards",
+    __operit_toolpkg_subpackage_id: "fixture.tools",
+    containerPackageName: "com.operit.character_cards",
+    toolPkgId: "com.operit.character_cards",
+    __operit_ui_package_name: "com.operit.character_cards",
+    __operit_script_screen: "tools/index.js",
+  };
+}
+
+/** Runs actual native-boundary JavaScript with strict transport endpoints; Rust injection itself is not executed by this Node harness. */
+export function createNativeToolRuntime(globals, dispatchIpc, dispatchTool) {
+  const terminal = [], pending = new Map(), detached = new Set();
+  let nextCall = 0;
+  const context=vm.createContext({...globals});
+  vm.runInContext(nativeToolSource('hosts/web/src/javascript_promises.js'),context);
+  const registry=context.__operitHostPromiseRegistry;
+  /** Tracks the native execution owner selected by the production continuation runtime. */
+  context.__operitNativeActivateCall = (callId, interrupt) => {
+    assert.equal(typeof callId, "string");
+    assert.equal(typeof interrupt, "boolean");
+    context.nativeActiveCallId = callId;
+  };
+  /** Supplies the trusted library source through the production structured binding. */
+  context.__operitNativeReadBootstrapLibrary=registry.syncBinding(bootstrapLibrarySource);
+  /** Captures ordinary tool results and Compose results through their respective native bindings. */
+  const receiveResult=(callId,value)=>{
+    const request=pending.get(callId);assert.ok(request,'Unexpected native result '+callId);
+    pending.delete(callId);terminal.push({callId,type:'result',value});request.resolve(value);
+  };
+  context.__operitNativeSetCallStructuredResult=receiveResult;
+  context.__operitNativeSetCallResult=receiveResult;
+  context.__operitNativeSetCallError=registry.syncBinding((callId,value)=>{
+    const request=pending.get(callId);assert.ok(request,'Unexpected native failure '+callId);
+    pending.delete(callId);terminal.push({callId,type:'error',value});request.reject(new Error(value.message));
+  });
+  context.__operitNativeLogJsExecutionTrace=(callId,message)=>{assert.equal(typeof callId,'string');assert.equal(typeof message,'string');};
+  context.__operitNativeLog=()=>{};
+  context.__operitNativeCancelJavaScriptPromises=scope=>registry.cancel(scope);
+  /** Records calls retained by pending JavaScript continuations after terminal delivery. */
+  context.__operitNativeNotifyDetachedCall = callId => { assert.equal(typeof callId, "string"); detached.add(callId); };
+  context.__operitNativeHashText=text=>{let hash=0;for(let i=0;i<text.length;i++)hash=(Math.imul(hash,31)+text.charCodeAt(i))>>>0;return hash.toString(16);};
+  context.__operitNativeInvokeToolPkgIpc=registry.binding((requestId,packageTarget,callerContextKey,targetContextKey,targetRuntime,channel,payload)=>{
+    assert.equal(packageTarget,'com.operit.character_cards');
+    assert.equal(callerContextKey,'toolpkg_main:com.operit.character_cards');
+    assert.equal(targetContextKey,'');assert.equal(targetRuntime,'main');
+    assert.equal(typeof dispatchIpc,'function');
+    Promise.resolve().then(()=>dispatchIpc(channel,payload,{targetRuntime})).then(
+      value=>registry.settle(requestId,{success:true,value},false),
+      error=>registry.settle(requestId,String(error.message),true),
+    );
+  });
+  context.__operitNativeCallToolStructured=registry.binding((requestId,type,name,params)=>{
+    assert.equal(typeof dispatchTool,'function');
+    Promise.resolve().then(()=>dispatchTool(type,name,params)).then(
+      data=>registry.settle(requestId,{success:true,data},false),
+      error=>registry.settle(requestId,String(error.message),true),
+    );
+  });
+  context.__operitNativePrepareComposeModule = compileComposeModule;
+  installTestJavaScriptCompiler(context);
+  vm.runInContext(productionBootstrap(),context);
+
+  /** Invokes the production engine entry point with exactly the supplied converted native parameters. */
+  function invoke(script, name, params, compose = true) {
+    const callId = "native-tool-fixture-" + ++nextCall;
+    const result = new Promise(
+      /** Registers the sole terminal receiver before the real module and target function execute. */
+      (resolve, reject) => pending.set(callId, { resolve, reject }),
+    );
+    const sourceId = callId + ":" + createHash("sha256").update(script).digest("hex");
+    context.__operitRegisterScriptSource(sourceId, script);
+    // Native Host imports produce realm-owned JSON data, including nested objects.
+    const imported = vm.runInContext(`JSON.parse(${JSON.stringify(JSON.stringify(params))})`, context);
+    context.__operitExecuteScriptFunction(callId, imported, sourceId, name, compose, {
+      packageTarget: 'com.operit.character_cards',
+      contextKey: 'toolpkg_main:com.operit.character_cards',
+      runtime: params.__operit_toolpkg_runtime_kind,
+    });
+    return result;
+  }
+  return { invoke, terminal };
+}

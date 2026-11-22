@@ -1,0 +1,2187 @@
+#[path = "../../terminal_command.rs"]
+mod terminal_command;
+
+use std::collections::{BTreeMap, VecDeque};
+use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
+use operit_host_api::{
+    HiddenTerminalCommandOutput, HostError, HostResult, TerminalCloseOutput, TerminalCommandOutput,
+    TerminalHost, TerminalInfo, TerminalInputOutput, TerminalScreenOutput, TerminalSessionInfo,
+    TerminalSessionListEntry, TerminalTypeInfo,
+};
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use uuid::Uuid;
+
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+const PTY_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
+const PTY_PROMPT_MARKER_PREFIX: &[u8] = b"\x1b]133;OperitPrompt=";
+const PTY_PROMPT_MARKER_END: u8 = 7;
+const COMMAND_CANCEL_SETTLE_TIMEOUT_MS: u64 = 3000;
+const PLATFORM: &str = "posix";
+const TERMINAL: &str = "native";
+const PRIMARY_TERMINAL_TYPE: &str = "bash";
+
+#[derive(Clone)]
+pub struct NativePtyTerminalHost {
+    state: Arc<Mutex<TerminalState>>,
+    commandSpec: Arc<PtyCommandSpec>,
+}
+
+#[derive(Clone)]
+struct PtyCommandSpec {
+    program: String,
+    controllingTty: bool,
+    args: Vec<String>,
+    terminalType: String,
+    description: String,
+    nameKey: Option<String>,
+    commandProtocol: PtyCommandProtocol,
+    processWorkingDirectory: PtyProcessWorkingDirectory,
+    initialWorkingDirectory: PtyInitialWorkingDirectory,
+    environment: Vec<(String, String)>,
+    sessionWorkingDirectoryEnvironment: PtySessionWorkingDirectoryEnvironment,
+}
+
+/// Describes an explicitly configured interactive POSIX shell process.
+#[derive(Clone)]
+pub struct NativePtyShellCommand {
+    pub program: String,
+    pub arguments: Vec<String>,
+    pub description: String,
+    pub processWorkingDirectory: String,
+    pub defaultSessionWorkingDirectory: String,
+    pub environment: Vec<(String, String)>,
+    pub sessionWorkingDirectoryEnvironment: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PtyCommandProtocol {
+    BashPromptCommand,
+    ExplicitMarker,
+}
+
+#[derive(Clone)]
+enum PtyProcessWorkingDirectory {
+    Session,
+    Fixed(String),
+}
+
+#[derive(Clone)]
+enum PtyInitialWorkingDirectory {
+    ProcessCurrent,
+    Fixed(String),
+}
+
+#[derive(Clone)]
+enum PtySessionWorkingDirectoryEnvironment {
+    None,
+    Name(String),
+}
+
+impl Default for NativePtyTerminalHost {
+    /// Creates the shared POSIX host configured for its native bash terminal.
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(TerminalState::default())),
+            commandSpec: Arc::new(PtyCommandSpec::nativeBash()),
+        }
+    }
+}
+
+impl PtyCommandSpec {
+    /// Builds the default interactive bash command configuration.
+    fn nativeBash() -> Self {
+        Self {
+            program: if cfg!(target_os = "macos") {
+                "/bin/bash"
+            } else {
+                "bash"
+            }
+            .to_string(),
+            controllingTty: !cfg!(target_os = "macos"),
+            args: vec![
+                "--noprofile".to_string(),
+                "--norc".to_string(),
+                "-i".to_string(),
+            ],
+            terminalType: PRIMARY_TERMINAL_TYPE.to_string(),
+            description: "POSIX bash terminal".to_string(),
+            nameKey: Some("terminalBuiltinPosix".into()),
+            commandProtocol: PtyCommandProtocol::BashPromptCommand,
+            processWorkingDirectory: PtyProcessWorkingDirectory::Session,
+            initialWorkingDirectory: PtyInitialWorkingDirectory::ProcessCurrent,
+            environment: Vec::new(),
+            sessionWorkingDirectoryEnvironment: PtySessionWorkingDirectoryEnvironment::None,
+        }
+    }
+
+    /// Builds the privileged system POSIX sh command configuration.
+    fn systemShell() -> Self {
+        Self {
+            program: "/bin/sh".to_string(),
+            controllingTty: !cfg!(target_os = "macos"),
+            args: vec!["-i".to_string()],
+            terminalType: "shell".to_string(),
+            description: "Privileged system /bin/sh terminal".to_string(),
+            nameKey: Some("terminalBuiltinPrivileged".into()),
+            commandProtocol: PtyCommandProtocol::ExplicitMarker,
+            processWorkingDirectory: PtyProcessWorkingDirectory::Session,
+            initialWorkingDirectory: PtyInitialWorkingDirectory::ProcessCurrent,
+            environment: Vec::new(),
+            sessionWorkingDirectoryEnvironment: PtySessionWorkingDirectoryEnvironment::None,
+        }
+    }
+
+    /// Builds an explicitly configured POSIX shell command specification.
+    fn customShell(command: NativePtyShellCommand) -> HostResult<Self> {
+        let program = nonBlank(&command.program, "program")?;
+        let description = nonBlank(&command.description, "description")?;
+        let processWorkingDirectory = nonBlank(
+            &command.processWorkingDirectory,
+            "process_working_directory",
+        )?;
+        let defaultSessionWorkingDirectory = nonBlank(
+            &command.defaultSessionWorkingDirectory,
+            "default_session_working_directory",
+        )?;
+        let sessionWorkingDirectoryEnvironment = nonBlank(
+            &command.sessionWorkingDirectoryEnvironment,
+            "session_working_directory_environment",
+        )?;
+        if !program.starts_with('/') {
+            return Err(HostError::new(format!(
+                "Custom POSIX shell program must be absolute: {program}"
+            )));
+        }
+        Ok(Self {
+            program,
+            controllingTty: !cfg!(target_os = "macos"),
+            args: command.arguments,
+            terminalType: "shell".to_string(),
+            description,
+            nameKey: None,
+            commandProtocol: PtyCommandProtocol::ExplicitMarker,
+            processWorkingDirectory: PtyProcessWorkingDirectory::Fixed(processWorkingDirectory),
+            initialWorkingDirectory: PtyInitialWorkingDirectory::Fixed(
+                defaultSessionWorkingDirectory,
+            ),
+            environment: command.environment,
+            sessionWorkingDirectoryEnvironment: PtySessionWorkingDirectoryEnvironment::Name(
+                sessionWorkingDirectoryEnvironment,
+            ),
+        })
+    }
+}
+
+#[derive(Default)]
+struct TerminalState {
+    sessionNameToId: BTreeMap<String, String>,
+    hiddenExecutorKeyToSessionId: BTreeMap<String, String>,
+    ptySessions: BTreeMap<String, PtySession>,
+}
+
+struct PtySession {
+    sessionName: String,
+    terminalType: String,
+    workingDir: String,
+    process: Option<PtyProcess>,
+    output: Arc<Mutex<VecDeque<u8>>>,
+    commandOutput: PtyCommandOutput,
+    screenOutput: Arc<Mutex<VecDeque<u8>>>,
+    commandRunning: bool,
+    exitCode: Option<i32>,
+    commandProtocol: PtyCommandProtocol,
+}
+
+type PtyCommandOutput = Arc<(Mutex<VecDeque<u8>>, Condvar)>;
+
+#[derive(Debug)]
+struct PtyCursor {
+    row: usize,
+    col: usize,
+}
+
+type PtyCursorState = Arc<Mutex<PtyCursor>>;
+
+/// Owns every live PTY resource separately from retained session output and status.
+struct PtyProcess {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    master: Box<dyn MasterPty + Send>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    stopReader: Arc<AtomicBool>,
+    readerTask: Option<operit_host_native_scheduler::NativeTaskHandle<()>>,
+}
+
+impl Drop for PtyProcess {
+    fn drop(&mut self) {
+        self.stopReader.store(true, Ordering::Release);
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            if self.child.kill().is_ok() {
+                // portable-pty escalates SIGHUP to SIGKILL; reap the shell as well.
+                let _ = self.child.wait();
+            }
+        }
+        if let Some(readerTask) = self.readerTask.take() {
+            let _ = readerTask.join_timeout(Duration::from_secs(1));
+        }
+    }
+}
+
+impl PtySession {
+    fn process(&self) -> HostResult<&PtyProcess> {
+        self.process
+            .as_ref()
+            .ok_or_else(|| HostError::new("PTY session has exited"))
+    }
+
+    /// Reclaims handles on observed exit while preserving output and the exit receipt.
+    fn pollExitCode(&mut self) -> HostResult<Option<i32>> {
+        if self.exitCode.is_none() {
+            if let Some(process) = self.process.as_mut() {
+                if let Some(status) = process.child.try_wait()? {
+                    self.exitCode = Some(status.exit_code() as i32);
+                    self.commandRunning = false;
+                    self.process.take();
+                }
+            }
+        }
+        Ok(self.exitCode)
+    }
+}
+
+impl NativePtyTerminalHost {
+    /// Creates a separate configured shell while preserving this host's PTY and command protocol.
+    pub fn withProfile(&self, profile: &operit_host_api::TerminalProfile) -> HostResult<Self> {
+        let program = profile.options.get("executable").ok_or_else(|| HostError::new("Custom terminal requires executable"))?;
+        if !std::path::Path::new(program).is_absolute() || !std::path::Path::new(program).is_file() {
+            return Err(HostError::new("Terminal executable must be an existing absolute file path"));
+        }
+        let mut spec = (*self.commandSpec).clone();
+        spec.program = program.clone();
+        let mut arguments = operit_host_api::TerminalProfiles::profileArguments(profile)?;
+        arguments.extend(spec.args);
+        spec.args = arguments;
+        Ok(Self { state: Arc::default(), commandSpec: Arc::new(spec) })
+    }
+    /// Creates the shared POSIX host configured for its native bash terminal.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a host that starts the actual system /bin/sh process in a PTY.
+    pub fn systemShell() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(TerminalState::default())),
+            commandSpec: Arc::new(PtyCommandSpec::systemShell()),
+        }
+    }
+
+    /// Creates a host that starts one explicitly configured POSIX shell process in a PTY.
+    pub fn customShell(command: NativePtyShellCommand) -> HostResult<Self> {
+        Ok(Self {
+            state: Arc::new(Mutex::new(TerminalState::default())),
+            commandSpec: Arc::new(PtyCommandSpec::customShell(command)?),
+        })
+    }
+
+    /// Retains ownership after shell exit, until the caller closes the session.
+    pub fn ownsSession(&self, sessionId: &str) -> HostResult<bool> {
+        Ok(self.lockState()?.ptySessions.contains_key(sessionId))
+    }
+
+    /// Selects whether the real PTY becomes the child process's controlling TTY.
+    /// Apple sandbox hosts must disable TIOCSCTTY; unrestricted hosts keep job control.
+    pub fn withControllingTty(mut self, enabled: bool) -> Self {
+        Arc::make_mut(&mut self.commandSpec).controllingTty = enabled;
+        self
+    }
+
+    /// Creates a native login shell with its normal startup files and environment.
+    pub fn loginShell(program: &str, terminalType: &str, home: &str) -> HostResult<Self> {
+        if !std::path::Path::new(program).is_absolute() || !std::path::Path::new(program).is_file() {
+            return Err(HostError::new(format!("Login shell is unavailable: {program}")));
+        }
+        let home = nonBlank(home, "home_directory")?;
+        let mut spec = PtyCommandSpec::nativeBash();
+        spec.program = program.to_string();
+        spec.controllingTty = true;
+        spec.args = vec!["-l".to_string(), "-i".to_string()];
+        spec.terminalType = nonBlank(terminalType, "terminal_type")?;
+        spec.description = format!("Native {program} login shell");
+        spec.commandProtocol = PtyCommandProtocol::ExplicitMarker;
+        spec.initialWorkingDirectory = PtyInitialWorkingDirectory::Fixed(home);
+        spec.environment = vec![("SHELL".to_string(), program.to_string())];
+        Ok(Self {
+            state: Arc::new(Mutex::new(TerminalState::default())),
+            commandSpec: Arc::new(spec),
+        })
+    }
+
+    /// Verifies that this host can start and close its configured PTY shell.
+    pub fn probe(&self, workingDir: &str) -> HostResult<()> {
+        let sessionId = self.startPtySession(
+            "operit-terminal-capability-probe",
+            TERMINAL,
+            &self.commandSpec.terminalType,
+            workingDir,
+            1,
+            1,
+        )?;
+        self.closePtySession(&sessionId)
+    }
+
+    /// Validates the shell type configured for this native PTY host.
+    fn normalizeTerminalType(&self, terminalType: &str) -> HostResult<String> {
+        match terminalType.trim() {
+            value if value == self.commandSpec.terminalType => Ok(value.to_string()),
+            value => Err(HostError::new(format!(
+                "Unsupported terminal type for shared POSIX PTY host: {value}"
+            ))),
+        }
+    }
+
+    /// Returns the working directory used for automatically created terminal sessions.
+    fn initialWorkingDirectory(&self) -> HostResult<String> {
+        match &self.commandSpec.initialWorkingDirectory {
+            PtyInitialWorkingDirectory::ProcessCurrent => {
+                Ok(std::env::current_dir()?.display().to_string())
+            }
+            PtyInitialWorkingDirectory::Fixed(directory) => Ok(directory.clone()),
+        }
+    }
+}
+
+impl TerminalHost for NativePtyTerminalHost {
+    /// Resolves native terminal directories through the runtime's host VFS mapper.
+    fn resolveWorkingDirectory(
+        &self,
+        terminal: &str,
+        terminalType: &str,
+        workingDir: &str,
+        resolveHostDirectory: &dyn Fn(&str) -> HostResult<String>,
+    ) -> HostResult<String> {
+        requireNativeTerminal(terminal)?;
+        self.normalizeTerminalType(terminalType)?;
+        resolveHostDirectory(workingDir)
+    }
+
+    fn terminalInfo(&self) -> HostResult<TerminalInfo> {
+        Ok(TerminalInfo {
+            platform: PLATFORM.to_string(),
+            terminal: TERMINAL.to_string(),
+            terminalType: self.commandSpec.terminalType.clone(),
+            types: vec![TerminalTypeInfo {
+                terminal: TERMINAL.to_string(),
+                terminalType: self.commandSpec.terminalType.clone(),
+                available: true,
+                description: self.commandSpec.description.clone(),
+                nameKey: self.commandSpec.nameKey.clone(),
+            }],
+        })
+    }
+
+    fn startPtySession(
+        &self,
+        sessionName: &str,
+        terminal: &str,
+        terminalType: &str,
+        workingDir: &str,
+        rows: u16,
+        cols: u16,
+    ) -> HostResult<String> {
+        let normalizedSessionName = nonBlank(sessionName, "session_name")?;
+        requireNativeTerminal(terminal)?;
+        let normalizedTerminalType = self.normalizeTerminalType(terminalType)?;
+        let workDir = nonBlank(workingDir, "working_directory")?;
+        let session = createPtySession(
+            normalizedSessionName,
+            normalizedTerminalType,
+            workDir,
+            rows,
+            cols,
+            self.commandSpec.as_ref(),
+        )?;
+        let sessionId = nextSessionId();
+        let mut state = self.lockState()?;
+        state.ptySessions.insert(sessionId.clone(), session);
+        Ok(sessionId)
+    }
+
+    fn readPtySession(&self, sessionId: &str) -> HostResult<Vec<u8>> {
+        let mut state = self.lockState()?;
+        let session = state
+            .ptySessions
+            .get_mut(sessionId)
+            .ok_or_else(|| HostError::new(format!("PTY session does not exist: {sessionId}")))?;
+        let mut output = session
+            .output
+            .lock()
+            .map_err(|_| HostError::new("pty output mutex poisoned"))?;
+        Ok(output.drain(..).collect())
+    }
+
+    fn writePtySession(&self, sessionId: &str, data: &[u8]) -> HostResult<usize> {
+        let mut state = self.lockState()?;
+        let session = state
+            .ptySessions
+            .get_mut(sessionId)
+            .ok_or_else(|| HostError::new(format!("PTY session does not exist: {sessionId}")))?;
+        let mut writer = session
+            .process()?
+            .writer
+            .lock()
+            .map_err(|_| HostError::new("pty writer mutex poisoned"))?;
+        writer.write_all(data)?;
+        writer.flush()?;
+        Ok(data.len())
+    }
+
+    fn resizePtySession(&self, sessionId: &str, rows: u16, cols: u16) -> HostResult<()> {
+        let state = self.lockState()?;
+        let session = state
+            .ptySessions
+            .get(sessionId)
+            .ok_or_else(|| HostError::new(format!("PTY session does not exist: {sessionId}")))?;
+        session
+            .process()?
+            .master
+            .resize(ptySize(rows, cols))
+            .map_err(toHostError)
+    }
+
+    fn pollPtyExitCode(&self, sessionId: &str) -> HostResult<Option<i32>> {
+        let mut state = self.lockState()?;
+        let session = state
+            .ptySessions
+            .get_mut(sessionId)
+            .ok_or_else(|| HostError::new(format!("PTY session does not exist: {sessionId}")))?;
+        session.pollExitCode()
+    }
+
+    fn closePtySession(&self, sessionId: &str) -> HostResult<()> {
+        let mut state = self.lockState()?;
+        let removed = state.ptySessions.remove(sessionId);
+        match removed {
+            Some(_) => {
+                removeSessionMappings(&mut state, sessionId);
+                Ok(())
+            }
+            None => Err(HostError::new(format!(
+                "PTY session does not exist: {sessionId}"
+            ))),
+        }
+    }
+
+    fn listSessions(&self) -> HostResult<Vec<TerminalSessionListEntry>> {
+        let mut state = self.lockState()?;
+        let mut entries = Vec::new();
+        for (sessionId, session) in state.ptySessions.iter_mut() {
+            if session.pollExitCode()?.is_some() {
+                continue;
+            }
+            entries.push(TerminalSessionListEntry {
+                sessionId: sessionId.clone(),
+                sessionName: session.sessionName.clone(),
+                platform: PLATFORM.to_string(),
+                terminal: TERMINAL.to_string(),
+                terminalType: session.terminalType.clone(),
+                sessionKind: "pty".to_string(),
+                workingDir: session.workingDir.clone(),
+                commandRunning: session.commandRunning,
+            });
+        }
+        Ok(entries)
+    }
+
+    /// Creates or reuses a named session in the configured default terminal.
+    fn createOrGetSession(&self, sessionName: &str) -> HostResult<TerminalSessionInfo> {
+        self.createOrGetTypedSession(sessionName, &self.commandSpec.terminalType)
+    }
+
+    /// Creates or reuses a named session of exactly the requested interpreter type.
+    fn createOrGetTypedSession(
+        &self,
+        sessionName: &str,
+        terminalType: &str,
+    ) -> HostResult<TerminalSessionInfo> {
+        let normalizedSessionName = nonBlank(sessionName, "session_name")?;
+        let normalizedTerminalType = self.normalizeTerminalType(terminalType)?;
+        let sessionKey = sessionKey(&normalizedTerminalType, &normalizedSessionName);
+        {
+            let mut state = self.lockState()?;
+            if let Some(sessionId) = state.sessionNameToId.get(&sessionKey).cloned() {
+                if state.ptySessions.contains_key(&sessionId) {
+                    return Ok(TerminalSessionInfo {
+                        sessionId,
+                        sessionName: normalizedSessionName,
+                        platform: PLATFORM.to_string(),
+                        terminal: TERMINAL.to_string(),
+                        terminalType: normalizedTerminalType,
+                        isNewSession: false,
+                    });
+                }
+                state.sessionNameToId.remove(&sessionKey);
+            }
+        }
+
+        let workingDir = self.initialWorkingDirectory()?;
+        let session = createPtySession(
+            normalizedSessionName.clone(),
+            normalizedTerminalType.clone(),
+            workingDir,
+            24,
+            80,
+            self.commandSpec.as_ref(),
+        )?;
+        let sessionId = nextSessionId();
+        let mut state = self.lockState()?;
+        state.sessionNameToId.insert(sessionKey, sessionId.clone());
+        state.ptySessions.insert(sessionId.clone(), session);
+        Ok(TerminalSessionInfo {
+            sessionId,
+            sessionName: normalizedSessionName,
+            platform: PLATFORM.to_string(),
+            terminal: TERMINAL.to_string(),
+            terminalType: normalizedTerminalType,
+            isNewSession: true,
+        })
+    }
+
+    fn executeInSession(
+        &self,
+        sessionId: &str,
+        command: &str,
+        timeoutMs: u64,
+    ) -> HostResult<TerminalCommandOutput> {
+        self.executeInSessionStreaming(sessionId, command, timeoutMs, &mut |_| Ok(()))
+    }
+
+    fn executeInSessionStreaming(
+        &self,
+        sessionId: &str,
+        command: &str,
+        timeoutMs: u64,
+        onOutput: &mut dyn FnMut(&[u8]) -> HostResult<()>,
+    ) -> HostResult<TerminalCommandOutput> {
+        let normalizedSessionId = nonBlank(sessionId, "session_id")?;
+        let normalizedCommand = nonBlank(command, "command")?;
+        let (terminalType, commandOutput, commandProtocol, commandEcho) = {
+            let mut state = self.lockState()?;
+            let session = state
+                .ptySessions
+                .get_mut(&normalizedSessionId)
+                .ok_or_else(|| {
+                    HostError::new(format!("Terminal session does not exist: {sessionId}"))
+                })?;
+            if session.commandRunning {
+                return Err(HostError::new(
+                    "Terminal session already has a command in progress",
+                ));
+            }
+            clearPtyCommandOutput(&session.commandOutput)?;
+            let commandInput = ptyCommandInput(&normalizedCommand, session.commandProtocol);
+            let commandEcho = commandInput.trim_end().to_string();
+            let mut writer = session
+                .process()?
+                .writer
+                .lock()
+                .map_err(|_| HostError::new("pty writer mutex poisoned"))?;
+            writer.write_all(commandInput.as_bytes())?;
+            writer.flush()?;
+            drop(writer);
+            session.commandRunning = true;
+            (
+                session.terminalType.clone(),
+                session.commandOutput.clone(),
+                session.commandProtocol,
+                commandEcho,
+            )
+        };
+
+        let result = executePtyCommandInSession(
+            commandOutput,
+            &commandEcho,
+            timeoutMs,
+            commandProtocol,
+            onOutput,
+        );
+        {
+            let mut state = self.lockState()?;
+            if let Some(session) = state.ptySessions.get_mut(&normalizedSessionId) {
+                // Release the busy flag even if interrupting a broken PTY fails.
+                // The state lock still excludes new commands during cancellation.
+                session.commandRunning = false;
+                if result.as_ref().map_or(true, |receipt| receipt.timedOut) {
+                    if let Some(workingDir) = cancelTimedOutPtyCommand(session)? {
+                        session.workingDir = workingDir;
+                    }
+                } else if let Some(workingDir) = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|receipt| receipt.workingDir.clone())
+                {
+                    session.workingDir = workingDir;
+                }
+            }
+        }
+        let result = result?;
+        Ok(TerminalCommandOutput {
+            command: normalizedCommand,
+            output: result.output,
+            exitCode: result.exitCode,
+            sessionId: normalizedSessionId,
+            platform: PLATFORM.to_string(),
+            terminal: TERMINAL.to_string(),
+            terminalType,
+            timedOut: result.timedOut,
+        })
+    }
+
+    fn executeHiddenCommand(
+        &self,
+        command: &str,
+        executorKey: &str,
+        timeoutMs: u64,
+    ) -> HostResult<HiddenTerminalCommandOutput> {
+        let normalizedCommand = nonBlank(command, "command")?;
+        let normalizedTerminalType = self.commandSpec.terminalType.clone();
+        let normalizedExecutorKey = match executorKey.trim() {
+            "" => "default".to_string(),
+            value => value.to_string(),
+        };
+        let executorKey = sessionKey(&normalizedTerminalType, &normalizedExecutorKey);
+        let sessionId = hiddenPtySessionId(
+            self,
+            &executorKey,
+            &normalizedExecutorKey,
+            &normalizedTerminalType,
+        )?;
+        let output = self.executeInSession(&sessionId, &normalizedCommand, timeoutMs)?;
+        Ok(HiddenTerminalCommandOutput {
+            command: normalizedCommand,
+            output: output.output,
+            exitCode: output.exitCode,
+            executorKey: normalizedExecutorKey,
+            platform: PLATFORM.to_string(),
+            terminal: TERMINAL.to_string(),
+            terminalType: normalizedTerminalType,
+            timedOut: output.timedOut,
+        })
+    }
+
+    fn inputInSession(
+        &self,
+        sessionId: &str,
+        input: Option<&str>,
+        control: Option<&str>,
+    ) -> HostResult<TerminalInputOutput> {
+        let normalizedSessionId = nonBlank(sessionId, "session_id")?;
+        if input.is_none() && control.and_then(normalizeControl).is_none() {
+            return Err(HostError::new(
+                "At least one of input or control is required",
+            ));
+        }
+        let mut state = self.lockState()?;
+        let session = state
+            .ptySessions
+            .get_mut(&normalizedSessionId)
+            .ok_or_else(|| {
+                HostError::new(format!("Terminal session does not exist: {sessionId}"))
+            })?;
+        let acceptedChars =
+            applyPtyTerminalInput(session, input, control.and_then(normalizeControl))?;
+        Ok(TerminalInputOutput {
+            sessionId: normalizedSessionId,
+            acceptedChars,
+        })
+    }
+
+    fn closeSession(&self, sessionId: &str) -> HostResult<TerminalCloseOutput> {
+        let normalizedSessionId = nonBlank(sessionId, "session_id")?;
+        let mut state = self.lockState()?;
+        if state.ptySessions.remove(&normalizedSessionId).is_none() {
+            return Err(HostError::new(format!(
+                "Terminal session does not exist: {sessionId}"
+            )));
+        }
+        removeSessionMappings(&mut state, &normalizedSessionId);
+        Ok(TerminalCloseOutput {
+            sessionId: normalizedSessionId.clone(),
+            success: true,
+            message: format!("Terminal session closed: {normalizedSessionId}"),
+        })
+    }
+
+    fn closeSessionIfIdle(&self, sessionId: &str, sessionName: &str) -> HostResult<TerminalCloseOutput> {
+        let id = nonBlank(sessionId, "session_id")?;
+        let name = nonBlank(sessionName, "session_name")?;
+        let mut state = self.lockState()?;
+        let session = state.ptySessions.get(&id)
+            .ok_or_else(|| HostError::new(format!("Terminal session does not exist: {id}")))?;
+        if !operit_host_api::terminalSessionNameMatches(&session.sessionName, &name) {
+            return Err(HostError::new("Terminal session name does not match"));
+        }
+        if session.commandRunning {
+            return Err(HostError::new("Terminal session has a command in progress"));
+        }
+        state.ptySessions.remove(&id);
+        removeSessionMappings(&mut state, &id);
+        Ok(TerminalCloseOutput { sessionId: id.clone(), success: true, message: format!("Idle terminal session closed: {id}") })
+    }
+
+    fn getSessionScreen(&self, sessionId: &str) -> HostResult<TerminalScreenOutput> {
+        let normalizedSessionId = nonBlank(sessionId, "session_id")?;
+        let mut state = self.lockState()?;
+        let session = state
+            .ptySessions
+            .get_mut(&normalizedSessionId)
+            .ok_or_else(|| {
+                HostError::new(format!("Terminal session does not exist: {sessionId}"))
+            })?;
+        let content = ptyScreenContent(session)?;
+        let rows = content.lines().count();
+        let cols = content
+            .lines()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(0);
+        Ok(TerminalScreenOutput {
+            sessionId: normalizedSessionId,
+            platform: PLATFORM.to_string(),
+            terminal: TERMINAL.to_string(),
+            terminalType: session.terminalType.clone(),
+            rows,
+            cols,
+            content,
+            commandRunning: session.commandRunning,
+        })
+    }
+}
+
+impl NativePtyTerminalHost {
+    #[allow(non_snake_case)]
+    fn lockState(&self) -> HostResult<std::sync::MutexGuard<'_, TerminalState>> {
+        self.state
+            .lock()
+            .map_err(|_| HostError::new("terminal state mutex poisoned"))
+    }
+}
+
+#[allow(non_snake_case)]
+fn hiddenPtySessionId(
+    host: &NativePtyTerminalHost,
+    executorKey: &str,
+    executorLabel: &str,
+    terminalType: &str,
+) -> HostResult<String> {
+    {
+        let mut state = host.lockState()?;
+        if let Some(sessionId) = liveHiddenPtySessionId(&mut state, executorKey)? {
+            return Ok(sessionId);
+        }
+    }
+
+    let workingDir = host.initialWorkingDirectory()?;
+    let session = createPtySession(
+        format!("hidden:{executorLabel}"),
+        terminalType.to_string(),
+        workingDir,
+        24,
+        80,
+        host.commandSpec.as_ref(),
+    )?;
+    let sessionId = nextSessionId();
+    let mut state = host.lockState()?;
+    // Another caller may have installed a session while this shell was starting.
+    // Keep one executor per key and drop the unused shell instead of orphaning it.
+    if let Some(existing) = liveHiddenPtySessionId(&mut state, executorKey)? {
+        drop(state);
+        drop(session);
+        return Ok(existing);
+    }
+    state
+        .hiddenExecutorKeyToSessionId
+        .insert(executorKey.to_string(), sessionId.clone());
+    state.ptySessions.insert(sessionId.clone(), session);
+    Ok(sessionId)
+}
+
+/// Only replace an executor observed to have exited before submitting a command.
+/// Once a command has been submitted its outcome may be unknown, so never replay it.
+#[allow(non_snake_case)]
+fn liveHiddenPtySessionId(state: &mut TerminalState, executorKey: &str) -> HostResult<Option<String>> {
+    let Some(sessionId) = state.hiddenExecutorKeyToSessionId.get(executorKey).cloned() else {
+        return Ok(None);
+    };
+    let alive = match state.ptySessions.get_mut(&sessionId) {
+        Some(session) if session.commandRunning => true,
+        Some(session) => session.pollExitCode()?.is_none(),
+        None => false,
+    };
+    if alive {
+        return Ok(Some(sessionId));
+    }
+    state.ptySessions.remove(&sessionId);
+    removeSessionMappings(state, &sessionId);
+    Ok(None)
+}
+
+struct SessionCommandResult {
+    output: String,
+    exitCode: i32,
+    timedOut: bool,
+    workingDir: Option<String>,
+}
+
+#[allow(non_snake_case)]
+fn createPtySession(
+    sessionName: String,
+    terminalType: String,
+    workingDir: String,
+    rows: u16,
+    cols: u16,
+    commandSpec: &PtyCommandSpec,
+) -> HostResult<PtySession> {
+    let ptySystem = native_pty_system();
+    let pair = ptySystem
+        .openpty(ptySize(rows, cols))
+        .map_err(|error| HostError::new(format!("PTY open failed: {error}")))?;
+    // Poll a dedicated owned reader so cancellation does not depend on slave EOF.
+    #[cfg(unix)]
+    let mut reader = {
+        use std::os::fd::BorrowedFd;
+        let fd = pair
+            .master
+            .as_raw_fd()
+            .ok_or_else(|| HostError::new("PTY master has no file descriptor"))?;
+        // SAFETY: pair.master owns fd and remains alive throughout the duplication.
+        let owned = unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?;
+        std::fs::File::from(owned)
+    };
+    #[cfg(not(unix))]
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|error| HostError::new(format!("PTY reader setup failed: {error}")))?;
+    let writer = Arc::new(Mutex::new(pair.master.take_writer().map_err(|error| {
+        HostError::new(format!("PTY writer setup failed: {error}"))
+    })?));
+    let command = posixPtyCommand(&workingDir, commandSpec);
+    let child = pair.slave.spawn_command(command).map_err(|error| {
+        HostError::new(format!(
+            "PTY shell spawn failed (program={}, cwd={}): {error}",
+            commandSpec.program, workingDir
+        ))
+    })?;
+    // The parent must never retain the slave after spawn, including setup failures.
+    drop(pair.slave);
+    let stopReader = Arc::new(AtomicBool::new(false));
+    let mut process = PtyProcess {
+        child,
+        master: pair.master,
+        writer: writer.clone(),
+        stopReader: stopReader.clone(),
+        readerTask: None,
+    };
+    let output = Arc::new(Mutex::new(VecDeque::new()));
+    let commandOutput: PtyCommandOutput = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
+    let screenOutput = Arc::new(Mutex::new(VecDeque::new()));
+    let cursorState: PtyCursorState = Arc::new(Mutex::new(PtyCursor { row: 1, col: 1 }));
+    let outputForThread = output.clone();
+    let commandOutputForThread = commandOutput.clone();
+    let screenOutputForThread = screenOutput.clone();
+    let writerForThread = writer.clone();
+    let cursorStateForThread = cursorState.clone();
+    process.readerTask = Some(operit_host_native_scheduler::scheduleNativeServiceTask(
+        "operit-pty-reader",
+        move || {
+            let mut buffer = [0u8; 4096];
+            let mut drainDeadline = None;
+            loop {
+                let stopping = stopReader.load(Ordering::Acquire);
+                if stopping {
+                    // Drain already-written tail output, but bound descendants that keep writing.
+                    let deadline = drainDeadline
+                        .get_or_insert_with(|| Instant::now() + Duration::from_millis(100));
+                    if Instant::now() >= *deadline {
+                        break;
+                    }
+                }
+                #[cfg(unix)]
+                match pollPtyReader(&reader, if stopping { 0 } else { 100 }) {
+                    Ok(true) => {}
+                    Ok(false) if stopping => break,
+                    Ok(false) => continue,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+                #[cfg(not(unix))]
+                if stopping {
+                    break;
+                }
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        let chunk = &buffer[..count];
+                        if !stopping {
+                            processPtyTerminalQueries(
+                                &writerForThread,
+                                &cursorStateForThread,
+                                chunk,
+                            );
+                        }
+                        let commandChunk = stripPtyDeviceStatusReports(chunk);
+                        let visibleChunk = stripPtyPromptMarkers(&commandChunk);
+                        appendPtyOutput(&outputForThread, &visibleChunk);
+                        appendPtyOutput(&screenOutputForThread, &visibleChunk);
+                        appendPtyCommandOutput(&commandOutputForThread, &commandChunk);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+        },
+    )?);
+    if commandSpec.commandProtocol == PtyCommandProtocol::ExplicitMarker {
+        writePtyPromptMarker(&writer)?;
+    }
+    waitForInitialPtyPrompt(commandOutput.clone(), Duration::from_millis(10000))?;
+    clearPtyCommandOutput(&commandOutput)?;
+    if commandSpec.commandProtocol == PtyCommandProtocol::ExplicitMarker {
+        clearPtyOutput(&output)?;
+        clearPtyOutput(&screenOutput)?;
+    }
+    Ok(PtySession {
+        sessionName,
+        terminalType,
+        workingDir,
+        process: Some(process),
+        output,
+        commandOutput,
+        screenOutput,
+        commandRunning: false,
+        exitCode: None,
+        commandProtocol: commandSpec.commandProtocol,
+    })
+}
+
+/// Waits briefly for output without keeping a service worker blocked after session close.
+#[cfg(unix)]
+fn pollPtyReader(reader: &std::fs::File, timeoutMs: i32) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let mut descriptor = libc::pollfd {
+        fd: reader.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: descriptor is initialized, and reader owns its fd throughout poll.
+    let result = unsafe { libc::poll(&mut descriptor, 1, timeoutMs) };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(result > 0)
+}
+
+/// Produces the shell input that emits the command-completion marker for one protocol.
+fn ptyCommandInput(command: &str, commandProtocol: PtyCommandProtocol) -> String {
+    let command = terminal_command::posixCommandLine(command);
+    match commandProtocol {
+        PtyCommandProtocol::BashPromptCommand => format!("{command}\r"),
+        PtyCommandProtocol::ExplicitMarker => format!(
+            "{command}; __operit_status=$?; {}\r",
+            ptyPromptMarkerCommand()
+        ),
+    }
+}
+
+/// Returns the POSIX sh command that writes one machine-readable completion marker.
+fn ptyPromptMarkerCommand() -> &'static str {
+    "printf '\\033]133;OperitPrompt=plain:%s:%s\\007' \"$PWD\" \"$__operit_status\""
+}
+
+/// Writes one command-completion marker command into an interactive shell PTY.
+fn writePtyPromptMarker(writer: &Arc<Mutex<Box<dyn Write + Send>>>) -> HostResult<()> {
+    let markerCommand = format!("__operit_status=$?; {}\r", ptyPromptMarkerCommand());
+    let mut writer = writer
+        .lock()
+        .map_err(|_| HostError::new("pty writer mutex poisoned"))?;
+    writer.write_all(markerCommand.as_bytes())?;
+    writer.flush()?;
+    Ok(())
+}
+
+/// Builds an interactive PTY command for one configured POSIX shell.
+fn posixPtyCommand(workingDir: &str, commandSpec: &PtyCommandSpec) -> CommandBuilder {
+    let mut command = CommandBuilder::new(&commandSpec.program);
+    for argument in &commandSpec.args {
+        command.arg(argument);
+    }
+    match &commandSpec.processWorkingDirectory {
+        PtyProcessWorkingDirectory::Session => command.cwd(workingDir),
+        PtyProcessWorkingDirectory::Fixed(directory) => command.cwd(directory),
+    }
+    command.env("TERM", "xterm-256color");
+    command.env("COLORTERM", "truecolor");
+    command.env("LANG", "C.UTF-8");
+    for (key, value) in &commandSpec.environment {
+        command.env(key, value);
+    }
+    match &commandSpec.sessionWorkingDirectoryEnvironment {
+        PtySessionWorkingDirectoryEnvironment::None => {}
+        PtySessionWorkingDirectoryEnvironment::Name(key) => command.env(key, workingDir),
+    }
+    // Isolation is selected by the owning Host from its actual signature.
+    // Unrestricted macOS shells retain controlling-terminal signals and job control.
+    command.set_controlling_tty(commandSpec.controllingTty);
+
+    command.env(
+        "PS1",
+        match commandSpec.commandProtocol {
+            PtyCommandProtocol::BashPromptCommand => "$PWD $ ",
+            PtyCommandProtocol::ExplicitMarker => "sh$ ",
+        },
+    );
+    if commandSpec.commandProtocol == PtyCommandProtocol::BashPromptCommand {
+        command.env(
+            "PROMPT_COMMAND",
+            r#"__operit_status=$?; printf '\033]133;OperitPrompt=%s:%s\007' "$(printf '%s' "$PWD" | base64 | tr -d '\n')" "$__operit_status""#,
+        );
+    }
+    command
+}
+
+#[allow(non_snake_case)]
+fn ptySize(rows: u16, cols: u16) -> PtySize {
+    PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    }
+}
+
+#[allow(non_snake_case)]
+fn appendPtyOutput(output: &Arc<Mutex<VecDeque<u8>>>, data: &[u8]) {
+    if let Ok(mut buffer) = output.lock() {
+        buffer.extend(data.iter().copied());
+        while buffer.len() > PTY_OUTPUT_LIMIT {
+            buffer.pop_front();
+        }
+    }
+}
+
+#[allow(non_snake_case)]
+fn appendPtyCommandOutput(output: &PtyCommandOutput, data: &[u8]) {
+    let (lock, condvar) = &**output;
+    if let Ok(mut buffer) = lock.lock() {
+        buffer.extend(data.iter().copied());
+        while buffer.len() > PTY_OUTPUT_LIMIT {
+            buffer.pop_front();
+        }
+        condvar.notify_all();
+    }
+}
+
+#[allow(non_snake_case)]
+fn processPtyTerminalQueries(
+    writer: &Arc<Mutex<Box<dyn Write + Send>>>,
+    cursorState: &PtyCursorState,
+    data: &[u8],
+) {
+    let mut index = 0usize;
+    while index < data.len() {
+        if data[index..].starts_with(b"\x1b[6n") {
+            if let Ok(cursor) = cursorState.lock() {
+                let response = format!("\x1b[{};{}R", cursor.row, cursor.col);
+                if let Ok(mut writer) = writer.lock() {
+                    let _ = writer.write_all(response.as_bytes());
+                    let _ = writer.flush();
+                }
+            }
+            index += 4;
+            continue;
+        }
+        if data[index..].starts_with(PTY_PROMPT_MARKER_PREFIX) {
+            let payloadStart = index + PTY_PROMPT_MARKER_PREFIX.len();
+            if let Some(relativeEnd) = data[payloadStart..]
+                .iter()
+                .position(|value| *value == PTY_PROMPT_MARKER_END)
+            {
+                index = payloadStart + relativeEnd + 1;
+                continue;
+            }
+        }
+        if data[index] == b'\x1b' {
+            if index + 1 < data.len() && data[index + 1] == b'[' {
+                index += 2;
+                while index < data.len() {
+                    let value = data[index];
+                    index += 1;
+                    if value >= b'@' && value <= b'~' {
+                        break;
+                    }
+                }
+                continue;
+            }
+            if index + 1 < data.len() && data[index + 1] == b']' {
+                index += 2;
+                while index < data.len() {
+                    let value = data[index];
+                    index += 1;
+                    if value == PTY_PROMPT_MARKER_END {
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+        updatePtyCursor(cursorState, data[index]);
+        index += 1;
+    }
+}
+
+#[allow(non_snake_case)]
+fn updatePtyCursor(cursorState: &PtyCursorState, value: u8) {
+    if let Ok(mut cursor) = cursorState.lock() {
+        match value {
+            b'\r' => cursor.col = 1,
+            b'\n' => {
+                cursor.row += 1;
+                cursor.col = 1;
+            }
+            8 => {
+                if cursor.col > 1 {
+                    cursor.col -= 1;
+                }
+            }
+            0x20..=0x7e => cursor.col += 1,
+            _ => {}
+        }
+    }
+}
+
+#[allow(non_snake_case)]
+fn clearPtyCommandOutput(output: &PtyCommandOutput) -> HostResult<()> {
+    let (lock, _) = &**output;
+    let mut buffer = lock
+        .lock()
+        .map_err(|_| HostError::new("pty command output mutex poisoned"))?;
+    buffer.clear();
+    Ok(())
+}
+
+#[allow(non_snake_case)]
+fn waitForInitialPtyPrompt(output: PtyCommandOutput, timeout: Duration) -> HostResult<()> {
+    let deadline = Instant::now() + timeout;
+    let mut collected = Vec::new();
+    let mut promptSeenAt = None;
+    let quietPeriod = Duration::from_millis(150);
+    loop {
+        let drained = drainPtyCommandOutput(&output, &mut collected, deadline)?;
+        if drained > 0 {
+            promptSeenAt = None;
+        }
+        if findLastPtyPromptMarker(&collected)?.is_some() && promptSeenAt.is_none() {
+            promptSeenAt = Some(Instant::now());
+        }
+        if promptSeenAt.is_some_and(|seenAt| seenAt.elapsed() >= quietPeriod) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(HostError::new("Timed out waiting for terminal prompt"));
+        }
+    }
+}
+
+#[allow(non_snake_case)]
+fn executePtyCommandInSession(
+    output: PtyCommandOutput,
+    command: &str,
+    timeoutMs: u64,
+    commandProtocol: PtyCommandProtocol,
+    onOutput: &mut dyn FnMut(&[u8]) -> HostResult<()>,
+) -> HostResult<SessionCommandResult> {
+    let deadline = (timeoutMs != 0).then(|| Instant::now() + Duration::from_millis(timeoutMs));
+    let mut collected = Vec::new();
+    let mut promptSeenAt = None;
+    let quietPeriod = Duration::from_millis(150);
+    loop {
+        let previousLength = collected.len();
+        let waitDeadline = deadline.unwrap_or_else(|| Instant::now() + Duration::from_millis(100));
+        let drained = drainPtyCommandOutput(&output, &mut collected, waitDeadline)?;
+        onOutput(&collected[previousLength..])?;
+        if timeoutMs == 0 && collected.len() > PTY_OUTPUT_LIMIT {
+            collected.drain(..collected.len() - PTY_OUTPUT_LIMIT);
+        }
+        if drained > 0 {
+            promptSeenAt = None;
+        }
+        if let Some(marker) = findLastPtyPromptMarker(&collected)? {
+            if promptSeenAt.is_none() {
+                promptSeenAt = Some(Instant::now());
+            }
+            if !promptSeenAt.is_some_and(|seenAt| seenAt.elapsed() >= quietPeriod) {
+                if deadline.map_or(true, |deadline| Instant::now() < deadline) {
+                    continue;
+                }
+            }
+            let output = ptyCommandOutputText(
+                &collected,
+                command,
+                Some(&marker.workingDir),
+                commandProtocol,
+            );
+            return Ok(SessionCommandResult {
+                output,
+                exitCode: marker.exitCode,
+                timedOut: false,
+                workingDir: Some(marker.workingDir),
+            });
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            let output = ptyCommandOutputText(&collected, command, None, commandProtocol);
+            return Ok(SessionCommandResult {
+                output,
+                exitCode: -1,
+                timedOut: true,
+                workingDir: None,
+            });
+        }
+    }
+}
+
+#[allow(non_snake_case)]
+fn cancelTimedOutPtyCommand(session: &mut PtySession) -> HostResult<Option<String>> {
+    {
+        let mut writer = session
+            .process()?
+            .writer
+            .lock()
+            .map_err(|_| HostError::new("pty writer mutex poisoned"))?;
+        writer.write_all(b"\x03")?;
+        if session.commandProtocol == PtyCommandProtocol::ExplicitMarker {
+            writer.write_all(b"\r")?;
+            let markerCommand = format!("__operit_status=$?; {}\r", ptyPromptMarkerCommand());
+            writer.write_all(markerCommand.as_bytes())?;
+        }
+        writer.flush()?;
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(COMMAND_CANCEL_SETTLE_TIMEOUT_MS);
+    let mut collected = Vec::new();
+    while Instant::now() < deadline {
+        let drained = drainPtyCommandOutput(&session.commandOutput, &mut collected, deadline)?;
+        if drained == 0 {
+            continue;
+        }
+        if let Some(marker) = findLastPtyPromptMarker(&collected)? {
+            return Ok(Some(marker.workingDir));
+        }
+    }
+    Ok(None)
+}
+
+#[allow(non_snake_case)]
+fn drainPtyCommandOutput(
+    output: &PtyCommandOutput,
+    collected: &mut Vec<u8>,
+    deadline: Instant,
+) -> HostResult<usize> {
+    let (lock, condvar) = &**output;
+    let mut buffer = lock
+        .lock()
+        .map_err(|_| HostError::new("pty command output mutex poisoned"))?;
+    if buffer.is_empty() {
+        let now = Instant::now();
+        if now < deadline {
+            let wait = (deadline - now).min(Duration::from_millis(100));
+            let result = condvar
+                .wait_timeout(buffer, wait)
+                .map_err(|_| HostError::new("pty command output mutex poisoned"))?;
+            buffer = result.0;
+        }
+    }
+    let mut drained = 0usize;
+    while let Some(value) = buffer.pop_front() {
+        collected.push(value);
+        drained += 1;
+    }
+    Ok(drained)
+}
+
+#[derive(Clone, Debug)]
+struct PtyPromptMarker {
+    workingDir: String,
+    exitCode: i32,
+}
+
+#[allow(non_snake_case)]
+fn findLastPtyPromptMarker(data: &[u8]) -> HostResult<Option<PtyPromptMarker>> {
+    let Some(start) = rfindBytes(data, PTY_PROMPT_MARKER_PREFIX) else {
+        return Ok(None);
+    };
+    let payloadStart = start + PTY_PROMPT_MARKER_PREFIX.len();
+    let Some(relativeEnd) = data[payloadStart..]
+        .iter()
+        .position(|value| *value == PTY_PROMPT_MARKER_END)
+    else {
+        return Ok(None);
+    };
+    let payloadEnd = payloadStart + relativeEnd;
+    let payload = std::str::from_utf8(&data[payloadStart..payloadEnd])
+        .map_err(|error| HostError::new(format!("Invalid PTY prompt marker UTF-8: {error}")))?;
+    let (workingDir, exitCodeText) = if let Some(plainPayload) = payload.strip_prefix("plain:") {
+        let (workingDir, exitCode) = plainPayload
+            .rsplit_once(':')
+            .ok_or_else(|| HostError::new(format!("Invalid PTY prompt marker '{payload}'")))?;
+        (workingDir.to_string(), exitCode)
+    } else {
+        let (workingDirText, exitCode) = payload
+            .split_once(':')
+            .ok_or_else(|| HostError::new(format!("Invalid PTY prompt marker '{payload}'")))?;
+        let workingDirBytes = BASE64_STANDARD
+            .decode(workingDirText.as_bytes())
+            .map_err(|error| HostError::new(format!("Invalid PTY prompt cwd marker: {error}")))?;
+        let workingDir = String::from_utf8(workingDirBytes)
+            .map_err(|error| HostError::new(format!("Invalid PTY prompt cwd UTF-8: {error}")))?;
+        (workingDir, exitCode)
+    };
+    let exitCode = parseExitCode(exitCodeText)?;
+    Ok(Some(PtyPromptMarker {
+        workingDir,
+        exitCode,
+    }))
+}
+
+#[allow(non_snake_case)]
+fn rfindBytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .rposition(|window| window == needle)
+}
+
+#[allow(non_snake_case)]
+fn ptyCommandOutputText(
+    raw: &[u8],
+    command: &str,
+    workingDir: Option<&str>,
+    commandProtocol: PtyCommandProtocol,
+) -> String {
+    let visibleBytes = stripPtyPromptMarkers(raw);
+    let text = String::from_utf8_lossy(&visibleBytes);
+    let clean = renderTerminalText(&text);
+    let withoutEcho = dropCommandEcho(clean, command);
+    dropTrailingPtyPrompt(withoutEcho, workingDir, commandProtocol)
+}
+
+#[allow(non_snake_case)]
+fn ptyScreenContent(session: &PtySession) -> HostResult<String> {
+    let buffer = session
+        .screenOutput
+        .lock()
+        .map_err(|_| HostError::new("pty screen output mutex poisoned"))?;
+    let bytes = buffer.iter().copied().collect::<Vec<_>>();
+    let visibleBytes = stripPtyPromptMarkers(&bytes);
+    let text = String::from_utf8_lossy(&visibleBytes);
+    Ok(renderTerminalText(&text))
+}
+
+#[allow(non_snake_case)]
+fn stripPtyPromptMarkers(raw: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(raw.len());
+    let mut index = 0usize;
+    while index < raw.len() {
+        if raw[index..].starts_with(PTY_PROMPT_MARKER_PREFIX) {
+            let payloadStart = index + PTY_PROMPT_MARKER_PREFIX.len();
+            if let Some(relativeEnd) = raw[payloadStart..]
+                .iter()
+                .position(|value| *value == PTY_PROMPT_MARKER_END)
+            {
+                index = payloadStart + relativeEnd + 1;
+                continue;
+            }
+        }
+        output.push(raw[index]);
+        index += 1;
+    }
+    output
+}
+
+#[allow(non_snake_case)]
+fn stripPtyDeviceStatusReports(raw: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(raw.len());
+    let mut index = 0usize;
+    while index < raw.len() {
+        if raw[index..].starts_with(b"\x1b[6n") {
+            index += 4;
+            continue;
+        }
+        output.push(raw[index]);
+        index += 1;
+    }
+    output
+}
+
+#[derive(Default)]
+struct TerminalTextRenderer {
+    lines: Vec<Vec<char>>,
+    row: usize,
+    col: usize,
+    savedRow: usize,
+    savedCol: usize,
+}
+
+impl TerminalTextRenderer {
+    fn new() -> Self {
+        Self {
+            lines: vec![Vec::new()],
+            row: 0,
+            col: 0,
+            savedRow: 0,
+            savedCol: 0,
+        }
+    }
+
+    fn write(&mut self, value: &str) {
+        let chars = value.chars().collect::<Vec<_>>();
+        let mut index = 0usize;
+        while index < chars.len() {
+            let ch = chars[index];
+            if ch == '\x1b' {
+                index = self.consumeEscape(&chars, index);
+                continue;
+            }
+            self.writeChar(ch);
+            index += 1;
+        }
+    }
+
+    fn text(&self) -> String {
+        self.lines
+            .iter()
+            .map(|line| line.iter().collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn consumeEscape(&mut self, chars: &[char], index: usize) -> usize {
+        if index + 1 >= chars.len() {
+            return index + 1;
+        }
+        match chars[index + 1] {
+            '[' => self.consumeCsi(chars, index + 2),
+            ']' => self.consumeOsc(chars, index + 2),
+            '7' => {
+                self.savedRow = self.row;
+                self.savedCol = self.col;
+                index + 2
+            }
+            '8' => {
+                self.row = self.savedRow;
+                self.col = self.savedCol;
+                self.ensureCursorLine();
+                index + 2
+            }
+            _ => index + 2,
+        }
+    }
+
+    fn consumeOsc(&mut self, chars: &[char], mut index: usize) -> usize {
+        while index < chars.len() {
+            let ch = chars[index];
+            index += 1;
+            if ch == '\x07' {
+                break;
+            }
+            if ch == '\x1b' && index < chars.len() && chars[index] == '\\' {
+                index += 1;
+                break;
+            }
+        }
+        index
+    }
+
+    fn consumeCsi(&mut self, chars: &[char], mut index: usize) -> usize {
+        let start = index;
+        while index < chars.len() {
+            let ch = chars[index];
+            index += 1;
+            if ch >= '@' && ch <= '~' {
+                let params = chars[start..index - 1].iter().collect::<String>();
+                self.applyCsi(&params, ch);
+                break;
+            }
+        }
+        index
+    }
+
+    fn applyCsi(&mut self, params: &str, command: char) {
+        let values = csiParams(params);
+        match command {
+            'A' => self.moveRowUp(csiValue(&values, 0, 1)),
+            'B' => self.moveRowDown(csiValue(&values, 0, 1)),
+            'C' => self.col += csiValue(&values, 0, 1),
+            'D' => self.col = self.col.saturating_sub(csiValue(&values, 0, 1)),
+            'G' => self.col = csiValue(&values, 0, 1).saturating_sub(1),
+            'H' | 'f' => {
+                self.row = csiValue(&values, 0, 1).saturating_sub(1);
+                self.col = csiValue(&values, 1, 1).saturating_sub(1);
+                self.ensureCursorLine();
+            }
+            'J' => self.eraseDisplay(csiValue(&values, 0, 0)),
+            'K' => self.eraseLine(csiValue(&values, 0, 0)),
+            'X' => self.eraseChars(csiValue(&values, 0, 1)),
+            's' => {
+                self.savedRow = self.row;
+                self.savedCol = self.col;
+            }
+            'u' => {
+                self.row = self.savedRow;
+                self.col = self.savedCol;
+                self.ensureCursorLine();
+            }
+            _ => {}
+        }
+    }
+
+    fn writeChar(&mut self, ch: char) {
+        match ch {
+            '\r' => self.col = 0,
+            '\n' => {
+                self.row += 1;
+                self.col = 0;
+                self.ensureCursorLine();
+            }
+            '\x08' => {
+                self.col = self.col.saturating_sub(1);
+            }
+            '\t' => {
+                let nextStop = ((self.col / 8) + 1) * 8;
+                while self.col < nextStop {
+                    self.putChar(' ');
+                }
+            }
+            _ if ch.is_control() => {}
+            _ => self.putChar(ch),
+        }
+    }
+
+    fn putChar(&mut self, ch: char) {
+        self.ensureCursorLine();
+        let line = &mut self.lines[self.row];
+        while line.len() < self.col {
+            line.push(' ');
+        }
+        if line.len() == self.col {
+            line.push(ch);
+        } else {
+            line[self.col] = ch;
+        }
+        self.col += 1;
+    }
+
+    fn moveRowUp(&mut self, count: usize) {
+        self.row = self.row.saturating_sub(count);
+        self.ensureCursorLine();
+    }
+
+    fn moveRowDown(&mut self, count: usize) {
+        self.row += count;
+        self.ensureCursorLine();
+    }
+
+    fn eraseDisplay(&mut self, mode: usize) {
+        match mode {
+            0 => {
+                self.eraseLine(0);
+                self.lines.truncate(self.row + 1);
+            }
+            1 => {
+                for row in 0..self.row {
+                    self.lines[row].clear();
+                }
+                self.eraseLine(1);
+            }
+            2 | 3 => {
+                self.lines.clear();
+                self.lines.push(Vec::new());
+                self.row = 0;
+                self.col = 0;
+            }
+            _ => {}
+        }
+    }
+
+    fn eraseLine(&mut self, mode: usize) {
+        self.ensureCursorLine();
+        let line = &mut self.lines[self.row];
+        match mode {
+            0 => {
+                if self.col < line.len() {
+                    line.truncate(self.col);
+                }
+            }
+            1 => {
+                let end = self.col.min(line.len());
+                for cell in &mut line[..end] {
+                    *cell = ' ';
+                }
+            }
+            2 => line.clear(),
+            _ => {}
+        }
+    }
+
+    fn eraseChars(&mut self, count: usize) {
+        self.ensureCursorLine();
+        let line = &mut self.lines[self.row];
+        let end = (self.col + count).min(line.len());
+        for cell in &mut line[self.col..end] {
+            *cell = ' ';
+        }
+    }
+
+    fn ensureCursorLine(&mut self) {
+        while self.lines.len() <= self.row {
+            self.lines.push(Vec::new());
+        }
+    }
+}
+
+#[allow(non_snake_case)]
+fn renderTerminalText(value: &str) -> String {
+    let mut renderer = TerminalTextRenderer::new();
+    renderer.write(value);
+    renderer.text()
+}
+
+#[allow(non_snake_case)]
+fn csiParams(params: &str) -> Vec<Option<usize>> {
+    let params = params
+        .trim_start_matches('?')
+        .trim_start_matches('>')
+        .trim_start_matches('!');
+    params
+        .split(';')
+        .map(|value| {
+            if value.is_empty() {
+                None
+            } else {
+                value.parse::<usize>().ok()
+            }
+        })
+        .collect()
+}
+
+#[allow(non_snake_case)]
+fn csiValue(values: &[Option<usize>], index: usize, defaultValue: usize) -> usize {
+    values
+        .get(index)
+        .and_then(|value| *value)
+        .unwrap_or(defaultValue)
+}
+
+#[allow(non_snake_case)]
+fn dropCommandEcho(value: String, command: &str) -> String {
+    let mut lines = value.lines().map(str::to_string).collect::<Vec<_>>();
+    while lines.first().is_some_and(|line| line.trim().is_empty()) {
+        lines.remove(0);
+    }
+    if lines.first().is_some_and(|line| {
+        let line = line.trim_end();
+        let command = command.trim();
+        line == command || line.ends_with(command)
+    }) {
+        lines.remove(0);
+    }
+    lines.join("\n").trim().to_string()
+}
+
+#[allow(non_snake_case)]
+fn dropTrailingPtyPrompt(
+    value: String,
+    workingDir: Option<&str>,
+    commandProtocol: PtyCommandProtocol,
+) -> String {
+    match commandProtocol {
+        PtyCommandProtocol::BashPromptCommand => {
+            let Some(workingDir) = workingDir else {
+                return value.trim().to_string();
+            };
+            let prompt = format!("{workingDir} $");
+            let mut lines = value.lines().map(str::to_string).collect::<Vec<_>>();
+            while lines.last().is_some_and(|line| line.trim().is_empty()) {
+                lines.pop();
+            }
+            if lines
+                .last()
+                .is_some_and(|line| line.trim_end() == prompt.as_str())
+            {
+                lines.pop();
+            }
+            lines.join("\n").trim().to_string()
+        }
+        PtyCommandProtocol::ExplicitMarker => value
+            .trim_end()
+            .strip_suffix("sh$")
+            .unwrap_or(value.trim_end())
+            .trim()
+            .to_string(),
+    }
+}
+
+#[allow(non_snake_case)]
+fn toHostError(error: impl std::fmt::Display) -> HostError {
+    HostError::new(error.to_string())
+}
+
+/// Validates the terminal implementation owned by the shared POSIX PTY host.
+fn requireNativeTerminal(terminal: &str) -> HostResult<()> {
+    match terminal.trim() {
+        TERMINAL => Ok(()),
+        value => Err(HostError::new(format!(
+            "Unsupported terminal implementation for shared POSIX PTY host: {value}"
+        ))),
+    }
+}
+
+/// Clears one retained PTY output buffer after protocol initialization.
+fn clearPtyOutput(output: &Arc<Mutex<VecDeque<u8>>>) -> HostResult<()> {
+    let mut buffer = output
+        .lock()
+        .map_err(|_| HostError::new("pty output mutex poisoned"))?;
+    buffer.clear();
+    Ok(())
+}
+
+#[allow(non_snake_case)]
+fn sessionKey(terminalType: &str, name: &str) -> String {
+    format!("{terminalType}:{name}")
+}
+
+#[allow(non_snake_case)]
+fn removeSessionMappings(state: &mut TerminalState, sessionId: &str) {
+    state.sessionNameToId.retain(|_, value| value != sessionId);
+    state
+        .hiddenExecutorKeyToSessionId
+        .retain(|_, value| value != sessionId);
+}
+
+#[allow(non_snake_case)]
+fn parseExitCode(exitCodeText: &str) -> HostResult<i32> {
+    exitCodeText.trim().parse::<i32>().map_err(|error| {
+        HostError::new(format!(
+            "Invalid terminal exit code marker '{exitCodeText}': {error}"
+        ))
+    })
+}
+
+#[allow(non_snake_case)]
+fn applyPtyTerminalInput(
+    session: &mut PtySession,
+    input: Option<&str>,
+    control: Option<&str>,
+) -> HostResult<usize> {
+    let mut acceptedChars = 0;
+    if let Some(input) = input {
+        let mut writer = session
+            .process()?
+            .writer
+            .lock()
+            .map_err(|_| HostError::new("pty writer mutex poisoned"))?;
+        writer.write_all(input.as_bytes())?;
+        writer.flush()?;
+        acceptedChars += input.chars().count();
+    }
+    if let Some(control) = control {
+        let sequence = match control {
+            "enter" => "\r".to_string(),
+            value => controlToSequence(value, input)?,
+        };
+        let mut writer = session
+            .process()?
+            .writer
+            .lock()
+            .map_err(|_| HostError::new("pty writer mutex poisoned"))?;
+        writer.write_all(sequence.as_bytes())?;
+        writer.flush()?;
+        acceptedChars += sequence.chars().count();
+    }
+    Ok(acceptedChars)
+}
+
+#[allow(non_snake_case)]
+fn controlToSequence(control: &str, input: Option<&str>) -> HostResult<String> {
+    match control {
+        "enter" => Ok("\n".to_string()),
+        "tab" => Ok("\t".to_string()),
+        "esc" => Ok("\x1b".to_string()),
+        "up" => Ok("\x1b[A".to_string()),
+        "down" => Ok("\x1b[B".to_string()),
+        "right" => Ok("\x1b[C".to_string()),
+        "left" => Ok("\x1b[D".to_string()),
+        "home" => Ok("\x1b[H".to_string()),
+        "end" => Ok("\x1b[F".to_string()),
+        "pageup" => Ok("\x1b[5~".to_string()),
+        "pagedown" => Ok("\x1b[6~".to_string()),
+        "delete" => Ok("\x1b[3~".to_string()),
+        "backspace" => Ok("\x7f".to_string()),
+        "ctrl" | "control" => ctrlSequence(input),
+        "alt" | "meta" | "cmd" => Ok(format!("\x1b{}", input.unwrap_or(""))),
+        "shift" => Ok(input.unwrap_or("").to_uppercase()),
+        other => Err(HostError::new(format!(
+            "Unsupported terminal control: {other}"
+        ))),
+    }
+}
+
+#[allow(non_snake_case)]
+fn ctrlSequence(input: Option<&str>) -> HostResult<String> {
+    let input = input.ok_or_else(|| HostError::new("ctrl control requires input"))?;
+    let mut chars = input.chars();
+    let value = chars
+        .next()
+        .ok_or_else(|| HostError::new("ctrl control requires input"))?;
+    if chars.next().is_some() {
+        return Err(HostError::new(
+            "ctrl control input must be a single character",
+        ));
+    }
+    let code = match value.to_ascii_uppercase() {
+        'A'..='Z' => value.to_ascii_uppercase() as u8 - b'A' + 1,
+        '[' => 27,
+        '\\' => 28,
+        ']' => 29,
+        '^' => 30,
+        '_' => 31,
+        '?' => 127,
+        other => {
+            return Err(HostError::new(format!(
+                "Unsupported ctrl control input: {other}"
+            )))
+        }
+    };
+    Ok((code as char).to_string())
+}
+
+#[allow(non_snake_case)]
+fn normalizeControl(rawControl: &str) -> Option<&'static str> {
+    match rawControl.trim().to_ascii_lowercase().as_str() {
+        "" => None,
+        "return" => Some("enter"),
+        "escape" => Some("esc"),
+        "arrowup" => Some("up"),
+        "arrowdown" => Some("down"),
+        "arrowleft" => Some("left"),
+        "arrowright" => Some("right"),
+        "pgup" | "page_up" => Some("pageup"),
+        "pgdn" | "page_down" => Some("pagedown"),
+        "del" => Some("delete"),
+        "enter" => Some("enter"),
+        "tab" => Some("tab"),
+        "esc" => Some("esc"),
+        "up" => Some("up"),
+        "down" => Some("down"),
+        "left" => Some("left"),
+        "right" => Some("right"),
+        "home" => Some("home"),
+        "end" => Some("end"),
+        "pageup" => Some("pageup"),
+        "pagedown" => Some("pagedown"),
+        "delete" => Some("delete"),
+        "backspace" => Some("backspace"),
+        "ctrl" | "control" => Some("ctrl"),
+        "alt" => Some("alt"),
+        "shift" => Some("shift"),
+        "meta" => Some("meta"),
+        "cmd" => Some("cmd"),
+        _ => None,
+    }
+}
+
+#[allow(non_snake_case)]
+fn nonBlank(value: &str, paramName: &str) -> HostResult<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(HostError::new(format!("{paramName} parameter is required")));
+    }
+    Ok(trimmed.to_string())
+}
+
+#[allow(non_snake_case)]
+fn nextSessionId() -> String {
+    Uuid::new_v4().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use operit_host_api::TerminalHost;
+
+    /// An exited hidden shell is replaced before a new command is submitted.
+    #[test]
+    fn hidden_executor_replaces_an_exited_shell() {
+        let host = NativePtyTerminalHost::new();
+        let first = host.executeHiddenCommand("printf 'first\\n'", "recover", 3000).unwrap();
+        assert!(first.output.contains("first"));
+        let key = sessionKey(&host.commandSpec.terminalType, "recover");
+        let old = {
+            let mut state = host.lockState().unwrap();
+            let id = state.hiddenExecutorKeyToSessionId[&key].clone();
+            let process = state.ptySessions.get_mut(&id).unwrap().process.as_mut().unwrap();
+            process.child.kill().unwrap();
+            process.child.wait().unwrap();
+            // Do not discard a shell while its previous command is still being observed.
+            state.ptySessions.get_mut(&id).unwrap().commandRunning = true;
+            assert_eq!(liveHiddenPtySessionId(&mut state, &key).unwrap(), Some(id.clone()));
+            state.ptySessions.get_mut(&id).unwrap().commandRunning = false;
+            id
+        };
+        let second = host.executeHiddenCommand("printf 'second\\n'", "recover", 3000).unwrap();
+        assert!(second.output.contains("second"));
+        let state = host.lockState().unwrap();
+        let new = &state.hiddenExecutorKeyToSessionId[&key];
+        assert_ne!(new, &old);
+        assert!(!state.ptySessions.contains_key(&old));
+    }
+
+    /// Concurrent first use keeps only one mapped shell for the executor key.
+    #[test]
+    fn concurrent_hidden_executor_creation_does_not_orphan_sessions() {
+        let host = NativePtyTerminalHost::new();
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let threads: Vec<_> = (0..4).map(|_| {
+            let host = host.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let kind = &host.commandSpec.terminalType;
+                hiddenPtySessionId(&host, &sessionKey(kind, "concurrent"), "concurrent", kind).unwrap()
+            })
+        }).collect();
+        let ids: Vec<_> = threads.into_iter().map(|thread| thread.join().unwrap()).collect();
+        assert!(ids.iter().all(|id| id == &ids[0]));
+        let state = host.lockState().unwrap();
+        assert_eq!(state.ptySessions.len(), 1);
+        assert_eq!(state.hiddenExecutorKeyToSessionId.len(), 1);
+    }
+
+    /// The name and command state are checked under the same lock as removal.
+    #[test]
+    fn idle_close_rejects_wrong_owner_and_running_command() {
+        let host = NativePtyTerminalHost::new();
+        let name = "maintenance_child";
+        let session = host.createOrGetSession(name).unwrap();
+        assert!(host.closeSessionIfIdle(&session.sessionId, "other_child").is_err());
+        let worker = host.clone();
+        let id = session.sessionId.clone();
+        let thread = std::thread::spawn(move || worker.executeInSession(&id, "sleep 1", 5000));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if host.lockState().unwrap().ptySessions[&session.sessionId].commandRunning { break; }
+            assert!(Instant::now() < deadline, "command did not start");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(host.closeSessionIfIdle(&session.sessionId, name).is_err());
+        assert!(!thread.join().unwrap().unwrap().timedOut);
+        assert!(host.closeSessionIfIdle(&session.sessionId, name).unwrap().success);
+        assert!(!host.ownsSession(&session.sessionId).unwrap());
+        let generated = host.createOrGetSession("maintenance_child_generation_2").unwrap();
+        assert!(host.closeSessionIfIdle(&generated.sessionId, name).unwrap().success);
+        let other = host.createOrGetSession("maintenance_child_generation_2_extra").unwrap();
+        assert!(host.closeSessionIfIdle(&other.sessionId, name).is_err());
+        host.closeSession(&other.sessionId).unwrap();
+    }
+
+    /// Runs every statement before completing and keeps changes in the existing shell.
+    #[test]
+    fn posix_multiline_command_preserves_shell_state() {
+        let host = NativePtyTerminalHost::new();
+        let session = host.createOrGetSession("terminal_multiline").unwrap();
+        let result = host.executeInSession(
+            &session.sessionId,
+            "OPERIT_V=$(cat <<'EOF'\n中文 'quoted' \\012 $literal\nEOF\n)\nsleep 1\nprintf '%s\\n' \"$OPERIT_V\"",
+            5000,
+        ).unwrap();
+        assert!(!result.timedOut);
+        assert_eq!(result.exitCode, 0);
+        assert_eq!(result.output, "中文 'quoted' \\012 $literal");
+        let next = host
+            .executeInSession(&session.sessionId, "printf '%s\\n' \"$OPERIT_V\"", 3000)
+            .unwrap();
+        assert_eq!(next.output, "中文 'quoted' \\012 $literal");
+    }
+
+    /// Submits literal history characters through both interactive Bash protocols.
+    #[test]
+    fn posix_history_characters_execute_without_expansion() {
+        for protocol in [
+            PtyCommandProtocol::BashPromptCommand,
+            PtyCommandProtocol::ExplicitMarker,
+        ] {
+            let mut host = NativePtyTerminalHost::new();
+            Arc::make_mut(&mut host.commandSpec).commandProtocol = protocol;
+            let session = host.createOrGetSession("terminal_history").unwrap();
+            let result = host
+                .executeInSession(
+                    &session.sessionId,
+                    "#!/bin/bash\nOPERIT_HISTORY_LITERAL='中文 ! !! !$ !123'\nprintf '%s\\n' \"$OPERIT_HISTORY_LITERAL\"",
+                    3000,
+                )
+                .unwrap();
+            assert!(!result.timedOut);
+            assert_eq!(result.exitCode, 0);
+            assert_eq!(result.output.lines().last(), Some("中文 ! !! !$ !123"));
+
+            let next = host
+                .executeInSession(
+                    &session.sessionId,
+                    "printf '%s\\n' \"$OPERIT_HISTORY_LITERAL\" 'single line!'",
+                    3000,
+                )
+                .unwrap();
+            assert!(!next.timedOut);
+            assert_eq!(next.exitCode, 0);
+            assert!(next.output.ends_with("中文 ! !! !$ !123\nsingle line!"));
+            host.closePtySession(&session.sessionId).unwrap();
+        }
+    }
+
+    /// Applies the timeout to the complete multiline script and keeps the shell responsive.
+    #[test]
+    fn posix_multiline_timeout_keeps_session_usable() {
+        let host = NativePtyTerminalHost::new();
+        let session = host
+            .createOrGetSession("terminal_multiline_timeout")
+            .unwrap();
+        let result = host
+            .executeInSession(
+                &session.sessionId,
+                "printf 'started\\n'\nsleep 8\nprintf forbidden",
+                800,
+            )
+            .unwrap();
+        assert!(result.timedOut);
+        let next = host
+            .executeInSession(&session.sessionId, "printf 'ready\\n'", 3000)
+            .unwrap();
+        assert!(!next.timedOut);
+        assert_eq!(next.output, "ready");
+    }
+
+    #[test]
+    fn linux_command_block_completes_in_pty() {
+        let host = NativePtyTerminalHost::new();
+        let session = host
+            .createOrGetSession("linux_terminal_marker")
+            .expect("create terminal session");
+        let result = host
+            .executeInSession(
+                &session.sessionId,
+                "printf 'hello\\n'; [ -t 0 ] && echo tty=yes || echo tty=no",
+                3000,
+            )
+            .expect("execute terminal command");
+
+        assert!(!result.timedOut);
+        assert_eq!(result.exitCode, 0);
+        assert_eq!(result.output, "hello\ntty=yes");
+    }
+
+    #[test]
+    fn linux_screen_records_prompt_command_output_prompt() {
+        let host = NativePtyTerminalHost::new();
+        let session = host
+            .createOrGetSession("linux_terminal_screen")
+            .expect("create terminal session");
+        let workingDir = std::env::current_dir().unwrap().display().to_string();
+        let prompt = format!("{workingDir} $ ");
+        let command = "printf 'screen-ok\\n'";
+
+        let initialScreen = host
+            .getSessionScreen(&session.sessionId)
+            .expect("get initial screen");
+        assert_eq!(initialScreen.content, prompt);
+
+        let result = host
+            .executeInSession(&session.sessionId, command, 3000)
+            .expect("execute terminal command");
+        let screen = host
+            .getSessionScreen(&session.sessionId)
+            .expect("get terminal screen");
+
+        assert!(!result.timedOut);
+        assert_eq!(result.output, "screen-ok");
+        assert_eq!(
+            screen.content.split('\n').collect::<Vec<_>>(),
+            vec![
+                format!("{prompt}{command}"),
+                "screen-ok".to_string(),
+                prompt
+            ]
+        );
+        assert!(!screen.commandRunning);
+    }
+
+    #[test]
+    fn visible_linux_sessions_are_listed_as_pty() {
+        let host = NativePtyTerminalHost::new();
+        let created = host
+            .createOrGetSession("linux_visible_ai")
+            .expect("create visible terminal session");
+        let manual = host
+            .startPtySession(
+                "linux_visible_manual",
+                TERMINAL,
+                PRIMARY_TERMINAL_TYPE,
+                &std::env::current_dir().unwrap().display().to_string(),
+                24,
+                80,
+            )
+            .expect("start manual terminal session");
+
+        let sessions = host.listSessions().expect("list terminal sessions");
+        let createdEntry = sessions
+            .iter()
+            .find(|entry| entry.sessionId == created.sessionId)
+            .expect("created terminal listed");
+        let manualEntry = sessions
+            .iter()
+            .find(|entry| entry.sessionId == manual)
+            .expect("manual terminal listed");
+
+        assert_eq!(createdEntry.sessionKind, "pty");
+        assert_eq!(createdEntry.terminalType, PRIMARY_TERMINAL_TYPE);
+        assert_eq!(manualEntry.sessionKind, "pty");
+        assert_eq!(manualEntry.terminalType, PRIMARY_TERMINAL_TYPE);
+    }
+
+    #[test]
+    fn linux_pty_session_preserves_working_directory() {
+        let host = NativePtyTerminalHost::new();
+        let session = host
+            .createOrGetSession("linux_terminal_cwd")
+            .expect("create terminal session");
+
+        let cdResult = host
+            .executeInSession(&session.sessionId, "cd /tmp", 3000)
+            .expect("cd in terminal session");
+        let pwdResult = host
+            .executeInSession(&session.sessionId, "pwd", 3000)
+            .expect("pwd in terminal session");
+
+        assert!(!cdResult.timedOut);
+        assert_eq!(cdResult.exitCode, 0);
+        assert_eq!(pwdResult.output, "/tmp");
+        assert_eq!(pwdResult.exitCode, 0);
+    }
+}

@@ -1,0 +1,1200 @@
+use std::sync::Arc;
+
+use operit_host_api::{
+    HiddenTerminalCommandOutput, HostError, HostResult, TerminalCloseOutput, TerminalCommandOutput,
+    HostRuntimeTaskSchedulerHost, TerminalHost, TerminalInfo,
+    TerminalScreenOutput, TerminalSessionInfo,
+};
+
+use operit_tools::tools::ToolResultDataClasses::{
+    HiddenTerminalCommandResultData, JsOptional, StringResultData, TerminalCommandResultData,
+    TerminalImplementation, TerminalInfoResultData, TerminalProfileInfoData, TerminalSessionCloseResultData,
+    TerminalSessionCreationResultData, TerminalSessionScreenResultData,
+    TerminalType, TerminalTypeInfoData, ToolResultData,
+};
+use operit_tools::ConversationMarkupManager::ToolResult;
+use operit_tools::ToolExecutionManager::{
+    AITool, AsyncToolExecutor, ToolExecutionManager, ToolAccessSpec,
+    ToolBoundary, ToolEffect, ToolInvocationContext, ToolInvocationFuture, ToolValidationResult,
+};
+use operit_vfs::VisualFileSystem::VisualFileSystem;
+use operit_host_api::TerminalWorkingDirectory::{directoryChangeCommand, enterTerminalDirectory};
+
+const HIDDEN_TERMINAL_TIMEOUT_MS: u64 = 120000;
+pub(crate) const ANDROID_MAX_COMMAND_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+
+#[derive(Clone)]
+/// Terminal tool facade backed by the host terminal API.
+pub struct StandardTerminalTools {
+    pub terminalHost: Option<Arc<dyn TerminalHost>>,
+    filesystem: Option<VisualFileSystem>,
+    storage: Option<Arc<dyn operit_host_api::RuntimeStorageHost>>,
+}
+
+#[derive(Clone, Copy)]
+/// Supported terminal tool operations.
+pub enum TerminalToolOperation {
+    GetTerminalInfo,
+    CreateSession,
+    ExecuteHiddenCommand,
+    InputInSession,
+    CloseSession,
+    GetSessionScreen,
+}
+
+#[derive(Clone)]
+/// Tool executor adapter for one terminal operation.
+pub struct TerminalToolExecutor {
+    pub tools: StandardTerminalTools,
+    pub operation: TerminalToolOperation,
+    pub scheduler: Option<Arc<dyn HostRuntimeTaskSchedulerHost>>,
+}
+
+impl StandardTerminalTools {
+    /// Acquires the newest idle generation without submitting directory commands to a busy shell.
+    pub(crate) fn availableSession(
+        &self,
+        name: &str,
+        terminalType: &str,
+        reserved: &std::collections::BTreeSet<String>,
+    ) -> HostResult<TerminalSessionInfo> {
+        self.availableSelectedSession(name, Some(terminalType), None, reserved)
+    }
+
+    /// Acquires a session in an exact saved profile or explicitly requested legacy interpreter.
+    pub(crate) fn availableSelectedSession(
+        &self,
+        name: &str,
+        requestedType: Option<&str>,
+        requestedProfile: Option<&str>,
+        reserved: &std::collections::BTreeSet<String>,
+    ) -> HostResult<TerminalSessionInfo> {
+        let host = self.host()?;
+        if requestedType.is_some() && requestedProfile.is_some() {
+            return Err(HostError::new(
+                "Specify profileId or terminalType, not both",
+            ));
+        }
+        let info = host.terminalInfo()?;
+        if info.platform == "android" {
+            return self.androidSession(host, name, requestedType, requestedProfile, reserved);
+        }
+        let profile = if requestedType.is_none() {
+            let settings = host.terminalProfileSettings()?;
+            let id = requestedProfile.unwrap_or(settings.defaultProfileId.as_str()).to_owned();
+            Some(
+                settings
+                    .profiles
+                    .into_iter()
+                    .find(|profile| profile.id == id)
+                    .ok_or_else(|| {
+                        HostError::new(format!("Terminal profile is not registered: {id}"))
+                    })?,
+            )
+        } else {
+            None
+        };
+        let terminalType = match &profile {
+            Some(profile) => profile.terminalType.as_str(),
+            None => requestedType.ok_or_else(|| HostError::new("Terminal selection is missing"))?,
+        };
+        let terminal = match &profile {
+            Some(profile) => format!("profile:{}", profile.id),
+            None => info
+                .types
+                .iter()
+                .find(|entry| entry.terminalType == terminalType)
+                .ok_or_else(|| HostError::new("Terminal interpreter is not registered"))?
+                .terminal
+                .clone(),
+        };
+        let scopedName = match &profile {
+            Some(profile) => format!("{name}_profile_{}", profile.id),
+            None => name.to_string(),
+        };
+        let prefix = format!("{scopedName}_generation_");
+        let sessions = host.listSessions()?;
+        let candidates = sessions
+            .iter()
+            .filter(|session| session.terminalType == terminalType)
+            .filter_map(|session| {
+                let generation = if session.sessionName == scopedName {
+                    0
+                } else {
+                    session
+                        .sessionName
+                        .strip_prefix(&prefix)?
+                        .parse::<u64>()
+                        .ok()?
+                };
+                Some((
+                    generation,
+                    session.commandRunning || reserved.contains(&session.sessionId),
+                ))
+            });
+        let generation = match candidates
+            .clone()
+            .filter(|(_, busy)| !busy)
+            .max_by_key(|(generation, _)| *generation)
+        {
+            Some((generation, _)) => generation,
+            None => match candidates.max_by_key(|(generation, _)| *generation) {
+                Some((generation, _)) => generation
+                    .checked_add(1)
+                    .ok_or_else(|| HostError::new("Terminal session generation exhausted"))?,
+                None => 0,
+            },
+        };
+        let sessionName = if generation == 0 {
+            scopedName
+        } else {
+            format!("{prefix}{generation}")
+        };
+        let directory = self
+            .fileDirectory()?
+            .map(|workspace| self.resolveFileDirectory(host, &terminal, terminalType, &workspace))
+            .transpose()?;
+        let session = match &profile {
+            Some(profile) => host.createOrGetProfileSession(&sessionName, &profile.id)?,
+            None => host.createOrGetTypedSession(&sessionName, terminalType)?,
+        };
+        if let Some(directory) = directory {
+            if let Err(error) =
+                enterTerminalDirectory(host, &session.sessionId, terminalType, &directory)
+            {
+                if session.isNewSession {
+                    let _ = host.closeSession(&session.sessionId);
+                }
+                return Err(error);
+            }
+        }
+        Ok(session)
+    }
+
+    /// Starts either Android channel in the resolved workspace.
+    fn androidSession(
+        &self,
+        host: &dyn TerminalHost,
+        name: &str,
+        requestedType: Option<&str>,
+        requestedProfile: Option<&str>,
+        reserved: &std::collections::BTreeSet<String>,
+    ) -> HostResult<TerminalSessionInfo> {
+        let settings = if requestedType != Some("shell") {
+            Some(host.terminalProfileSettings()?)
+        } else {
+            None
+        };
+        let profile = settings.as_ref().and_then(|settings| {
+            let id = requestedProfile.unwrap_or(&settings.defaultProfileId);
+            settings.profiles.iter().find(|profile| profile.id == id)
+        });
+        if let Some(id) = requestedProfile {
+            if profile.is_none() {
+                return Err(HostError::new(format!("Terminal profile is not registered: {id}")));
+            }
+        }
+        let kind = requestedType.or_else(|| profile.map(|profile| profile.terminalType.as_str())).unwrap_or("shell");
+        let implementation = match kind {
+            "bash" => "proot",
+            "shell" => "android-system",
+            _ => return Err(HostError::new(format!("Unsupported Android terminal type: {kind}"))),
+        };
+        let profile = profile.filter(|profile| profile.terminal == implementation && profile.terminalType == kind);
+        let terminal = profile.map_or_else(|| implementation.to_owned(), |profile| format!("profile:{}", profile.id));
+        // Keep distribution changes from reusing the previous Linux environment.
+        let name = if kind == "bash" {
+            let mut identity = std::collections::hash_map::DefaultHasher::new();
+            use std::hash::{Hash, Hasher};
+            profile.map(|profile| (&profile.id, &profile.options)).hash(&mut identity);
+            format!("{name}_container_{:016x}", identity.finish())
+        } else {
+            name.to_owned()
+        };
+        let directory = match self.fileDirectory()? {
+            Some(workspace) => self.resolveFileDirectory(host, &terminal, kind, &workspace)?,
+            None if kind == "bash" => "/root".to_owned(),
+            None => return host.createOrGetTerminalSession(&name, &terminal, kind),
+        };
+        let prefix = format!("{name}_generation_");
+        let sessions = host.listSessions()?;
+        let mut nextGeneration = 0;
+        for session in sessions.into_iter().filter(|session| session.terminal == implementation) {
+            let generation = if session.sessionName == name {
+                Some(0)
+            } else {
+                session.sessionName.strip_prefix(&prefix).and_then(|value| value.parse::<u64>().ok())
+            };
+            let Some(generation) = generation else { continue };
+            nextGeneration = nextGeneration.max(generation.saturating_add(1));
+            if session.commandRunning || reserved.contains(&session.sessionId) {
+                continue;
+            }
+            if session.workingDir != directory {
+                // Keep the original security identity tied to its launch directory.
+                host.closeSessionIfIdle(&session.sessionId, &session.sessionName)?;
+                continue;
+            }
+            return Ok(TerminalSessionInfo {
+                sessionId: session.sessionId,
+                sessionName: session.sessionName,
+                platform: session.platform,
+                terminal: session.terminal,
+                terminalType: session.terminalType,
+                isNewSession: false,
+            });
+        }
+        let sessionName = if nextGeneration == 0 { name.to_owned() } else { format!("{prefix}{nextGeneration}") };
+        let sessionId = host.startPtySession(&sessionName, &terminal, kind, &directory, 24, 80)?;
+        Ok(TerminalSessionInfo {
+            sessionId, sessionName, platform: "android".into(), terminal: implementation.into(),
+            terminalType: kind.into(), isNewSession: true,
+        })
+    }
+
+    /// Creates terminal tools from an optional host implementation.
+    pub fn new(terminalHost: Option<Arc<dyn TerminalHost>>) -> Self {
+        Self { terminalHost, filesystem: None, storage: None }
+    }
+
+    /// Supplies the runtime VFS for the current chat file directory.
+    pub fn withVfs(mut self, filesystem: VisualFileSystem) -> Self {
+        self.filesystem = Some(filesystem);
+        self
+    }
+
+    pub fn withStorage(mut self, storage: Arc<dyn operit_host_api::RuntimeStorageHost>) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
+    fn fileDirectory(&self) -> HostResult<Option<String>> {
+        let Some(context) = ToolExecutionManager::currentToolRuntimeContext() else { return Ok(None); };
+        let directory = if let Some(storage) = &self.storage {
+            context.fileDirectory(storage.clone()).map_err(HostError::new)?
+        } else {
+            context.workspacePath.clone().filter(|p| !p.trim().is_empty())
+        };
+        if directory.is_none() && context.callerChatId.is_some() {
+            return Err(HostError::new(
+                "Current chat file directory is unavailable; cannot start a terminal in the home directory",
+            ));
+        }
+        Ok(directory)
+    }
+
+    fn resolveFileDirectory(
+        &self, host: &dyn TerminalHost, terminal: &str, terminalType: &str, path: &str,
+    ) -> HostResult<String> {
+        host.resolveWorkingDirectory(terminal, terminalType, path, &|path| {
+            self.filesystem.as_ref()
+                .ok_or_else(|| HostError::new("Workspace VFS is not configured for terminal tools"))?
+                .terminalDirectory(host, path)
+                .map_err(HostError::new)
+        })
+    }
+
+    #[allow(non_snake_case)]
+    /// Returns terminal capabilities exposed by the host.
+    pub fn getTerminalInfo(&self, tool: &AITool) -> ToolResult {
+        match self
+            .host()
+            .and_then(|host| host.terminalInfo())
+            .and_then(|data| {
+                let mut result = terminalInfoResultData(&data)?;
+                let settings = self.host()?.terminalProfileSettings()?;
+                result.defaultProfileId = settings.defaultProfileId;
+                result.profiles = settings.profiles.into_iter().map(|profile| {
+                    Ok(TerminalProfileInfoData {
+                        available: !profile.options.is_empty() || data.types.iter().any(|entry| entry.terminal == profile.terminal && entry.terminalType == profile.terminalType && entry.available),
+                        terminal: terminalImplementation(&profile.terminal)?, terminalType: terminalType(&profile.terminalType)?,
+                        id: profile.id, name: profile.name,
+                    })
+                }).collect::<HostResult<Vec<_>>>()?;
+                Ok(result)
+            })
+        {
+            Ok(data) => toolSuccessData(tool, ToolResultData::TerminalInfoResultData(data)),
+            Err(error) => toolError(
+                tool,
+                format!("Error getting terminal info: {}", error.message),
+            ),
+        }
+    }
+
+    #[allow(non_snake_case)]
+    /// Creates or returns a named command session in the host's execution environment.
+    pub fn createOrGetSession(&self, tool: &AITool) -> ToolResult {
+        let sessionName = parameterValue(tool, "session_name");
+        let requestedType = optionalParameterValue(tool, "type");
+        let requestedProfile = optionalParameterValue(tool, "profile_id");
+        let result = self
+            .availableSelectedSession(
+                    &sessionName,
+                    requestedType.as_deref(),
+                    requestedProfile.as_deref(),
+                    &Default::default(),
+                )
+            .and_then(|session| terminalSessionCreationResultData(&session));
+        match result
+        {
+            Ok(data) => toolSuccessData(
+                tool,
+                ToolResultData::TerminalSessionCreationResultData(data),
+            ),
+            Err(error) => toolError(
+                tool,
+                format!(
+                    "Error creating or getting terminal session: {}",
+                    error.message
+                ),
+            ),
+        }
+    }
+
+    #[allow(non_snake_case)]
+    /// Executes a hidden host command outside an interactive session.
+    pub fn executeHiddenCommand(&self, tool: &AITool) -> ToolResult {
+        let command = parameterValue(tool, "command");
+        let requestedType = optionalParameterValue(tool, "type");
+        let requestedProfile = optionalParameterValue(tool, "profile_id");
+        let executorKey = stringParameterValue(tool, "executor_key", "default");
+        let timeoutMs = timeoutParameterValue(tool, "timeout_ms", HIDDEN_TERMINAL_TIMEOUT_MS);
+        match self
+            .host()
+            .and_then(|host| {
+                if requestedType.is_some() && requestedProfile.is_some() {
+                    return Err(HostError::new(
+                        "Specify profileId or terminalType, not both",
+                    ));
+                }
+                let nativeAndroid = host.terminalInfo()?.platform == "android";
+                let selectedProfile = requestedProfile.as_deref();
+                // Hidden executors must be scoped to the selected environment.  The old
+                // path delegated to host.executeHiddenCommand(), which always used the
+                // global default profile and made a container/system-shell pair appear
+                // mutually exclusive.  A session is the stable owner of its host, so use
+                // the same routing as visible terminal sessions and keep the executor key
+                // independent for every profile.
+                let sessionName = if let Some(profileId) = selectedProfile {
+                    format!("hidden:{executorKey}:profile:{profileId}")
+                } else if let Some(terminalType) = requestedType.as_deref() {
+                    format!("hidden:{executorKey}:type:{terminalType}")
+                } else {
+                    format!("hidden:{executorKey}")
+                };
+                let session = if nativeAndroid {
+                    self.androidSession(host, &sessionName, requestedType.as_deref(), selectedProfile, &Default::default())?
+                } else if let Some(profileId) = selectedProfile {
+                    host.createOrGetProfileSession(&sessionName, profileId)?
+                } else if let Some(terminalType) = requestedType.as_deref() {
+                    host.createOrGetTypedSession(&sessionName, terminalType)?
+                } else {
+                    host.createOrGetSession(&sessionName)?
+                };
+                let workspace = if nativeAndroid { None } else { self.fileDirectory()? };
+                let scopedCommand = if let Some(workspace) = workspace {
+                    let directory = self.resolveFileDirectory(
+                        host, &session.terminal, &session.terminalType, &workspace,
+                    )?;
+                    let cd = directoryChangeCommand(&session.terminalType, &directory)?;
+                    if session.terminalType == "powershell" {
+                        format!("{cd};\n{command}")
+                    } else {
+                        format!("{cd} && {{\n{command}\n}}")
+                    }
+                } else {
+                    command.clone()
+                };
+                let timeoutMs = if nativeAndroid && timeoutMs == 0 {
+                    HIDDEN_TERMINAL_TIMEOUT_MS
+                } else if nativeAndroid {
+                    timeoutMs.min(ANDROID_MAX_COMMAND_TIMEOUT_MS)
+                } else {
+                    timeoutMs
+                };
+                let result = host.executeInSession(&session.sessionId, &scopedCommand, timeoutMs)?;
+                Ok(HiddenTerminalCommandOutput {
+                    command: command.clone(),
+                    output: result.output,
+                    exitCode: result.exitCode,
+                    executorKey,
+                    platform: result.platform,
+                    terminal: result.terminal,
+                    terminalType: result.terminalType,
+                    timedOut: result.timedOut,
+                })
+            })
+        {
+            Ok(data) => {
+                if data.exitCode == 0 || data.timedOut {
+                    match hiddenTerminalCommandResultData(&data) {
+                        Ok(data) => toolSuccessData(
+                            tool,
+                            ToolResultData::HiddenTerminalCommandResultData(data),
+                        ),
+                        Err(error) => toolError(
+                            tool,
+                            format!("Error executing hidden terminal command: {}", error.message),
+                        ),
+                    }
+                } else {
+                    toolError(
+                        tool,
+                        format!(
+                            "Error executing hidden terminal command: state=EXITED, error=exitCode={}\n{}",
+                            data.exitCode,
+                            data.output.trim()
+                        ),
+                    )
+                }
+            }
+            Err(error) => toolError(
+                tool,
+                format!("Error executing hidden terminal command: {}", error.message),
+            ),
+        }
+    }
+
+    #[allow(non_snake_case)]
+    /// Sends text or control input to an interactive session.
+    pub fn inputInSession(&self, tool: &AITool) -> ToolResult {
+        let sessionId = parameterValue(tool, "session_id");
+        let input = optionalParameterValue(tool, "input");
+        let control = optionalParameterValue(tool, "control");
+        match self
+            .host()
+            .and_then(|host| host.inputInSession(&sessionId, input.as_deref(), control.as_deref()))
+        {
+            Ok(data) => toolSuccessStringData(
+                tool,
+                StringResultData {
+                    value: format!(
+                        "Terminal input sent to session {}. Accepted chars: {}",
+                        data.sessionId, data.acceptedChars
+                    ),
+                },
+            ),
+            Err(error) => toolError(tool, error.message),
+        }
+    }
+
+    #[allow(non_snake_case)]
+    /// Closes an interactive terminal session.
+    pub fn closeSession(&self, tool: &AITool) -> ToolResult {
+        let sessionId = parameterValue(tool, "session_id");
+        let idleOnly = optionalParameterValue(tool, "if_idle").as_deref() == Some("true");
+        let sessionName = parameterValue(tool, "session_name");
+        match self.host().and_then(|host| {
+            if idleOnly { host.closeSessionIfIdle(&sessionId, &sessionName) }
+            else { host.closeSession(&sessionId) }
+        }) {
+            Ok(data) => toolSuccessData(
+                tool,
+                ToolResultData::TerminalSessionCloseResultData(terminalSessionCloseResultData(
+                    &data,
+                )),
+            ),
+            Err(error) => toolError(
+                tool,
+                format!(
+                    "Error closing terminal session {}: {}",
+                    sessionId, error.message
+                ),
+            ),
+        }
+    }
+
+    #[allow(non_snake_case)]
+    /// Reads the current terminal screen for an interactive session.
+    pub fn getSessionScreen(&self, tool: &AITool) -> ToolResult {
+        let sessionId = parameterValue(tool, "session_id");
+        match self
+            .host()
+            .and_then(|host| host.getSessionScreen(&sessionId))
+            .and_then(|data| terminalSessionScreenResultData(&data))
+        {
+            Ok(data) => {
+                toolSuccessData(tool, ToolResultData::TerminalSessionScreenResultData(data))
+            }
+            Err(error) => toolError(
+                tool,
+                format!("Error getting terminal session screen: {}", error.message),
+            ),
+        }
+    }
+
+    fn host(&self) -> Result<&dyn TerminalHost, operit_host_api::HostError> {
+        self.terminalHost.as_deref().ok_or_else(|| {
+            operit_host_api::HostError::new("TerminalHost is not registered for this runtime.")
+        })
+    }
+}
+
+impl AsyncToolExecutor for TerminalToolExecutor {
+    fn validateParameters(&self, tool: &AITool) -> ToolValidationResult {
+        validateTerminalTool(self.operation, tool)
+    }
+
+    fn accessSpec(&self, _tool: &AITool) -> Result<ToolAccessSpec, String> {
+        let effect = match self.operation {
+            TerminalToolOperation::GetTerminalInfo | TerminalToolOperation::GetSessionScreen => {
+                ToolEffect::READ
+            }
+            TerminalToolOperation::CreateSession
+            | TerminalToolOperation::ExecuteHiddenCommand
+            | TerminalToolOperation::InputInSession
+            | TerminalToolOperation::CloseSession => ToolEffect::WRITE,
+        };
+        Ok(ToolAccessSpec {
+            effect,
+            boundary: ToolBoundary::None,
+        })
+    }
+
+    /// Executes terminal calls on the host blocking pool so a stuck PTY cannot block the tool runtime.
+    fn invokeAndStreamAsync<'a>(
+        &'a self,
+        tool: &'a AITool,
+        context: &'a ToolInvocationContext,
+    ) -> ToolInvocationFuture<'a> {
+        let tools = self.tools.clone();
+        let operation = self.operation;
+        let request = tool.clone();
+        let invocationContext = context.clone();
+        let scheduler = self.scheduler.clone();
+        Box::pin(async move {
+            let Some(scheduler) = scheduler else {
+                return vec![toolError(tool, "Terminal tool scheduler is unavailable".into())];
+            };
+            let timeoutMs = terminalBlockingTimeout(operation, &request);
+            let (sender, mut receiver) = tokio::sync::oneshot::channel();
+            let scheduled = scheduler.scheduleHostRuntimeBlockingAsyncTask(
+                "terminal-tool-invocation",
+                Box::new(move || {
+                    Box::pin(async move {
+                        let result = invocationContext.scopeSync(|| match operation {
+                            TerminalToolOperation::GetTerminalInfo => tools.getTerminalInfo(&request),
+                            TerminalToolOperation::CreateSession => tools.createOrGetSession(&request),
+                            TerminalToolOperation::ExecuteHiddenCommand => tools.executeHiddenCommand(&request),
+                            TerminalToolOperation::InputInSession => tools.inputInSession(&request),
+                            TerminalToolOperation::CloseSession => tools.closeSession(&request),
+                            TerminalToolOperation::GetSessionScreen => tools.getSessionScreen(&request),
+                        });
+                        let _ = sender.send(result);
+                    })
+                }),
+            );
+            if let Err(error) = scheduled {
+                return vec![toolError(tool, format!("Terminal tool scheduling failed: {}", error.message))];
+            }
+            let deadline = match scheduler.monotonicTimeMillis() {
+                Ok(now) => now.saturating_add(timeoutMs),
+                Err(error) => return vec![toolError(tool, error.message)],
+            };
+            loop {
+                tokio::select! {
+                    result = &mut receiver => {
+                        return vec![match result {
+                            Ok(result) => result,
+                            Err(_) => toolError(tool, "Terminal tool ended without a result".into()),
+                        }];
+                    }
+                    result = scheduler.waitForHostRuntimeDelay(50) => {
+                        if let Err(error) = result {
+                            return vec![toolError(tool, error.message)];
+                        }
+                    }
+                }
+                match scheduler.monotonicTimeMillis() {
+                    Ok(now) if now >= deadline => {
+                        return vec![toolError(
+                            tool,
+                            format!("Terminal tool exceeded its {} ms deadline", timeoutMs),
+                        )];
+                    }
+                    Ok(_) => {}
+                    Err(error) => return vec![toolError(tool, error.message)],
+                }
+            }
+        })
+    }
+}
+
+fn terminalBlockingTimeout(operation: TerminalToolOperation, tool: &AITool) -> u64 {
+    match operation {
+        TerminalToolOperation::ExecuteHiddenCommand => optionalParameterValue(tool, "timeout_ms")
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(HIDDEN_TERMINAL_TIMEOUT_MS)
+            .saturating_add(5_000),
+        TerminalToolOperation::CloseSession => 10_000,
+        _ => 30_000,
+    }
+}
+
+#[allow(non_snake_case)]
+fn validateTerminalTool(operation: TerminalToolOperation, tool: &AITool) -> ToolValidationResult {
+    let invalid = |message: &str| ToolValidationResult {
+        valid: false,
+        errorMessage: message.to_string(),
+    };
+    match operation {
+        TerminalToolOperation::ExecuteHiddenCommand => {
+            if parameterValue(tool, "command").is_empty() {
+                return invalid("Command parameter is required");
+            }
+        }
+        TerminalToolOperation::CreateSession => {}
+        TerminalToolOperation::InputInSession => {
+            if parameterValue(tool, "session_id").is_empty() {
+                return invalid("session_id is required.");
+            }
+            if !hasParameter(tool, "input") && optionalParameterValue(tool, "control").is_none() {
+                return invalid("At least one of input or control is required.");
+            }
+        }
+        TerminalToolOperation::CloseSession | TerminalToolOperation::GetSessionScreen => {
+            if parameterValue(tool, "session_id").is_empty() {
+                return invalid("session_id is required.");
+            }
+            if matches!(operation, TerminalToolOperation::CloseSession) {
+                match optionalParameterValue(tool, "if_idle").as_deref() {
+                    Some("true") if parameterValue(tool, "session_name").is_empty() => return invalid("session_name is required for idle close."),
+                    Some(value) if value != "true" && value != "false" => return invalid("if_idle must be true or false."),
+                    _ => {}
+                }
+            }
+        }
+        TerminalToolOperation::GetTerminalInfo => {}
+    }
+    match operation {
+        TerminalToolOperation::CreateSession | TerminalToolOperation::ExecuteHiddenCommand => {
+            if optionalParameterValue(tool, "type").is_some()
+                && optionalParameterValue(tool, "profile_id").is_some()
+            {
+                return invalid("Specify profile_id or type, not both.");
+            }
+        }
+        _ => {}
+    }
+    match operation {
+        TerminalToolOperation::ExecuteHiddenCommand => {
+            if optionalParameterValue(tool, "timeout_ms")
+                .as_deref()
+                .is_some_and(|value| value.parse::<u64>().is_err())
+            {
+                return invalid("timeout_ms must be an integer.");
+            }
+        }
+        _ => {}
+    }
+    ToolValidationResult {
+        valid: true,
+        errorMessage: String::new(),
+    }
+}
+
+/// Converts the host terminal literal into the SDK terminal enum.
+#[allow(non_snake_case)]
+fn terminalType(value: &str) -> HostResult<TerminalType> {
+    TerminalType::try_from(value).map_err(HostError::new)
+}
+
+/// Converts the host terminal implementation literal into the SDK terminal enum.
+#[allow(non_snake_case)]
+fn terminalImplementation(value: &str) -> HostResult<TerminalImplementation> {
+    TerminalImplementation::try_from(value).map_err(HostError::new)
+}
+
+#[allow(non_snake_case)]
+pub(crate) fn terminalCommandResultData(
+    data: &TerminalCommandOutput,
+) -> HostResult<TerminalCommandResultData> {
+    Ok(TerminalCommandResultData {
+        command: data.command.clone(),
+        output: data.output.clone(),
+        exitCode: data.exitCode,
+        sessionId: data.sessionId.clone(),
+        platform: data.platform.clone(),
+        terminal: terminalImplementation(&data.terminal)?,
+        terminalType: terminalType(&data.terminalType)?,
+        timedOut: data.timedOut,
+        commandRunning: false,
+    })
+}
+
+#[allow(non_snake_case)]
+fn hiddenTerminalCommandResultData(
+    data: &HiddenTerminalCommandOutput,
+) -> HostResult<HiddenTerminalCommandResultData> {
+    Ok(HiddenTerminalCommandResultData {
+        command: data.command.clone(),
+        output: data.output.clone(),
+        exitCode: data.exitCode,
+        executorKey: data.executorKey.clone(),
+        platform: data.platform.clone(),
+        terminal: terminalImplementation(&data.terminal)?,
+        terminalType: terminalType(&data.terminalType)?,
+        timedOut: data.timedOut,
+    })
+}
+
+#[allow(non_snake_case)]
+fn terminalSessionCreationResultData(
+    data: &TerminalSessionInfo,
+) -> HostResult<TerminalSessionCreationResultData> {
+    Ok(TerminalSessionCreationResultData {
+        sessionId: data.sessionId.clone(),
+        sessionName: data.sessionName.clone(),
+        platform: data.platform.clone(),
+        terminal: terminalImplementation(&data.terminal)?,
+        terminalType: terminalType(&data.terminalType)?,
+        isNewSession: data.isNewSession,
+    })
+}
+
+#[allow(non_snake_case)]
+fn terminalSessionCloseResultData(data: &TerminalCloseOutput) -> TerminalSessionCloseResultData {
+    TerminalSessionCloseResultData {
+        sessionId: data.sessionId.clone(),
+        success: data.success,
+        message: data.message.clone(),
+    }
+}
+
+#[allow(non_snake_case)]
+fn terminalSessionScreenResultData(
+    data: &TerminalScreenOutput,
+) -> HostResult<TerminalSessionScreenResultData> {
+    Ok(TerminalSessionScreenResultData {
+        sessionId: data.sessionId.clone(),
+        platform: data.platform.clone(),
+        terminal: terminalImplementation(&data.terminal)?,
+        terminalType: terminalType(&data.terminalType)?,
+        rows: data.rows,
+        cols: data.cols,
+        content: data.content.clone(),
+        commandRunning: data.commandRunning,
+    })
+}
+
+#[allow(non_snake_case)]
+fn terminalInfoResultData(data: &TerminalInfo) -> HostResult<TerminalInfoResultData> {
+    let types = data
+        .types
+        .iter()
+        .map(|info| {
+            Ok(TerminalTypeInfoData {
+                terminal: terminalImplementation(&info.terminal)?,
+                terminalType: terminalType(&info.terminalType)?,
+                available: info.available,
+                description: info.description.clone(),
+            })
+        })
+        .collect::<HostResult<Vec<_>>>()?;
+    Ok(TerminalInfoResultData {
+        defaultProfileId: String::new(), profiles: Vec::new(),
+        platform: data.platform.clone(),
+        terminal: terminalImplementation(&data.terminal)?,
+        terminalType: terminalType(&data.terminalType)?,
+        types,
+    })
+}
+
+#[allow(non_snake_case)]
+fn toolSuccess(tool: &AITool, result: String) -> ToolResult {
+    ToolResult {
+        toolName: tool.name.clone(),
+        success: true,
+        result: ToolResultData::StringResultData(StringResultData { value: result }),
+        error: None,
+    }
+}
+
+#[allow(non_snake_case)]
+fn toolSuccessData(tool: &AITool, data: ToolResultData) -> ToolResult {
+    ToolResult {
+        toolName: tool.name.clone(),
+        success: true,
+        result: data,
+        error: None,
+    }
+}
+
+#[allow(non_snake_case)]
+fn toolSuccessStringData(tool: &AITool, data: StringResultData) -> ToolResult {
+    ToolResult {
+        toolName: tool.name.clone(),
+        success: true,
+        result: ToolResultData::StringResultData(data),
+        error: None,
+    }
+}
+
+#[allow(non_snake_case)]
+fn toolError(tool: &AITool, error: String) -> ToolResult {
+    ToolResult {
+        toolName: tool.name.clone(),
+        success: false,
+        result: ToolResultData::StringResultData(StringResultData {
+            value: String::new(),
+        }),
+        error: Some(error),
+    }
+}
+
+#[allow(non_snake_case)]
+fn parameterValue(tool: &AITool, name: &str) -> String {
+    optionalParameterValue(tool, name)
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default()
+}
+
+#[allow(non_snake_case)]
+fn optionalParameterValue(tool: &AITool, name: &str) -> Option<String> {
+    tool.parameters
+        .iter()
+        .find(|parameter| parameter.name == name)
+        .map(|parameter| parameter.value.clone())
+}
+
+#[allow(non_snake_case)]
+fn hasParameter(tool: &AITool, name: &str) -> bool {
+    tool.parameters
+        .iter()
+        .any(|parameter| parameter.name == name)
+}
+
+#[allow(non_snake_case)]
+fn stringParameterValue(tool: &AITool, name: &str, defaultValue: &str) -> String {
+    match optionalParameterValue(tool, name)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => value,
+        None => defaultValue.to_string(),
+    }
+}
+
+#[allow(non_snake_case)]
+fn timeoutParameterValue(tool: &AITool, name: &str, defaultValue: u64) -> u64 {
+    match optionalParameterValue(tool, name)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => value
+            .parse::<u64>()
+            .expect("timeout_ms must be validated before terminal tool execution"),
+        None => defaultValue,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use operit_host_api::TerminalTypeInfo;
+
+    fn terminal_info() -> TerminalInfo {
+        TerminalInfo {
+            platform: "macos".into(),
+            terminal: "native".into(),
+            terminalType: "zsh".into(),
+            types: vec![TerminalTypeInfo {
+                nameKey: None,
+                terminal: "native".into(),
+                terminalType: "zsh".into(),
+                available: true,
+                description: "macOS native zsh login PTY with job control".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn zsh_host_results_preserve_terminal_type() {
+        let info = terminal_info();
+        let result = terminalInfoResultData(&info).unwrap();
+        assert!(matches!(result.terminalType, TerminalType::Zsh));
+        assert!(matches!(result.types[0].terminalType, TerminalType::Zsh));
+
+        let session = TerminalSessionInfo {
+            sessionId: "session".into(),
+            sessionName: "default".into(),
+            platform: info.platform.clone(),
+            terminal: info.terminal.clone(),
+            terminalType: info.terminalType.clone(),
+            isNewSession: true,
+        };
+        assert!(matches!(
+            terminalSessionCreationResultData(&session)
+                .unwrap()
+                .terminalType,
+            TerminalType::Zsh
+        ));
+
+        let command = TerminalCommandOutput {
+            command: "printf hello".into(),
+            output: "hello".into(),
+            exitCode: 0,
+            sessionId: session.sessionId.clone(),
+            platform: info.platform.clone(),
+            terminal: info.terminal.clone(),
+            terminalType: info.terminalType.clone(),
+            timedOut: false,
+        };
+        let result = terminalCommandResultData(&command).unwrap();
+        assert!(matches!(result.terminalType, TerminalType::Zsh));
+        assert_eq!(result.output, "hello");
+        assert_eq!(result.exitCode, 0);
+
+        let hidden = HiddenTerminalCommandOutput {
+            command: command.command,
+            output: command.output,
+            exitCode: command.exitCode,
+            executorKey: "default".into(),
+            platform: info.platform.clone(),
+            terminal: info.terminal.clone(),
+            terminalType: info.terminalType.clone(),
+            timedOut: false,
+        };
+        assert!(matches!(
+            hiddenTerminalCommandResultData(&hidden)
+                .unwrap()
+                .terminalType,
+            TerminalType::Zsh
+        ));
+
+        let screen = TerminalScreenOutput {
+            sessionId: session.sessionId,
+            platform: info.platform,
+            terminal: info.terminal,
+            terminalType: info.terminalType,
+            rows: 24,
+            cols: 80,
+            content: "hello".into(),
+            commandRunning: false,
+        };
+        assert!(matches!(
+            terminalSessionScreenResultData(&screen)
+                .unwrap()
+                .terminalType,
+            TerminalType::Zsh
+        ));
+    }
+
+    #[test]
+    fn invalid_host_terminal_metadata_returns_errors() {
+        let mut info = terminal_info();
+        info.terminalType = "unknown-shell".into();
+        assert_eq!(
+            terminalInfoResultData(&info).err().unwrap().message,
+            "invalid terminal type: unknown-shell"
+        );
+
+        info = terminal_info();
+        info.types[0].terminalType = "unknown-shell".into();
+        assert_eq!(
+            terminalInfoResultData(&info).err().unwrap().message,
+            "invalid terminal type: unknown-shell"
+        );
+
+        info = terminal_info();
+        info.terminal = "unknown-terminal".into();
+        assert!(terminalInfoResultData(&info).is_err());
+
+        info = terminal_info();
+        info.types[0].terminal = "unknown-terminal".into();
+        assert!(terminalInfoResultData(&info).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn zsh_session_executes_through_terminal_tools() {
+        use operit_host_native_terminal::NativePtyTerminalHost;
+        use operit_tools::ToolExecutionManager::ToolParameter;
+
+        let home = std::env::temp_dir().to_string_lossy().into_owned();
+        let host = Arc::new(NativePtyTerminalHost::loginShell("/bin/zsh", "zsh", &home).unwrap());
+        let tools = StandardTerminalTools::new(Some(host.clone()));
+        let tool = |name: &str, parameters: &[(&str, &str)]| AITool {
+            name: name.into(),
+            parameters: parameters
+                .iter()
+                .map(|(name, value)| ToolParameter {
+                    name: (*name).into(),
+                    value: (*value).into(),
+                })
+                .collect(),
+        };
+        assert!(tools.getTerminalInfo(&tool("terminal_info", &[])).success);
+        let created = tools.createOrGetSession(&tool(
+            "terminal_create",
+            &[("session_name", "zsh-regression"), ("type", "zsh")],
+        ));
+        assert!(created.success, "{:?}", created.error);
+        let ToolResultData::TerminalSessionCreationResultData(session) = created.result else {
+            panic!("expected session creation result");
+        };
+        let output = host.executeInSession(&session.sessionId, "printf 'operit-zsh-ok\n'", 5000).unwrap();
+        let command = terminalCommandResultData(&output).unwrap();
+        host.closeSession(&session.sessionId).unwrap();
+        assert!(matches!(command.terminalType, TerminalType::Zsh));
+        assert_eq!(command.exitCode, 0);
+        assert!(
+            command.output.contains("operit-zsh-ok"),
+            "output: {:?}",
+            command.output
+        );
+    }
+
+    /// Real interactive and hidden shells share the file-tool base, and a
+    /// missing directory must fail before a user command can execute.
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "windows")))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn shells_enter_workspace_or_persistent_outputs_and_reject_missing_directories() {
+        use operit_host_api::RuntimeStorageHost;
+        use operit_host_native_storage::NativeRuntimeStorageHost;
+        use operit_host_native_terminal::NativePtyTerminalHost;
+        use operit_tools::ToolExecutionManager::{ToolExposureMode, ToolParameter, ToolRuntimeContext};
+        let root = std::env::temp_dir().join(format!(
+            "operit-terminal-directory-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("workspaces/project")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let storage = Arc::new(NativeRuntimeStorageHost::new(
+            root.join("runtime"),
+            root.join("workspaces"),
+        ));
+        operit_store::CoreNodeIdentityStore::CoreNodeIdentityStore::new(storage.clone())
+            .writeNodeId("shell-test".into())
+            .unwrap();
+        let output = operit_store::ChatOutputStore::ChatOutputStore::new(storage.clone())
+            .bind("chat", 1793740800123, None)
+            .unwrap();
+        let filesystem = VisualFileSystem::fromStorage(
+            Arc::new(operit_host_native_filesystem::PosixFileSystemHost::new()), storage.clone(),
+        ).unwrap();
+        let host = Arc::new(NativePtyTerminalHost::loginShell("/bin/bash", "bash", "/").unwrap());
+        let tools = StandardTerminalTools::new(Some(host.clone()))
+            .withVfs(filesystem.clone())
+            .withStorage(storage.clone());
+        let tool = |name: &str, params: &[(&str, &str)]| AITool {
+            name: name.into(),
+            parameters: params
+                .iter()
+                .map(|(name, value)| ToolParameter {
+                    name: (*name).into(),
+                    value: (*value).into(),
+                })
+                .collect(),
+        };
+        for workspace in [
+            None,
+            Some("/operitapp/workspaces/project"),
+            Some("/operitapp/workspaces/missing"),
+        ] {
+            let context = ToolRuntimeContext {
+                callerName: None,
+                callerChatId: Some("chat".into()),
+                callerParticipantId: None,
+                workspacePath: workspace.map(str::to_string),
+                workspaceFolders: Vec::new(),
+                toolExposureMode: ToolExposureMode::FULL,
+                extensionOwner: "test".into(),
+                executionData: Default::default(),
+            };
+            ToolExecutionManager::scopeToolRuntimeContext(context, async {
+                let created = tools.createOrGetSession(&tool(
+                    "terminal_create",
+                    &[("session_name", "directory-test"), ("type", "bash")],
+                ));
+                if workspace == Some("/operitapp/workspaces/missing") {
+                    assert!(!created.success);
+                    let hidden = tools.executeHiddenCommand(&tool(
+                        "terminal_execute",
+                        &[("command", "printf should-not-run")],
+                    ));
+                    assert!(!hidden.success);
+                    return;
+                }
+                assert!(created.success, "{:?}", created.error);
+                let ToolResultData::TerminalSessionCreationResultData(session) = created.result else {
+                    panic!("Expected session");
+                };
+                let base = workspace.unwrap_or(&output);
+                let pwd_command = "printf '__operit_pwd__%s__operit_pwd_end__\\n' \"$PWD\"";
+                let expected = operit_host_api::FileSource::nativePath(&filesystem.file(base).unwrap()).unwrap();
+                let command = host.executeInSession(&session.sessionId, pwd_command, 5000).unwrap();
+                assert_eq!(command.exitCode, 0);
+                assert!(
+                    command
+                        .output
+                        .contains(&format!("__operit_pwd__{expected}__operit_pwd_end__")),
+                    "{}",
+                    command.output
+                );
+                let hidden =
+                    tools.executeHiddenCommand(&tool("terminal_execute", &[("command", pwd_command)]));
+                assert!(hidden.success, "{:?}", hidden.error);
+                let ToolResultData::HiddenTerminalCommandResultData(command) = hidden.result else {
+                    panic!("Expected hidden command");
+                };
+                assert_eq!(command.exitCode, 0);
+                assert!(
+                    command
+                        .output
+                        .contains(&format!("__operit_pwd__{expected}__operit_pwd_end__")),
+                    "{}",
+                    command.output
+                );
+                // Reuse must cd back after the user changes the live session.
+                host.executeInSession(&session.sessionId, "cd /", 5000)
+                    .unwrap();
+                let reused = tools.createOrGetSession(&tool(
+                    "terminal_create",
+                    &[("session_name", "directory-test")],
+                ));
+                assert!(reused.success, "{:?}", reused.error);
+                let pwd = host
+                    .executeInSession(&session.sessionId, pwd_command, 5000)
+                    .unwrap();
+                assert_eq!(pwd.exitCode, 0);
+                assert!(
+                    pwd.output
+                        .contains(&format!("__operit_pwd__{expected}__operit_pwd_end__")),
+                    "{}",
+                    pwd.output
+                );
+                host.closeSession(&session.sessionId).unwrap();
+            })
+            .await;
+        }
+        assert!(storage
+            .exists(&format!(
+                "{}/.operit/sync.json",
+                operit_store::ChatOutputStore::ChatOutputStore::storagePath(&output).unwrap()
+            ))
+            .unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "windows")))]
+    #[test]
+    fn invalid_host_terminal_info_becomes_tool_error() {
+        use operit_host_native_terminal::NativePtyTerminalHost;
+
+        let home = std::env::temp_dir().to_string_lossy().into_owned();
+        let host = NativePtyTerminalHost::loginShell("/bin/sh", "unknown-shell", &home).unwrap();
+        let tools = StandardTerminalTools::new(Some(Arc::new(host)));
+        let result = tools.getTerminalInfo(&AITool {
+            name: "terminal_info".into(),
+            parameters: vec![],
+        });
+        assert!(!result.success);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("Error getting terminal info: invalid terminal type: unknown-shell")
+        );
+    }
+}

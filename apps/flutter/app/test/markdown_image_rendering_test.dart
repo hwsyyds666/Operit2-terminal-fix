@@ -1,0 +1,634 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:flutter/material.dart';
+import 'package:flutter_svg/flutter_svg.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:operit2/core/proxy/generated/CoreProxyModels.g.dart';
+import 'package:operit2/core/proxy/generated/CoreProxyClients.g.dart';
+import 'package:operit2/core/bridge/OperitRuntimeBridge.dart';
+import 'package:operit2/core/link/CoreLinkProtocol.dart';
+import 'package:operit2/core/link/CoreLinkCodec.dart';
+import 'package:operit2/data/preferences/UserPreferencesManager.dart';
+import 'package:operit2/l10n/generated/app_localizations.dart';
+import 'package:operit2/ui/common/markdown/MarkdownFileScope.dart';
+import 'package:operit2/ui/common/markdown/MarkdownImagePreview.dart';
+import 'package:operit2/ui/common/markdown/MarkdownImageRenderer.dart';
+import 'package:operit2/ui/common/markdown/MarkdownRemoteImage.dart';
+import 'package:operit2/ui/common/markdown/StreamMarkdownRenderer.dart';
+import 'package:operit2/ui/features/chat/components/style/bubble/BubbleAiMessageComposable.dart';
+import 'package:operit2/ui/features/chat/components/style/bubble/BubbleSurface.dart';
+import 'package:operit2/ui/features/chat/components/style/bubble/BubbleUserMessageComposable.dart';
+import 'package:operit2/ui/theme/OperitTheme.dart';
+
+import 'support/markdown_event_fixture.dart';
+import 'support/semantic_markdown_fixture.dart';
+
+const _url =
+    'data:image/png;base64,'
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAANSURBVBhXY2Bg+P8fAAMCAf/Jsq3uAAAAAElFTkSuQmCC';
+const _markdown = '![图片说明]($_url)';
+const _svg =
+    '<?xml version="1.0" encoding="UTF-8"?>\n'
+    '<!-- Markdown vector fixture -->\n'
+    '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100" '
+    'viewBox="0 0 200 100"><rect width="200" height="100" fill="#4488cc"/>'
+    '<text x="10" y="50">SVG 图片</text></svg>';
+
+void main() {
+  for (final source in [
+    './diagram.svg',
+    '/operitapp/outputs/diagram.SVG',
+    'core-other:/operitapp/outputs/diagram.svg',
+    'https://example.com/diagram.svg?version=2#figure',
+    'https://example.com/image/42',
+    Uri.dataFromString(
+      _svg,
+      mimeType: 'image/svg+xml',
+      encoding: utf8,
+    ).toString(),
+    Uri.dataFromString(
+      _svg,
+      mimeType: 'image/svg+xml',
+      encoding: utf8,
+      base64: true,
+    ).toString(),
+  ]) {
+    testWidgets(
+      'SVG Markdown renders and previews through its owner: $source',
+      (tester) async {
+        final bridge = _ImageBridge(
+          bytes: Uint8List.fromList(utf8.encode(_svg)),
+        );
+        final clients = GeneratedCoreProxyClients(bridge);
+
+        /// Changes layout while retaining the same image source and owner.
+        Future<void> render(double width) => tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: Center(
+                child: SizedBox(
+                  width: width,
+                  child: MarkdownFileScope(
+                    basePath: '/operitapp/outputs',
+                    nodeId: null,
+                    clients: clients,
+                    child: MarkdownImageRenderer(
+                      imageMarkdown: '![矢量图]($source)',
+                      textColor: Colors.black,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+
+        await render(400);
+        await _settleImages(tester);
+        expect(find.byType(SvgPicture), findsOneWidget);
+        expect(find.byType(Image), findsNothing);
+        expect(find.byType(CircularProgressIndicator), findsNothing);
+        expect(find.byIcon(Icons.broken_image_outlined), findsNothing);
+        final picture = tester.widget<SvgPicture>(find.byType(SvgPicture));
+        expect(picture.semanticsLabel, '矢量图');
+        final size = tester.getSize(find.byType(SvgPicture));
+        expect(size.width / size.height, closeTo(2, 0.01));
+        expect(size.height, lessThanOrEqualTo(140));
+        final readCount = source.startsWith('data:') ? 0 : 1;
+        expect(bridge.sources, hasLength(readCount));
+        if (readCount > 0) {
+          expect(
+            bridge.sources.single,
+            source == './diagram.svg'
+                ? '/operitapp/outputs/diagram.svg'
+                : source,
+          );
+        }
+        await render(280);
+        await _settleImages(tester);
+        expect(bridge.sources, hasLength(readCount));
+        expect(
+          tester.widget<SvgPicture>(find.byType(SvgPicture)).bytesLoader,
+          picture.bytesLoader,
+        );
+
+        await tester.tap(find.byType(SvgPicture));
+        await _settleImages(tester);
+        expect(find.byType(MarkdownImagePreview), findsOneWidget);
+        final previewImage = tester.widget<MarkdownRemoteImage>(
+          find.descendant(
+            of: find.byType(MarkdownImagePreview),
+            matching: find.byType(MarkdownRemoteImage),
+          ),
+        );
+        expect(previewImage.clients, same(clients));
+        expect(previewImage.decodeAtFullResolution, isTrue);
+        expect(
+          find.descendant(
+            of: find.byType(MarkdownImagePreview),
+            matching: find.byType(SvgPicture),
+          ),
+          findsOneWidget,
+        );
+        await tester.tap(find.byIcon(Icons.zoom_in));
+        await tester.pumpAndSettle();
+        expect(
+          tester
+              .widget<InteractiveViewer>(find.byType(InteractiveViewer))
+              .transformationController!
+              .value
+              .getMaxScaleOnAxis(),
+          closeTo(1.5, 0.001),
+        );
+        expect(find.byIcon(Icons.broken_image_outlined), findsNothing);
+        expect(tester.takeException(), isNull);
+        await tester.pumpWidget(const SizedBox());
+      },
+    );
+  }
+
+  for (final live in [false, true]) {
+    testWidgets('Core image blocks render with surrounding text, live=$live', (
+      tester,
+    ) async {
+      const source =
+          '图在这里：\n\n![](operit_art.jpg)\n\n绝对路径：\n\n'
+          '![](/operitapp/outputs/2026-11-05_12-34-10-303/operit_art.jpg)\n\n'
+          '![图片说明](./operit_art.png)\n\n后续正文';
+      const base = '/operitapp/outputs/2026-11-05_12-34-10-303';
+      final bridge = _ImageBridge();
+      final controller = StreamController<Object>.broadcast();
+      await tester.pumpWidget(
+        OperitTheme(
+          initialThemePreferenceSnapshot:
+              UserPreferencesManager.defaultThemePreferenceSnapshot,
+          initialThemeIsReady: false,
+          unconfiguredChildEnabled: true,
+          hostInteractionHostsEnabled: false,
+          child: MaterialApp(
+            localizationsDelegates: AppLocalizations.localizationsDelegates,
+            supportedLocales: AppLocalizations.supportedLocales,
+            home: Scaffold(
+              body: SingleChildScrollView(
+                child: MarkdownFileScope.forParts(
+                  parts: const [
+                    MessagePart(
+                      partId: 'image',
+                      sequence: 0,
+                      kind: MessagePartKind.markdown,
+                      content: source,
+                      toolCallId: null,
+                      toolName: null,
+                      attributes: {'file_base_path': base},
+                    ),
+                  ],
+                  clients: GeneratedCoreProxyClients(bridge),
+                  child: StreamMarkdownRenderer(
+                    content: source,
+                    isStreaming: live,
+                    contentStream: live ? controller.stream : null,
+                    textColor: Colors.black,
+                    backgroundColor: Colors.white,
+                    splitMarkdownContent: splitSemanticMarkdownFixture,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      if (live) {
+        for (final event in semanticMarkdownEvents(source)) {
+          controller.add(event);
+          await tester.pump(const Duration(milliseconds: 200));
+        }
+      }
+      await controller.close();
+      await _settleImages(tester);
+      expect(find.byType(MarkdownImageRenderer), findsNWidgets(3));
+      expect(find.byType(Image), findsNWidgets(3));
+      expect(find.text('图片说明'), findsOneWidget);
+      expect(find.textContaining('后续正文', findRichText: true), findsOneWidget);
+      expect(find.byIcon(Icons.broken_image_outlined), findsNothing);
+      expect(
+        bridge.sources,
+        containsAll(['$base/operit_art.jpg', '$base/operit_art.png']),
+      );
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox());
+    });
+  }
+
+  for (final source in [
+    'images/layout.png',
+    _url,
+    'https://example.com/layout.png',
+  ]) {
+    testWidgets('sidebar layout changes retain the loaded image: $source', (
+      tester,
+    ) async {
+      final bridge = _ImageBridge();
+      final clients = GeneratedCoreProxyClients(bridge);
+      var currentSource = source;
+      Future<void> render(double width) => tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: Center(
+              child: SizedBox(
+                width: width,
+                child: MarkdownFileScope(
+                  basePath: '/operitapp/outputs/layout',
+                  nodeId: null,
+                  clients: clients,
+                  child: MarkdownImageRenderer(
+                    imageMarkdown: '![]($currentSource)',
+                    textColor: Colors.black,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      await render(640);
+      await _settleImages(tester);
+      final provider = tester.widget<Image>(find.byType(Image)).image;
+      final frame = tester.widget<RawImage>(find.byType(RawImage)).image;
+      expect(frame, isNotNull);
+      for (final width in [520.0, 400.0, 280.0, 400.0, 520.0, 640.0]) {
+        await render(width);
+        expect(tester.widget<Image>(find.byType(Image)).image, provider);
+        expect(
+          tester.widget<RawImage>(find.byType(RawImage)).image,
+          same(frame),
+        );
+        await _settleImages(tester);
+      }
+      final embedded = source.startsWith('data:');
+      expect(bridge.sources, hasLength(embedded ? 0 : 1));
+      if (!embedded) {
+        currentSource = source.replaceFirst('layout.png', 'changed.png');
+        await render(640);
+        await _settleImages(tester);
+        expect(bridge.sources, hasLength(2));
+        expect(bridge.sources.last, endsWith('/changed.png'));
+      }
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox());
+    });
+  }
+
+  testWidgets('standalone image and its alt are centered within the block', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            width: 400,
+            child: MarkdownImageRenderer(
+              imageMarkdown: _markdown,
+              textColor: Colors.black,
+            ),
+          ),
+        ),
+      ),
+    );
+    await _settleImages(tester);
+    final block = tester.getRect(find.byType(MarkdownImageRenderer));
+    final image = tester.getRect(find.byType(Image));
+    final caption = tester.getRect(find.text('图片说明'));
+    expect(image.center.dx, closeTo(block.center.dx, 0.1));
+    expect(caption.center.dx, closeTo(block.center.dx, 0.1));
+    expect(caption.top, greaterThanOrEqualTo(image.bottom));
+    expect(tester.widget<Text>(find.text('图片说明')).textAlign, TextAlign.center);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('image preview opens locally, zooms, pans freely, and closes', (
+    tester,
+  ) async {
+    var linkOpened = false;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: MarkdownImageRenderer(
+            imageMarkdown: _markdown,
+            textColor: Colors.black,
+            onOpenLink: (_) => linkOpened = true,
+          ),
+        ),
+      ),
+    );
+    await _settleImages(tester);
+    await tester.tap(find.byType(Image));
+    await tester.pumpAndSettle();
+    expect(find.byType(MarkdownImagePreview), findsOneWidget);
+    expect(linkOpened, isFalse);
+    final viewer = tester.widget<InteractiveViewer>(
+      find.byType(InteractiveViewer),
+    );
+    final controller = viewer.transformationController!;
+    expect(controller.value.getMaxScaleOnAxis(), 1);
+
+    // Drag at fit scale as well as when zoomed. The picture is unconstrained.
+    await tester.drag(find.byType(InteractiveViewer), const Offset(90, 50));
+    await tester.pumpAndSettle();
+    expect(controller.value.getTranslation().x, greaterThan(50));
+    await tester.tap(find.byIcon(Icons.zoom_in));
+    await tester.pumpAndSettle();
+    expect(controller.value.getMaxScaleOnAxis(), closeTo(1.5, 0.001));
+    await tester.tap(find.byIcon(Icons.zoom_out));
+    await tester.pumpAndSettle();
+    expect(controller.value.getMaxScaleOnAxis(), closeTo(1, 0.001));
+    await tester.tap(find.byIcon(Icons.fit_screen));
+    await tester.pumpAndSettle();
+    expect(controller.value, Matrix4.identity());
+
+    // Pinch gesture must scale the image without toolbar involvement.
+    final center = tester.getCenter(find.byType(InteractiveViewer));
+    final first = await tester.startGesture(
+      center - const Offset(50, 0),
+      pointer: 1,
+    );
+    final second = await tester.startGesture(
+      center + const Offset(50, 0),
+      pointer: 2,
+    );
+    await first.moveTo(center - const Offset(100, 0));
+    await second.moveTo(center + const Offset(100, 0));
+    await tester.pump();
+    expect(controller.value.getMaxScaleOnAxis(), greaterThan(1.4));
+    await first.up();
+    await second.up();
+    await tester.pumpAndSettle();
+
+    final fullImage = tester.widget<MarkdownRemoteImage>(
+      find.descendant(
+        of: find.byType(MarkdownImagePreview),
+        matching: find.byType(MarkdownRemoteImage),
+      ),
+    );
+    expect(fullImage.decodeAtFullResolution, isTrue);
+    await tester.tap(find.byIcon(Icons.close));
+    await tester.pumpAndSettle();
+    expect(find.byType(MarkdownImagePreview), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  for (final source in [
+    'https://example.com/photo.png',
+    '/operitapp/data/photo.png',
+  ]) {
+    testWidgets('preview retains the owning runtime for $source', (
+      tester,
+    ) async {
+      final bridge = _ImageBridge();
+      final clients = GeneratedCoreProxyClients(bridge);
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: MarkdownRemoteImage(url: source, clients: clients),
+          ),
+        ),
+      );
+      await _settleImages(tester);
+      await tester.tap(find.byType(Image));
+      await _settleImages(tester);
+      expect(find.byType(MarkdownImagePreview), findsOneWidget);
+      final previewImage = tester.widget<MarkdownRemoteImage>(
+        find.descendant(
+          of: find.byType(MarkdownImagePreview),
+          matching: find.byType(MarkdownRemoteImage),
+        ),
+      );
+      expect(previewImage.clients, same(clients));
+      expect(previewImage.url, source);
+      expect(find.byIcon(Icons.broken_image_outlined), findsNothing);
+      expect(bridge.sources, isNotEmpty);
+      expect(bridge.sources.every((url) => url == source), isTrue);
+      expect(tester.takeException(), isNull);
+    });
+  }
+
+  testWidgets('preview can be disabled for shared/static image rendering', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Scaffold(
+          body: MarkdownImageRenderer(
+            imageMarkdown: _markdown,
+            textColor: Colors.black,
+            enablePreview: false,
+          ),
+        ),
+      ),
+    );
+    await _settleImages(tester);
+    await tester.tap(find.byType(Image));
+    await tester.pumpAndSettle();
+    expect(find.byType(MarkdownImagePreview), findsNothing);
+  });
+
+  for (final wide in [false, true]) {
+    for (final sender in ['ai', 'user']) {
+      testWidgets('$sender pure image bypasses bubble surface, wide=$wide', (
+        tester,
+      ) async {
+        await _pumpBubble(tester, sender: sender, wide: wide);
+        expect(find.byType(MarkdownImageRenderer), findsOneWidget);
+        expect(find.byType(BubbleSurface), findsNothing);
+        expect(find.text('图片说明'), findsOneWidget);
+        await tester.tap(find.byType(Image));
+        await tester.pumpAndSettle();
+        expect(find.byType(MarkdownImagePreview), findsOneWidget);
+        expect(tester.takeException(), isNull);
+      });
+
+      testWidgets('$sender text plus image retains bubble, wide=$wide', (
+        tester,
+      ) async {
+        await _pumpBubble(
+          tester,
+          sender: sender,
+          wide: wide,
+          content: '图片在下面\n\n$_markdown',
+        );
+        expect(find.byType(BubbleSurface), findsOneWidget);
+        expect(tester.takeException(), isNull);
+      });
+    }
+  }
+
+  test('only a single image qualifies for the bubble shortcut', () {
+    expect(isStandaloneMarkdownImage(_markdown), isTrue);
+    expect(isStandaloneMarkdownImage('$_markdown\n$_markdown'), isFalse);
+    expect(isStandaloneMarkdownImage('说明 $_markdown'), isFalse);
+    expect(
+      isStandaloneMarkdownImage('![视频](https://example.com/clip.mp4)'),
+      isFalse,
+    );
+    expect(
+      isStandaloneMarkdownImage('![音频](https://example.com/song.mp3)'),
+      isFalse,
+    );
+    expect(
+      isStandaloneMarkdownImage('![未完成](https://example.com/a.png'),
+      isFalse,
+    );
+  });
+}
+
+Future<void> _pumpBubble(
+  WidgetTester tester, {
+  required String sender,
+  required bool wide,
+  String content = _markdown,
+}) async {
+  final snapshot = ThemePreferenceSnapshot.fromJson({
+    ...UserPreferencesManager.defaultThemePreferenceSnapshot.toJson(),
+    'bubbleWideLayoutEnabled': wide,
+    'bubbleShowAvatar': false,
+    'showRoleName': false,
+  });
+  final message = ChatMessage(
+    pluginExtensions: const {},
+    sender: sender,
+    parts: [
+      MessagePart(
+        partId: 'image',
+        sequence: 0,
+        kind: MessagePartKind.markdown,
+        content: content,
+        toolCallId: null,
+        toolName: null,
+        attributes: const {},
+      ),
+    ],
+    timestamp: 1,
+    roleName: sender,
+    selectedVariantIndex: 0,
+    variantCount: 1,
+    provider: 'test',
+    modelName: 'test',
+    inputTokens: 0,
+    outputTokens: 0,
+    cachedInputTokens: 0,
+    sentAt: 0,
+    outputDurationMs: 0,
+    waitDurationMs: 0,
+    completedAt: 1,
+    displayMode: ChatMessageDisplayMode.normal,
+    isFavorite: false,
+    contentStream: null,
+  );
+  await tester.pumpWidget(
+    OperitTheme(
+      initialThemePreferenceSnapshot: snapshot,
+      initialThemeIsReady: false,
+      unconfiguredChildEnabled: true,
+      hostInteractionHostsEnabled: false,
+      child: MaterialApp(
+        localizationsDelegates: AppLocalizations.localizationsDelegates,
+        supportedLocales: AppLocalizations.supportedLocales,
+        home: Scaffold(
+          body: SingleChildScrollView(
+            child: sender == 'ai'
+                ? BubbleAiMessageComposable(
+                    message: message,
+                    backgroundColor: Colors.blue,
+                    textColor: Colors.black,
+                    splitMarkdownContent: splitMarkdownEventFixture,
+                  )
+                : BubbleUserMessageComposable(
+                    message: message,
+                    backgroundColor: Colors.blue,
+                    textColor: Colors.black,
+                  ),
+          ),
+        ),
+      ),
+    ),
+  );
+  await _settleImages(tester);
+}
+
+/// Waits for raster decoding and vector compilation before checking the frame.
+Future<void> _settleImages(WidgetTester tester) async {
+  await tester.pumpAndSettle();
+  for (final element in find.byType(Image).evaluate()) {
+    final image = element.widget as Image;
+    await tester.runAsync(() => precacheImage(image.image, element));
+  }
+  for (final element in find.byType(SvgPicture).evaluate()) {
+    final image = element.widget as SvgPicture;
+    await tester.runAsync(() async {
+      final picture = await vg.loadPicture(image.bytesLoader, element);
+      picture.picture.dispose();
+    });
+  }
+  await tester.pumpAndSettle();
+}
+
+/// Serves image bytes over both runtime contracts used by Markdown images.
+class _ImageBridge extends OperitRuntimeBridge {
+  /// Serves the selected format over the same VFS and HTTP proxy contracts.
+  _ImageBridge({Uint8List? bytes})
+    : bytes = bytes ?? UriData.parse(_url).contentAsBytes();
+
+  final Uint8List bytes;
+  final sources = <String>[];
+
+  @override
+  Future<Uint8List> callBytes(CoreCallRequest request) async {
+    expect(request.methodName, 'executeTool');
+    final tool = (request.args as Map)['tool'] as Map;
+    expect(tool['name'], 'read_file_binary');
+    final path =
+        ((tool['parameters'] as List).single as Map)['value'] as String;
+    sources.add(path);
+    return encodeCoreLink([
+      0,
+      {
+        'toolName': 'read_file_binary',
+        'success': true,
+        'error': null,
+        'result': {
+          '__type': 'BinaryFileContentData',
+          'path': path,
+          'contentBase64': base64Encode(bytes),
+          'size': bytes.length,
+        },
+      },
+    ]);
+  }
+
+  @override
+  Stream<CoreEvent> watchStream(CoreWatchRequest request) async* {
+    expect(request.propertyName, 'imageBytes');
+    sources.add((request.args as Map)['url'] as String);
+    yield CoreEvent.raw(
+      requestId: request.requestId,
+      target: request.target,
+      propertyName: request.propertyName,
+      kind: 'Changed',
+      valueBytes: encodeCoreLink({
+        'bytes': bytes,
+        'displayUrl': null,
+        'error': null,
+      }),
+      decodeValue: (data) => decodeCoreLink<Object?>(data),
+    );
+  }
+
+  @override
+  Future<CorePushSink> push(CorePushRequest request) =>
+      throw UnimplementedError();
+
+  @override
+  Future<CoreEvent> watchSnapshot(CoreWatchRequest request) =>
+      throw UnimplementedError();
+}

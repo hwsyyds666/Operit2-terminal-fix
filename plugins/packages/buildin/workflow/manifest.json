@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "toolpkg_id": "com.operit.workflow",
+  "version": "0.2.0",
+  "api_version": "2.0.0",
+  "main": "dist/main.js",
+  "public_api": "src/api.ts",
+  "display_name": {
+    "zh": "工作流",
+    "en": "Workflow"
+  },
+  "description": {
+    "zh": "用可视化节点搭建自动化流程：条件分支、调用工具、定时运行，每次执行都有记录。",
+    "en": "Build automations from visual nodes: branches, tool calls, schedules and a log of every run."
+  },
+  "logo": "package_logo",
+  "enabled_by_default": false,
+  "subpackages": [
+    {
+      "id": "workflow",
+      "entry": "dist/tools.js"
+    }
+  ],
+  "resources": [
+    {
+      "key": "package_logo",
+      "path": "resources/logo.svg",
+      "mime": "image/svg+xml"
+    },
+    {
+      "key": "workflow_web",
+      "path": "resources/workflow.html",
+      "mime": "text/html"
+    }
+  ],
+  "workflow_templates": [],
+  "workspace_templates": []
+}

@@ -1,0 +1,342 @@
+package dev.floating_windows;
+
+import android.content.Context;
+import android.content.Intent;
+import android.graphics.Color;
+import android.graphics.Point;
+import android.graphics.Rect;
+import android.hardware.input.InputManager;
+import android.graphics.PixelFormat;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
+import android.provider.Settings;
+import android.view.Gravity;
+import android.view.MotionEvent;
+import android.view.ViewConfiguration;
+import android.view.WindowManager;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.UUID;
+import io.flutter.embedding.android.FlutterTextureView;
+import io.flutter.embedding.android.FlutterView;
+import io.flutter.embedding.engine.FlutterEngine;
+import io.flutter.embedding.engine.dart.DartExecutor;
+import io.flutter.embedding.engine.loader.FlutterLoader;
+import io.flutter.FlutterInjector;
+import io.flutter.embedding.engine.plugins.FlutterPlugin;
+import io.flutter.plugin.common.BinaryMessenger;
+import io.flutter.plugin.common.MethodCall;
+import io.flutter.plugin.common.MethodChannel;
+
+/** Transparent live Android overlays; every surface owns an independent engine. */
+public final class FloatingWindowsPlugin implements FlutterPlugin, MethodChannel.MethodCallHandler {
+    public interface EngineConfigurer { void configure(FlutterEngine engine); }
+    private static EngineConfigurer engineConfigurer;
+    public static void setEngineConfigurer(EngineConfigurer configurer) { engineConfigurer = configurer; }
+    private static final Map<String, Surface> surfaces = new LinkedHashMap<>();
+    private static final Handler handler = new Handler(Looper.getMainLooper());
+    private Context context;
+    private BinaryMessenger messenger;
+    private MethodChannel channel;
+
+    private static final class Surface {
+        String id;
+        BinaryMessenger owner;
+        FlutterEngine engine;
+        FlutterView view;
+        WindowManager manager;
+        Context windowContext;
+        WindowManager.LayoutParams params;
+        boolean attached, configured, closed, draggable, pointerDown, dragging;
+        boolean fill;
+        boolean screenBounded;
+        float downX, downY;
+        int windowX, windowY;
+        float opacity = 1.0f;
+    }
+    private final class DragFlutterView extends FlutterView {
+        private final Surface surface;
+        DragFlutterView(Context context, FlutterTextureView texture, Surface surface) {
+            super(context, texture); this.surface = surface;
+        }
+        @Override public boolean dispatchTouchEvent(MotionEvent event) {
+            Surface s = surface;
+            if (!s.configured || !s.draggable) return super.dispatchTouchEvent(event);
+            int action = event.getActionMasked();
+            if (action == MotionEvent.ACTION_DOWN) {
+                s.pointerDown = true; s.dragging = false;
+                s.downX = event.getRawX(); s.downY = event.getRawY();
+                s.windowX = s.params.x; s.windowY = s.params.y;
+            }
+            if (event.getPointerCount() != 1 || action == MotionEvent.ACTION_CANCEL) {
+                boolean consumed = s.dragging;
+                s.pointerDown = false; s.dragging = false;
+                return consumed || super.dispatchTouchEvent(event);
+            }
+            if (s.pointerDown && (action == MotionEvent.ACTION_MOVE || action == MotionEvent.ACTION_UP)) {
+                float dx = event.getRawX() - s.downX, dy = event.getRawY() - s.downY;
+                if (!s.dragging && Math.hypot(dx, dy) >= ViewConfiguration.get(getContext()).getScaledTouchSlop()) {
+                    s.dragging = true;
+                    MotionEvent cancel = MotionEvent.obtain(event);
+                    cancel.setAction(MotionEvent.ACTION_CANCEL);
+                    super.dispatchTouchEvent(cancel); cancel.recycle();
+                }
+                if (s.dragging) {
+                    s.params.x = s.windowX + Math.round(dx); s.params.y = s.windowY + Math.round(dy);
+                    s.manager.updateViewLayout(s.view, s.params);
+                }
+                boolean consumed = s.dragging;
+                if (action == MotionEvent.ACTION_UP) { s.pointerDown = false; s.dragging = false; }
+                if (consumed) return true;
+            }
+            return super.dispatchTouchEvent(event);
+        }
+    }
+    @Override public void onAttachedToEngine(FlutterPluginBinding binding) {
+        context = binding.getApplicationContext(); messenger = binding.getBinaryMessenger();
+        channel = new MethodChannel(messenger, "floating_windows/window");
+        channel.setMethodCallHandler(this);
+    }
+    @Override public void onDetachedFromEngine(FlutterPluginBinding binding) {
+        channel.setMethodCallHandler(null);
+        for (Surface surface : new ArrayList<>(surfaces.values())) {
+            if (surface.owner == messenger) destroy(surface);
+        }
+    }
+    /** Resolves the surface through the plugin instance registered on its engine. */
+    private Surface current() {
+        for (Surface surface : surfaces.values()) {
+            if (surface.engine.getPlugins().get(FloatingWindowsPlugin.class) == this) return surface;
+        }
+        throw new IllegalStateException("Only an overlay engine can control its current surface");
+    }
+    private boolean permitted() { return Settings.canDrawOverlays(context); }
+    private int pixels(double value) { return (int)Math.round(value * context.getResources().getDisplayMetrics().density); }
+    private float density(Surface surface) {
+        return (surface.windowContext != null ? surface.windowContext : context)
+            .getResources().getDisplayMetrics().density;
+    }
+    private double number(Map<?, ?> args, String key, double fallback, boolean dimension) {
+        Object raw = args.get(key);
+        if (raw == null) return fallback;
+        if (!(raw instanceof Number)) throw new IllegalArgumentException("Expected numeric " + key);
+        double value = ((Number)raw).doubleValue();
+        if (!Double.isFinite(value) || Math.abs(value) > 1000000 || (dimension && (value < 16 || value > 4096))) {
+            throw new IllegalArgumentException("Invalid " + key);
+        }
+        return value;
+    }
+    private boolean flag(Map<?, ?> args, String key, boolean fallback) {
+        Object value = args.get(key);
+        if (value == null) return fallback;
+        if (!(value instanceof Boolean)) throw new IllegalArgumentException("Expected boolean " + key);
+        return (Boolean)value;
+    }
+    /** Applies surface options while Android owns the bounds of a fill window. */
+    private void apply(Surface surface, Map<?, ?> args) {
+        if (!flag(args,"alwaysOnTop",true)) throw new UnsupportedOperationException("Android overlays are always above applications");
+        surface.draggable = flag(args, "draggable", surface.draggable);
+        if (!surface.draggable) { surface.pointerDown = false; surface.dragging = false; }
+        float density = density(surface);
+        WindowManager.LayoutParams next = new WindowManager.LayoutParams();
+        next.copyFrom(surface.params);
+        if (args.containsKey("screenBounds")) {
+            if (surface.fill || !(args.get("screenBounds") instanceof Map)) throw new IllegalArgumentException("Invalid screen bounds mode");
+            Map<?, ?> bounds = (Map<?, ?>)args.get("screenBounds");
+            for (String edge : new String[] {"left", "top", "right", "bottom"}) {
+                if (!bounds.containsKey(edge)) throw new IllegalArgumentException("Missing screen edge");
+            }
+            int left = (int)Math.round(number(bounds,"left",0,false));
+            int top = (int)Math.round(number(bounds,"top",0,false));
+            int right = (int)Math.round(number(bounds,"right",0,false));
+            int bottom = (int)Math.round(number(bounds,"bottom",0,false));
+            if (right <= left || bottom <= top) throw new IllegalArgumentException("Empty screen bounds");
+            next.x = left; next.y = top; next.width = right - left; next.height = bottom - top;
+            surface.screenBounded = true;
+        }
+        if (surface.fill) {
+            next.width = WindowManager.LayoutParams.MATCH_PARENT;
+            next.height = WindowManager.LayoutParams.MATCH_PARENT;
+            next.x = 0;
+            next.y = 0;
+            // An IME belongs to the controlled app, not to this indicator.
+            next.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING;
+            if (Build.VERSION.SDK_INT >= 30) {
+                next.setFitInsetsTypes(0);
+                next.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
+            } else if (Build.VERSION.SDK_INT >= 28) {
+                next.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            }
+        } else if (!surface.screenBounded) {
+            next.width = (int)Math.round(number(args,"width",next.width/density,true) * density);
+            next.height = (int)Math.round(number(args,"height",next.height/density,true) * density);
+            next.x = (int)Math.round(number(args,"x",next.x/density,false) * density);
+            next.y = (int)Math.round(number(args,"y",next.y/density,false) * density);
+        }
+        if (surface.screenBounded) {
+            next.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING;
+            if (Build.VERSION.SDK_INT >= 30) {
+                next.setFitInsetsTypes(0);
+                next.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
+            } else if (Build.VERSION.SDK_INT >= 28) {
+                next.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            }
+        }
+        boolean focus = flag(args,"focusable",(next.flags & WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)==0);
+        boolean through = flag(args,"clickThrough",(next.flags & WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE)!=0);
+        next.flags = WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+            | (surface.fill || surface.screenBounded ? WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS : 0)
+            | (focus ? 0 : WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
+            | (through ? WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE : 0);
+        // Android 12+ blocks touch delivery through untrusted overlays whose
+        // combined opacity is too high. Use the system maximum for pass-through.
+        surface.opacity = through && Build.VERSION.SDK_INT >= 31
+            ? ((InputManager)context.getSystemService(Context.INPUT_SERVICE)).getMaximumObscuringOpacityForTouch() : 1.0f;
+        next.alpha = surface.configured ? surface.opacity : 0.0f;
+        if (surface.attached) surface.manager.updateViewLayout(surface.view,next);
+        surface.params = next;
+    }
+    /** Reports display dimensions for match-parent surfaces in the current orientation. */
+    private static Point displaySize(WindowManager manager) {
+        if (Build.VERSION.SDK_INT >= 30) {
+            Rect bounds = manager.getMaximumWindowMetrics().getBounds();
+            return new Point(bounds.width(), bounds.height());
+        }
+        Point size = new Point();
+        manager.getDefaultDisplay().getRealSize(size);
+        return size;
+    }
+    /** Attaches the engine only after its view has an Android window parent. */
+    private void show(Surface surface) {
+        if (!permitted()) throw new IllegalStateException("Overlay permission is missing");
+        surface.params.alpha=surface.opacity;
+        if (!surface.attached) {
+            surface.manager.addView(surface.view,surface.params); surface.attached=true;
+            surface.view.attachToFlutterEngine(surface.engine);
+        }
+        else surface.manager.updateViewLayout(surface.view,surface.params);
+        surface.engine.getLifecycleChannel().appIsResumed();
+    }
+    /** Unregisters the accessibility bridge before removing the view's Android parent. */
+    private static void hide(Surface surface) {
+        surface.view.detachFromFlutterEngine();
+        if (surface.attached) { surface.manager.removeViewImmediate(surface.view); surface.attached=false; }
+    }
+    /** Disconnects the view before destroying its engine and removing the owned surface. */
+    private static void destroy(Surface surface) {
+        if (surface.closed) return;
+        surface.closed=true; surfaces.remove(surface.id);
+        hide(surface);
+        surface.engine.destroy();
+    }
+    @Override public void onMethodCall(MethodCall call, MethodChannel.Result result) {
+        try {
+            switch (call.method) {
+            case "capabilities": {
+                Map<String,Object> caps = new HashMap<>();
+                caps.put("supported",engineConfigurer != null); caps.put("permissionGranted",permitted());
+                caps.put("positioning",true); caps.put("alwaysOnTop",false);
+                caps.put("clickThrough",true); caps.put("focusable",true);
+                result.success(caps); return;
+            }
+            case "requestPermission":
+                if (!permitted()) context.startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:"+context.getPackageName())).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                result.success(permitted()); return;
+            case "create": {
+                if (!permitted()) throw new IllegalStateException("Overlay permission is missing");
+                if (engineConfigurer == null) throw new IllegalStateException("Overlay engine registration callback is missing");
+                FlutterLoader loader = FlutterInjector.instance().flutterLoader();
+                loader.startInitialization(context); loader.ensureInitializationComplete(context,null);
+                Surface surface = new Surface(); surface.id=UUID.randomUUID().toString(); surface.owner=messenger;
+                // A window context supplies overlay-specific density, configuration
+                // and rotation updates rather than the activity's split-screen metrics.
+                Context windowContext = context;
+                if (Build.VERSION.SDK_INT >= 30) {
+                    android.hardware.display.DisplayManager displays = (android.hardware.display.DisplayManager)
+                        context.getSystemService(Context.DISPLAY_SERVICE);
+                    windowContext = context.createDisplayContext(displays.getDisplay(android.view.Display.DEFAULT_DISPLAY))
+                        .createWindowContext(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, null);
+                }
+                surface.windowContext = windowContext;
+                surface.engine=new FlutterEngine(windowContext);
+                surface.manager=(WindowManager)windowContext.getSystemService(Context.WINDOW_SERVICE);
+                FlutterTextureView texture = new FlutterTextureView(windowContext);
+                texture.setOpaque(false);
+                surface.view=new DragFlutterView(windowContext,texture,surface);
+                surface.view.setFitsSystemWindows(false);
+                surface.view.setBackgroundColor(Color.TRANSPARENT);
+                surface.params=new WindowManager.LayoutParams(pixels(240),pixels(240),
+                    Build.VERSION.SDK_INT >= 26 ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY : WindowManager.LayoutParams.TYPE_PHONE,
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,PixelFormat.TRANSLUCENT);
+                surface.params.gravity=Gravity.TOP|Gravity.LEFT;
+                surfaces.put(surface.id,surface);
+                try {
+                    engineConfigurer.configure(surface.engine);
+                    // Establish the Android parent before enabling engine accessibility callbacks.
+                    surface.params.alpha=0;
+                    surface.manager.addView(surface.view,surface.params); surface.attached=true;
+                    surface.view.attachToFlutterEngine(surface.engine);
+                    surface.engine.getDartExecutor().executeDartEntrypoint(
+                        new DartExecutor.DartEntrypoint(loader.findAppBundlePath(),"main"),
+                        java.util.Arrays.asList("floating_windows.window",call.argument("arguments")));
+                    surface.engine.getLifecycleChannel().appIsResumed();
+                    result.success(surface.id);
+                } catch (Exception error) { destroy(surface); throw error; }
+                return;
+            }
+            case "list": result.success(new ArrayList<>(surfaces.keySet())); return;
+            case "destroy": {
+                Surface target=surfaces.get(call.<String>argument("id"));
+                if (target != null && target.owner != messenger) throw new SecurityException("Surface owner mismatch");
+                result.success(null); if (target != null) handler.post(() -> destroy(target)); return;
+            }
+            case "invoke": {
+                Surface target=surfaces.get(call.<String>argument("id"));
+                if (target == null || target.owner != messenger) throw new IllegalArgumentException("Unknown owned surface");
+                new MethodChannel(target.engine.getDartExecutor().getBinaryMessenger(),"floating_windows/window")
+                    .invokeMethod(call.argument("method"),call.argument("arguments"),result); return;
+            }
+            default: {
+                Surface surface=current();
+                if (call.method.equals("configure")) {
+                    if (!"floating_windows.window".equals(call.argument("role"))) throw new IllegalArgumentException("Explicit floating window role required");
+                    surface.fill = flag((Map<?,?>)call.arguments, "fill", false);
+                    apply(surface,(Map<?,?>)call.arguments); surface.configured=true; result.success(null); return;
+                }
+                if (!surface.configured) throw new IllegalStateException("Configure the floating window first");
+                switch (call.method) {
+                case "getBounds": {
+                    float density = density(surface);
+                    Map<String,Object> bounds = new HashMap<>();
+                    int x = surface.params.x, y = surface.params.y;
+                    Point size;
+                    if (surface.attached && surface.view.getWidth() > 0 && surface.view.getHeight() > 0) {
+                        int[] origin = new int[2];
+                        surface.view.getLocationOnScreen(origin);
+                        x = origin[0]; y = origin[1];
+                        size = new Point(surface.view.getWidth(), surface.view.getHeight());
+                    } else {
+                        size = surface.fill ? displaySize(surface.manager) : new Point(surface.params.width, surface.params.height);
+                    }
+                    bounds.put("x",x / density); bounds.put("y",y / density);
+                    bounds.put("width",size.x / density); bounds.put("height",size.y / density);
+                    result.success(bounds); return;
+                }
+                case "update": apply(surface,(Map<?,?>)call.arguments); result.success(null); return;
+                case "show": show(surface); result.success(null); return;
+                case "hide":
+                    hide(surface);
+                    result.success(null); return;
+                case "close": result.success(null); handler.post(() -> destroy(surface)); return;
+                default: result.notImplemented();
+                }
+            }
+            }
+        } catch (Exception error) { result.error("FLOATING_WINDOW_ERROR",error.getMessage(),null); }
+    }
+}

@@ -1,0 +1,21 @@
+
+{
+  "apiType": 'stageMode',
+  "buildOption": {
+    "nativeLib": { "filter": { "excludes": [] } },
+    "externalNativeOptions": {
+      "path": "./src/main/cpp/CMakeLists.txt",
+      "arguments": "",
+      "cppFlags": ""
+    }
+  },
+  "targets": [
+    {
+      "name": "default",
+      "runtimeOS": "OpenHarmony"
+    },
+    {
+      "name": "ohosTest",
+    }
+  ]
+}

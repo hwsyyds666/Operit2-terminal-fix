@@ -1,0 +1,2466 @@
+// ignore_for_file: file_names
+
+import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:flutter/material.dart';
+import 'package:operit2/core/browser/BrowserSessions.dart';
+import 'package:operit2/core/bridge/ProxyCoreRuntimeBridge.dart';
+import 'package:operit2/core/host/AppToastController.dart';
+import 'package:operit2/core/host/browser/RuntimeBrowserSessionRegistry.dart';
+import 'package:operit2/core/logging/ClientLogger.dart';
+import 'package:operit2/core/proxy/generated/CoreProxyClients.g.dart';
+import 'package:operit2/core/proxy/generated/CoreProxyModels.g.dart'
+    as core_proxy;
+import 'package:operit2/core/web_visit/WebVisitModels.dart';
+import '../../../../common/components/RetainedPage.dart';
+import '../../../../common/TerminalLabels.dart';
+import '../../../../common/contributions/ToolPkgChatUiCatalog.dart';
+import '../../../../common/contributions/EmbeddedPluginSurfaceCatalog.dart';
+import '../../../../common/contributions/EmbeddedPluginSurfaceHost.dart';
+import '../../../../common/contributions/PluginWorkspacePresentation.dart';
+import '../../../../main/layout/SidebarDockController.dart';
+import '../../../../main/navigation/ToolPkgCatalogChangeBus.dart';
+
+import '../../../../../l10n/generated/app_localizations.dart';
+import '../../../../theme/OperitTheme.dart';
+import 'WorkspacePanelSurface.dart';
+import 'file_preview/WorkspaceTextDocument.dart';
+import '../../viewmodel/WorkspaceFileModels.dart';
+import 'WorkspaceOverviewModels.dart';
+import 'WorkspaceOverviewContributionCatalog.dart';
+import 'WorkspaceTabContent.dart';
+import 'WorkspaceTabModels.dart';
+import 'WorkspaceSession.dart';
+import 'WorkspaceUnbindDialog.dart';
+import 'WorkspaceTabStrip.dart';
+import 'WorkspaceTopBarButton.dart';
+import 'browser/WorkspaceBrowserViewStore.dart';
+import 'browser/automation/WorkspaceWebVisitSessionRegistry.dart';
+import 'browser/tabs/WorkspaceBrowserTabModels.dart';
+import 'file_preview/WorkspaceTextCloseDialog.dart';
+import 'terminal/WorkspaceTerminalSessions.dart';
+import 'terminal/WorkspaceTerminalLaunch.dart';
+
+class WorkspacePanel extends StatefulWidget {
+  const WorkspacePanel({
+    super.key,
+    this.sidebarDockController,
+    required this.session,
+    required this.currentChatId,
+    required this.hasBoundWorkspace,
+    required this.workspacePath,
+    this.fileDirectory,
+    required this.chatCore,
+    required this.onListWorkspaceFiles,
+    this.onMutateWorkspaceFile,
+    required this.onListWorkspaceBindingDirectories,
+    required this.onReadWorkspaceTextFile,
+    required this.onReadWorkspaceFileBytes,
+    required this.onWriteWorkspaceFileBytes,
+    required this.onOpenWorkspaceFile,
+    required this.onCreateWorkspace,
+    required this.onBindWorkspace,
+    required this.onUnbindWorkspace,
+    this.onFileQuote,
+    this.onCloseWorkspace,
+  });
+
+  final WorkspaceSession session;
+  final String? currentChatId;
+  final SidebarDockController? sidebarDockController;
+  final bool hasBoundWorkspace;
+  final String? workspacePath;
+  final String? fileDirectory;
+  final GeneratedChatRuntimeHolderMainCoreProxy chatCore;
+  final Future<List<WorkspaceFileEntry>> Function(String path)
+  onListWorkspaceFiles;
+  final WorkspaceFileMutation? onMutateWorkspaceFile;
+  final Future<List<WorkspaceFileEntry>> Function(String path)
+  onListWorkspaceBindingDirectories;
+  final Future<String> Function(String path) onReadWorkspaceTextFile;
+  final Future<Uint8List> Function(String path) onReadWorkspaceFileBytes;
+  final Future<void> Function(String path, Uint8List bytes)
+  onWriteWorkspaceFileBytes;
+  final Future<void> Function(String path) onOpenWorkspaceFile;
+  final Future<void> Function(String name) onCreateWorkspace;
+  final Future<void> Function(String workspace) onBindWorkspace;
+  final Future<void> Function() onUnbindWorkspace;
+  final void Function(String fileName, String text)? onFileQuote;
+  final VoidCallback? onCloseWorkspace;
+
+  @override
+  State<WorkspacePanel> createState() => _WorkspacePanelState();
+}
+
+class _WorkspacePanelState extends State<WorkspacePanel> {
+  static final GeneratedCoreProxyClients _coreClients =
+      GeneratedCoreProxyClients(ProxyCoreRuntimeBridge());
+  final BrowserSessions _browserSessions = BrowserSessions();
+  final RuntimeBrowserSessionRegistry _browserSessionRegistry =
+      RuntimeBrowserSessionRegistry.instance;
+  final WorkspaceBrowserViewStore _browserViewStore =
+      WorkspaceBrowserViewStore.instance;
+  final WorkspaceWebVisitSessionRegistry _webVisitSessionRegistry =
+      WorkspaceWebVisitSessionRegistry.instance;
+  final WorkspaceTerminalSessions _terminalSessions =
+      const WorkspaceTerminalSessions();
+  final Map<String, Completer<WebVisitResponse>> _webVisitCompleters =
+      <String, Completer<WebVisitResponse>>{};
+
+  /// Returns the workspace state owned by the main chat shell.
+  WorkspaceSession get _session => widget.session;
+  final GlobalKey _primaryPaneKey = GlobalKey();
+  final GlobalKey _secondaryPaneKey = GlobalKey();
+  int? _dropHoverPaneIndex;
+  _WorkspaceDropZone? _dropHoverZone;
+  int _filesListingRevision = 0;
+  final _fileClipboard = WorkspaceFileClipboard();
+  bool _workspaceUnbindDialogOpen = false;
+  List<WorkspaceTerminalSessionInfo> _terminalSessionEntries =
+      const <WorkspaceTerminalSessionInfo>[];
+  final ValueNotifier<List<WorkspaceTerminalSessionInfo>>
+  _terminalSessionsNotifier = ValueNotifier<List<WorkspaceTerminalSessionInfo>>(
+    const <WorkspaceTerminalSessionInfo>[],
+  );
+  final ValueNotifier<int> _terminalSessionCount = ValueNotifier<int>(0);
+  final ValueNotifier<int> _browserSessionCount = ValueNotifier<int>(0);
+  List<core_proxy.ChatHistoryListItem>? _workspaceOverviewHistories;
+  ({Object error, StackTrace stackTrace})? _workspaceOverviewHistoryError;
+  WorkspaceOverviewChatScope? _workspaceOverviewChatScope;
+  bool? _workspaceOverviewUseEnglish;
+  final WorkspaceOverviewContributionCatalog _workspaceOverviewContributions =
+      WorkspaceOverviewContributionCatalog();
+  final EmbeddedPluginSurfaceCatalog _embeddedContributions =
+      EmbeddedPluginSurfaceCatalog(
+        clients: _coreClients,
+        surfaces: const {'workspace_home'},
+      );
+  List<WorkspaceFileEntry> _workspaceOverviewMountedFolders =
+      const <WorkspaceFileEntry>[];
+  bool _workspaceOverviewMountedFoldersLoading = false;
+  String? _workspaceOverviewMountedFoldersError;
+  int _workspaceOverviewMountedFoldersLoadGeneration = 0;
+  int _workspaceOverviewHistoryWatchGeneration = 0;
+  StreamSubscription<List<WorkspaceTerminalSessionInfo>>?
+  _terminalSessionSubscription;
+  StreamSubscription<List<core_proxy.ChatHistoryListItem>>?
+  _workspaceOverviewHistorySubscription;
+  StreamSubscription<void>? _workspaceOverviewCatalogSubscription;
+
+  /// Subscribes the mounted panel to workspace histories and catalog changes.
+  @override
+  void initState() {
+    super.initState();
+    _session.addListener(_handleSessionChanged);
+    widget.sidebarDockController?.addListener(_handleSidebarDockChanged);
+    _syncDockedPluginTabs();
+    unawaited(
+      _browserViewStore.ensureLoaded().catchError((
+        Object error,
+        StackTrace stackTrace,
+      ) {
+        debugPrint('Failed to load browser sessions: $error\n$stackTrace');
+      }),
+    );
+    _browserSessionRegistry.addListener(_handleBrowserSessionRegistryChanged);
+    _handleBrowserSessionRegistryChanged();
+    _browserViewStore.addListener(_handleBrowserViewStoreChanged);
+    _registerWebVisitControls();
+    _workspaceOverviewContributions.addListener(
+      _handleWorkspaceOverviewContributionsChanged,
+    );
+    _workspaceOverviewCatalogSubscription = ToolPkgCatalogChangeBus.listen(
+      _refreshWorkspaceOverviewContributions,
+    );
+    _watchWorkspaceOverviewHistories();
+    unawaited(_refreshWorkspaceOverviewMountedFolders());
+    unawaited(_refreshTerminalSessionEntries());
+    _terminalSessionSubscription = _terminalSessions.watchSessions().listen(
+      (sessions) {
+        if (!mounted) {
+          return;
+        }
+        _updateTerminalSessionEntries(sessions);
+      },
+      onError: (Object error, StackTrace stackTrace) {
+        debugPrint('Failed to watch terminal sessions: $error\n$stackTrace');
+      },
+    );
+  }
+
+  /// Reloads localized catalog display data when the host language changes.
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _embeddedContributions.setLanguage(
+      Localizations.localeOf(context).languageCode,
+    );
+    final useEnglish = Localizations.localeOf(context).languageCode == 'en';
+    if (_workspaceOverviewUseEnglish != useEnglish) {
+      _workspaceOverviewUseEnglish = useEnglish;
+      _refreshWorkspaceOverviewContributions();
+    }
+  }
+
+  /// Rebinds subscriptions and projections when the actual chat or workspace changes.
+  @override
+  void didUpdateWidget(covariant WorkspacePanel oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.currentChatId != widget.currentChatId ||
+        oldWidget.workspacePath != widget.workspacePath ||
+        oldWidget.fileDirectory != widget.fileDirectory) {
+      _fileClipboard.value = null;
+      _filesListingRevision++;
+    }
+    if (oldWidget.sidebarDockController != widget.sidebarDockController) {
+      oldWidget.sidebarDockController?.removeListener(
+        _handleSidebarDockChanged,
+      );
+      widget.sidebarDockController?.addListener(_handleSidebarDockChanged);
+      _syncDockedPluginTabs();
+    }
+    _registerWebVisitControls();
+    if (oldWidget.chatCore != widget.chatCore) {
+      _watchWorkspaceOverviewHistories();
+    }
+    final workspaceBindingChanged =
+        oldWidget.currentChatId != widget.currentChatId ||
+        oldWidget.hasBoundWorkspace != widget.hasBoundWorkspace ||
+        oldWidget.workspacePath != widget.workspacePath;
+    if (workspaceBindingChanged) {
+      _refreshWorkspaceOverviewContributions();
+      unawaited(_refreshWorkspaceOverviewMountedFolders());
+    }
+    if (!oldWidget.hasBoundWorkspace && widget.hasBoundWorkspace) {
+      _replacePickerTabWithFilesTab();
+    }
+  }
+
+  /// Releases subscriptions and invalidates every asynchronous overview request.
+  @override
+  void dispose() {
+    _fileClipboard.dispose();
+    _embeddedContributions.dispose();
+    _session.removeListener(_handleSessionChanged);
+    widget.sidebarDockController?.removeListener(_handleSidebarDockChanged);
+    _webVisitSessionRegistry.clearControls();
+    _browserSessionRegistry.removeListener(
+      _handleBrowserSessionRegistryChanged,
+    );
+    _browserViewStore.removeListener(_handleBrowserViewStoreChanged);
+    ++_workspaceOverviewHistoryWatchGeneration;
+    ++_workspaceOverviewMountedFoldersLoadGeneration;
+    unawaited(_workspaceOverviewHistorySubscription?.cancel());
+    unawaited(_workspaceOverviewCatalogSubscription?.cancel());
+    _workspaceOverviewContributions.removeListener(
+      _handleWorkspaceOverviewContributionsChanged,
+    );
+    _workspaceOverviewContributions.dispose();
+    for (final entry in _webVisitCompleters.entries) {
+      final completer = entry.value;
+      if (!completer.isCompleted) {
+        completer.complete(
+          WebVisitResponse(
+            requestId: entry.key,
+            success: false,
+            error: 'visit_web workspace closed',
+          ),
+        );
+      }
+    }
+    _webVisitCompleters.clear();
+    unawaited(_terminalSessionSubscription?.cancel());
+    _terminalSessionCount.dispose();
+    _terminalSessionsNotifier.dispose();
+    _browserSessionCount.dispose();
+    super.dispose();
+  }
+
+  /// Rebuilds after a turn review selects the workspace diff tab.
+  void _handleSessionChanged() {
+    if (!mounted) {
+      return;
+    }
+    setState(() {});
+  }
+
+  /// Refreshes peer plugin tabs after a sidebar dock movement.
+  void _handleSidebarDockChanged() {
+    if (!mounted) {
+      return;
+    }
+    setState(_syncDockedPluginTabs);
+  }
+
+  /// Reconciles docked plugin entries with the shared workspace tab list.
+  void _syncDockedPluginTabs() {
+    final controller = widget.sidebarDockController;
+    if (controller == null) {
+      return;
+    }
+    final dockedById = <String, SidebarDockedPluginView>{
+      for (final view in controller.secondaryViews) view.entry.entryId: view,
+    };
+    _session.tabs.removeWhere(
+      (tab) =>
+          tab.kind == WorkspaceTabKind.plugin &&
+          tab.pluginPresentation == null &&
+          !dockedById.containsKey(tab.pluginEntryId),
+    );
+    _session.secondaryTabs.removeWhere(
+      (tab) =>
+          tab.kind == WorkspaceTabKind.plugin &&
+          tab.pluginPresentation == null &&
+          !dockedById.containsKey(tab.pluginEntryId),
+    );
+    final existingIds = <String>{
+      for (final tab in <WorkspaceTab>[
+        ..._session.tabs,
+        ..._session.secondaryTabs,
+      ])
+        if (tab.kind == WorkspaceTabKind.plugin && tab.pluginEntryId != null)
+          tab.pluginEntryId!,
+    };
+    String? addedPluginEntryId;
+    for (final view in controller.secondaryViews) {
+      if (existingIds.contains(view.entry.entryId)) {
+        continue;
+      }
+      _session.tabs.add(
+        WorkspaceTab(
+          kind: WorkspaceTabKind.plugin,
+          title: view.entry.title,
+          icon: view.entry.icon,
+          closable: false,
+          pluginEntryId: view.entry.entryId,
+          pluginPackageName: view.route.ownerPackageName,
+          pluginUiModuleId: view.route.toolPkgUiModuleId,
+        ),
+      );
+      addedPluginEntryId = view.entry.entryId;
+    }
+    _session.selectedIndex = _clampSelectedIndex(
+      _session.selectedIndex,
+      _session.tabs,
+    );
+    _session.secondarySelectedIndex = _clampSelectedIndex(
+      _session.secondarySelectedIndex,
+      _session.secondaryTabs,
+    );
+    if (addedPluginEntryId != null) {
+      _session.selectedIndex = _session.tabs.indexWhere(
+        (tab) => tab.pluginEntryId == addedPluginEntryId,
+      );
+    }
+    _collapseEmptyPane();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return WorkspacePanelSurface(
+      transparentSurface: OperitTheme.of(
+        context,
+      ).themePreferenceSnapshot.transparentSurfaceEnabled,
+      child: _buildWorkspaceLayout(),
+    );
+  }
+
+  /// Builds the workspace layout with one or two independently tabbed panes.
+  Widget _buildWorkspaceLayout() {
+    if (_session.splitAxis == null) {
+      return _buildWorkspacePane(0);
+    }
+    final firstPane = _session.secondaryPaneFirst ? 1 : 0;
+    final secondPane = _session.secondaryPaneFirst ? 0 : 1;
+    final first = Expanded(
+      flex: (_session.splitRatio * 1000).round().clamp(200, 800),
+      child: _buildWorkspacePane(firstPane),
+    );
+    final second = Expanded(
+      flex: ((1 - _session.splitRatio) * 1000).round().clamp(200, 800),
+      child: _buildWorkspacePane(secondPane),
+    );
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final extent = _session.splitAxis == WorkspaceSplitAxis.vertical
+            ? constraints.maxWidth
+            : constraints.maxHeight;
+        final divider = _WorkspacePaneDivider(
+          axis: _session.splitAxis!,
+          extent: extent,
+          onDelta: (delta, totalExtent) {
+            if (totalExtent <= 0) {
+              return;
+            }
+            setState(() {
+              final change = delta / totalExtent;
+              _session.splitRatio = (_session.splitRatio + change).clamp(
+                0.2,
+                0.8,
+              );
+            });
+          },
+        );
+        return _session.splitAxis == WorkspaceSplitAxis.vertical
+            ? Row(children: <Widget>[first, divider, second])
+            : Column(children: <Widget>[first, divider, second]);
+      },
+    );
+  }
+
+  /// Builds one pane, including its tab strip, content stack, and drop zones.
+  Widget _buildWorkspacePane(int paneIndex) {
+    final paneTabs = _tabsForPane(paneIndex);
+    final selectedIndex = _selectedIndexForPane(paneIndex);
+    final closeWorkspace = paneIndex == 0 ? widget.onCloseWorkspace : null;
+    final tabs = WorkspaceTabStrip(
+      tabs: paneTabs,
+      selectedIndex: selectedIndex,
+      onSelected: (index) => _selectTab(index, paneIndex: paneIndex),
+      onClosed: (index) => _closeTab(index, paneIndex: paneIndex),
+      onCloseTabs: _closeTabs,
+      onOpenWith: _chooseFileOpener,
+    );
+    final content = Column(
+      children: <Widget>[
+        if (closeWorkspace == null)
+          tabs
+        else
+          Row(
+            children: [
+              Expanded(child: tabs),
+              WorkspaceTopBarButton(
+                open: true,
+                hasBoundWorkspace: widget.hasBoundWorkspace,
+                onPressed: closeWorkspace,
+              ),
+            ],
+          ),
+        Expanded(
+          child: IndexedStack(
+            index: selectedIndex,
+            children: <Widget>[
+              for (final (tabIndex, tab) in paneTabs.indexed)
+                KeyedSubtree(
+                  key: ValueKey<String>('pane-$paneIndex-${_tabIdentity(tab)}'),
+                  child: RetainedPage(
+                    active: tabIndex == selectedIndex,
+                    child: Builder(
+                      builder: (_) =>
+                          _buildTabContent(tab, paneIndex: paneIndex),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ],
+    );
+    final paneKey = paneIndex == 0 ? _primaryPaneKey : _secondaryPaneKey;
+    return SizedBox.expand(
+      key: paneKey,
+      child: DragTarget<Object>(
+        onWillAcceptWithDetails: (details) =>
+            _canAcceptWorkspaceDrop(details.data),
+        onMove: (details) {
+          final zone = _dropZoneForGlobalOffset(
+            paneKey.currentContext!,
+            details.offset,
+          );
+          if (_dropHoverPaneIndex == paneIndex && _dropHoverZone == zone) {
+            return;
+          }
+          setState(() {
+            _dropHoverPaneIndex = paneIndex;
+            _dropHoverZone = zone;
+          });
+        },
+        onLeave: (data) {
+          if (_dropHoverPaneIndex != paneIndex) {
+            return;
+          }
+          setState(() {
+            _dropHoverPaneIndex = null;
+            _dropHoverZone = null;
+          });
+        },
+        onAcceptWithDetails: (details) {
+          final zone = _dropZoneForGlobalOffset(
+            paneKey.currentContext!,
+            details.offset,
+          );
+          _clearDropHover();
+          _acceptWorkspaceDrop(details.data, paneIndex: paneIndex, zone: zone);
+        },
+        builder: (context, candidateData, rejectedData) {
+          final zone = _dropHoverPaneIndex == paneIndex ? _dropHoverZone : null;
+          return Stack(
+            fit: StackFit.expand,
+            children: <Widget>[
+              content,
+              if (candidateData.isNotEmpty && zone != null)
+                _buildDropOverlay(context, zone),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  /// Returns whether a plugin or regular tab can enter a workspace pane.
+  bool _canAcceptWorkspaceDrop(Object data) {
+    if (data is SidebarDockDragPayload) {
+      final controller = widget.sidebarDockController;
+      return controller != null &&
+          controller.canMove(data.entryId, SidebarDockLocation.secondary);
+    }
+    if (data is WorkspaceTabDragPayload) {
+      return _containsWorkspaceTab(data.tab);
+    }
+    return false;
+  }
+
+  /// Returns whether a dragged regular tab is currently present in a pane.
+  bool _containsWorkspaceTab(WorkspaceTab tab) {
+    return _session.tabs.contains(tab) || _session.secondaryTabs.contains(tab);
+  }
+
+  /// Returns the mutable tab list belonging to a physical pane index.
+  List<WorkspaceTab> _tabsForPane(int paneIndex) {
+    return paneIndex == 1 ? _session.secondaryTabs : _session.tabs;
+  }
+
+  /// Returns the selected tab index belonging to a physical pane index.
+  int _selectedIndexForPane(int paneIndex) {
+    final tabs = _tabsForPane(paneIndex);
+    final value = identical(tabs, _session.tabs)
+        ? _session.selectedIndex
+        : _session.secondarySelectedIndex;
+    return _clampSelectedIndex(value, tabs);
+  }
+
+  /// Keeps one selected index valid for a mutable workspace tab list.
+  int _clampSelectedIndex(int value, List<WorkspaceTab> tabs) {
+    if (tabs.isEmpty) {
+      return 0;
+    }
+    return value.clamp(0, tabs.length - 1).toInt();
+  }
+
+  /// Converts a global drag position into one of the five pane drop zones.
+  _WorkspaceDropZone _dropZoneForGlobalOffset(
+    BuildContext paneContext,
+    Offset globalOffset,
+  ) {
+    // Existing splits accept tabs into the hovered group without splitting it.
+    if (_session.splitAxis != null) {
+      return _WorkspaceDropZone.center;
+    }
+    final renderObject = paneContext.findRenderObject()! as RenderBox;
+    final local = renderObject.globalToLocal(globalOffset);
+    final size = renderObject.size;
+    if (local.dx <= size.width * 0.25) {
+      return _WorkspaceDropZone.left;
+    }
+    if (local.dx >= size.width * 0.75) {
+      return _WorkspaceDropZone.right;
+    }
+    if (local.dy <= size.height * 0.25) {
+      return _WorkspaceDropZone.top;
+    }
+    if (local.dy >= size.height * 0.75) {
+      return _WorkspaceDropZone.bottom;
+    }
+    return _WorkspaceDropZone.center;
+  }
+
+  /// Builds the visible highlight for the currently hovered drop zone.
+  Widget _buildDropOverlay(BuildContext context, _WorkspaceDropZone zone) {
+    final color = Theme.of(context).colorScheme.primary;
+    final decoration = BoxDecoration(
+      color: color.withValues(alpha: 0.14),
+      border: Border.all(color: color, width: 2),
+    );
+    if (zone == _WorkspaceDropZone.center) {
+      return IgnorePointer(child: DecoratedBox(decoration: decoration));
+    }
+    final horizontal =
+        zone == _WorkspaceDropZone.left || zone == _WorkspaceDropZone.right;
+    final alignment = switch (zone) {
+      _WorkspaceDropZone.left => Alignment.centerLeft,
+      _WorkspaceDropZone.right => Alignment.centerRight,
+      _WorkspaceDropZone.top => Alignment.topCenter,
+      _WorkspaceDropZone.bottom => Alignment.bottomCenter,
+      _WorkspaceDropZone.center => Alignment.center,
+    };
+    return IgnorePointer(
+      child: Align(
+        alignment: alignment,
+        child: FractionallySizedBox(
+          widthFactor: horizontal ? 0.5 : 1,
+          heightFactor: horizontal ? 1 : 0.5,
+          child: DecoratedBox(decoration: decoration),
+        ),
+      ),
+    );
+  }
+
+  /// Clears any active workspace drop-zone highlight.
+  void _clearDropHover() {
+    if (_dropHoverPaneIndex == null && _dropHoverZone == null) {
+      return;
+    }
+    setState(() {
+      _dropHoverPaneIndex = null;
+      _dropHoverZone = null;
+    });
+  }
+
+  /// Accepts a plugin or regular tab drop into a pane or directional split.
+  void _acceptWorkspaceDrop(
+    Object data, {
+    required int paneIndex,
+    required _WorkspaceDropZone zone,
+  }) {
+    if (data is WorkspaceTabDragPayload) {
+      _moveWorkspaceTabToPane(data.tab, paneIndex: paneIndex, zone: zone);
+      return;
+    }
+    if (data is! SidebarDockDragPayload) {
+      return;
+    }
+    _acceptPluginDrop(data, paneIndex: paneIndex, zone: zone);
+  }
+
+  /// Accepts a plugin drop into a pane or creates a directional split.
+  void _acceptPluginDrop(
+    SidebarDockDragPayload payload, {
+    required int paneIndex,
+    required _WorkspaceDropZone zone,
+  }) {
+    final controller = widget.sidebarDockController;
+    if (controller == null ||
+        !controller.canMove(payload.entryId, SidebarDockLocation.secondary)) {
+      return;
+    }
+    final alreadySecondary = controller.secondaryViews.any(
+      (view) => view.entry.entryId == payload.entryId,
+    );
+    if (!alreadySecondary) {
+      controller.move(
+        payload.entryId,
+        location: SidebarDockLocation.secondary,
+        insertionIndex: controller.secondaryViews.length,
+      );
+    }
+    final view = controller.secondaryViews.firstWhere(
+      (item) => item.entry.entryId == payload.entryId,
+    );
+    final pluginTab = WorkspaceTab(
+      kind: WorkspaceTabKind.plugin,
+      title: view.entry.title,
+      icon: view.entry.icon,
+      closable: false,
+      pluginEntryId: view.entry.entryId,
+      pluginPackageName: view.route.ownerPackageName,
+      pluginUiModuleId: view.route.toolPkgUiModuleId,
+    );
+    setState(() {
+      _removePluginFromPanes(payload.entryId);
+      if (_session.splitAxis == null && zone != _WorkspaceDropZone.center) {
+        _session.splitAxis =
+            zone == _WorkspaceDropZone.left || zone == _WorkspaceDropZone.right
+            ? WorkspaceSplitAxis.vertical
+            : WorkspaceSplitAxis.horizontal;
+        _session.secondaryPaneFirst =
+            zone == _WorkspaceDropZone.left || zone == _WorkspaceDropZone.top;
+        _session.secondaryTabs.add(pluginTab);
+        _session.secondarySelectedIndex = 0;
+        _session.splitRatio = 0.5;
+        return;
+      }
+      final targetTabs = _tabsForPane(paneIndex);
+      final targetIndex = targetTabs.indexWhere(
+        (tab) => tab.pluginEntryId == payload.entryId,
+      );
+      if (targetIndex >= 0) {
+        targetTabs[targetIndex] = pluginTab;
+        _setSelectedIndexForPane(paneIndex, targetIndex);
+      } else {
+        targetTabs.add(pluginTab);
+        _setSelectedIndexForPane(paneIndex, targetTabs.length - 1);
+      }
+      _collapseEmptyPane();
+    });
+  }
+
+  /// Removes an empty secondary group after a completed tab mutation.
+  void _collapseEmptyPane() {
+    if (_session.secondaryTabs.isNotEmpty) {
+      return;
+    }
+    _session.splitAxis = null;
+    _session.secondaryPaneFirst = false;
+    _session.splitRatio = 0.5;
+    _session.secondarySelectedIndex = 0;
+    _dropHoverPaneIndex = null;
+    _dropHoverZone = null;
+  }
+
+  /// Moves a regular workspace tab into a pane or creates a directional split.
+  void _moveWorkspaceTabToPane(
+    WorkspaceTab tab, {
+    required int paneIndex,
+    required _WorkspaceDropZone zone,
+  }) {
+    if (_session.dirtyPluginFiles.contains(tab)) {
+      ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+        SnackBar(
+          content: Text(
+            AppLocalizations.of(context)!.workspacePluginUnsavedChanges,
+          ),
+        ),
+      );
+      return;
+    }
+    final sourceTabs = _session.tabs.contains(tab)
+        ? _session.tabs
+        : (_session.secondaryTabs.contains(tab)
+              ? _session.secondaryTabs
+              : null);
+    if (sourceTabs == null) {
+      return;
+    }
+    setState(() {
+      if (_session.splitAxis == null && zone != _WorkspaceDropZone.center) {
+        if (identical(sourceTabs, _session.tabs)) {
+          _session.tabs.remove(tab);
+        }
+        _session.splitAxis =
+            zone == _WorkspaceDropZone.left || zone == _WorkspaceDropZone.right
+            ? WorkspaceSplitAxis.vertical
+            : WorkspaceSplitAxis.horizontal;
+        _session.secondaryPaneFirst =
+            zone == _WorkspaceDropZone.left || zone == _WorkspaceDropZone.top;
+        _session.secondaryTabs
+          ..clear()
+          ..add(tab);
+        _session.secondarySelectedIndex = 0;
+        _session.selectedIndex = _clampSelectedIndex(
+          _session.selectedIndex,
+          _session.tabs,
+        );
+        _session.splitRatio = 0.5;
+        return;
+      }
+      sourceTabs.remove(tab);
+      final targetTabs = _tabsForPane(paneIndex);
+      targetTabs.remove(tab);
+      targetTabs.add(tab);
+      _setSelectedIndexForPane(paneIndex, targetTabs.length - 1);
+      _session.selectedIndex = _clampSelectedIndex(
+        _session.selectedIndex,
+        _session.tabs,
+      );
+      _session.secondarySelectedIndex = _clampSelectedIndex(
+        _session.secondarySelectedIndex,
+        _session.secondaryTabs,
+      );
+      _collapseEmptyPane();
+    });
+  }
+
+  /// Removes one plugin tab from both pane lists and keeps their selection valid.
+  void _removePluginFromPanes(String entryId) {
+    _session.tabs.removeWhere((tab) => tab.pluginEntryId == entryId);
+    _session.secondaryTabs.removeWhere((tab) => tab.pluginEntryId == entryId);
+    _session.selectedIndex = _clampSelectedIndex(
+      _session.selectedIndex,
+      _session.tabs,
+    );
+    _session.secondarySelectedIndex = _clampSelectedIndex(
+      _session.secondarySelectedIndex,
+      _session.secondaryTabs,
+    );
+  }
+
+  /// Updates the selected index belonging to a physical pane.
+  void _setSelectedIndexForPane(int paneIndex, int index) {
+    final tabs = _tabsForPane(paneIndex);
+    final value = _clampSelectedIndex(index, tabs);
+    if (identical(tabs, _session.tabs)) {
+      _session.selectedIndex = value;
+    } else {
+      _session.secondarySelectedIndex = value;
+    }
+  }
+
+  void _registerWebVisitControls() {
+    _webVisitSessionRegistry.setControls(openWebVisitTab: _openWebVisitTab);
+  }
+
+  /// Watches actual history summaries and rejects events from a replaced chat core.
+  void _watchWorkspaceOverviewHistories() {
+    final generation = ++_workspaceOverviewHistoryWatchGeneration;
+    unawaited(_workspaceOverviewHistorySubscription?.cancel());
+    _workspaceOverviewHistories = null;
+    _workspaceOverviewHistoryError = null;
+    _refreshWorkspaceOverviewContributions();
+    _workspaceOverviewHistorySubscription = widget.chatCore
+        .chatHistoryListItemsFlow()
+        .listen(
+          (histories) {
+            if (!mounted ||
+                generation != _workspaceOverviewHistoryWatchGeneration) {
+              return;
+            }
+            _workspaceOverviewHistories =
+                List<core_proxy.ChatHistoryListItem>.unmodifiable(histories);
+            _workspaceOverviewHistoryError = null;
+            _refreshWorkspaceOverviewContributions();
+          },
+          onError: (Object error, StackTrace stackTrace) {
+            if (!mounted ||
+                generation != _workspaceOverviewHistoryWatchGeneration) {
+              return;
+            }
+            _workspaceOverviewHistories = null;
+            _workspaceOverviewHistoryError = (
+              error: error,
+              stackTrace: stackTrace,
+            );
+            _refreshWorkspaceOverviewContributions();
+          },
+        );
+  }
+
+  /// Refreshes registered contributions using only the selected workspace summaries.
+  void _refreshWorkspaceOverviewContributions() {
+    if (!mounted) {
+      return;
+    }
+    final historyError = _workspaceOverviewHistoryError;
+    if (historyError != null) {
+      _workspaceOverviewChatScope = null;
+      _workspaceOverviewContributions.reportError(
+        historyError.error,
+        historyError.stackTrace,
+      );
+      return;
+    }
+    final histories = _workspaceOverviewHistories;
+    final useEnglish = _workspaceOverviewUseEnglish;
+    if (histories == null || useEnglish == null) {
+      _workspaceOverviewChatScope = null;
+      _workspaceOverviewContributions.awaitHistories();
+      return;
+    }
+    final WorkspaceOverviewChatScope scope;
+    try {
+      scope = WorkspaceOverviewChatScope.fromHistories(
+        histories: histories,
+        currentChatId: widget.currentChatId,
+        hasBoundWorkspace: widget.hasBoundWorkspace,
+      );
+    } catch (error, stackTrace) {
+      _workspaceOverviewChatScope = null;
+      _workspaceOverviewContributions.reportError(error, stackTrace);
+      return;
+    }
+    _workspaceOverviewChatScope = scope;
+    unawaited(
+      _workspaceOverviewContributions.refresh(
+        catalog: ToolPkgChatUiCatalog(
+          clients: _coreClients,
+          useEnglish: useEnglish,
+        ),
+        chats: scope.chats,
+      ),
+    );
+  }
+
+  /// Rebuilds the mounted overview for explicit loading, success, and error states.
+  void _handleWorkspaceOverviewContributionsChanged() {
+    if (!mounted) {
+      return;
+    }
+    setState(() {});
+  }
+
+  /// Refreshes mounted folders shown by the workspace overview.
+  Future<void> _refreshWorkspaceOverviewMountedFolders() async {
+    final loadGeneration = ++_workspaceOverviewMountedFoldersLoadGeneration;
+    if (!widget.hasBoundWorkspace) {
+      setState(() {
+        _workspaceOverviewMountedFolders = const <WorkspaceFileEntry>[];
+        _workspaceOverviewMountedFoldersLoading = false;
+        _workspaceOverviewMountedFoldersError = null;
+      });
+      return;
+    }
+
+    setState(() {
+      _workspaceOverviewMountedFolders = const <WorkspaceFileEntry>[];
+      _workspaceOverviewMountedFoldersLoading = true;
+      _workspaceOverviewMountedFoldersError = null;
+    });
+    try {
+      final entries = await widget.onListWorkspaceFiles('');
+      final mountedFolders = entries
+          .where((entry) => entry.isDirectory)
+          .toList(growable: false);
+      if (!mounted ||
+          loadGeneration != _workspaceOverviewMountedFoldersLoadGeneration) {
+        return;
+      }
+      setState(() {
+        _workspaceOverviewMountedFolders =
+            List<WorkspaceFileEntry>.unmodifiable(mountedFolders);
+        _workspaceOverviewMountedFoldersLoading = false;
+      });
+    } catch (error, stackTrace) {
+      debugPrint(
+        'Failed to refresh workspace overview folders: $error\n$stackTrace',
+      );
+      if (!mounted ||
+          loadGeneration != _workspaceOverviewMountedFoldersLoadGeneration) {
+        return;
+      }
+      setState(() {
+        _workspaceOverviewMountedFoldersLoading = false;
+        _workspaceOverviewMountedFoldersError = error.toString();
+      });
+    }
+  }
+
+  /// Converts mounted folder entries into overview display models.
+  List<WorkspaceMountedFolder> _workspaceOverviewMountedFolderModels() {
+    final mountedFolders = <WorkspaceMountedFolder>[];
+    for (final entry in _workspaceOverviewMountedFolders) {
+      final name = entry.name.trim();
+      final path = entry.path.trim();
+      final relativePath = entry.relativePath.trim();
+      if (name.isEmpty || path.isEmpty || relativePath.isEmpty) {
+        continue;
+      }
+      mountedFolders.add(
+        WorkspaceMountedFolder(
+          name: name,
+          path: path,
+          relativePath: relativePath,
+        ),
+      );
+    }
+    return List<WorkspaceMountedFolder>.unmodifiable(mountedFolders);
+  }
+
+  /// Keeps host counts independent of plugin-owned contribution usage records.
+  WorkspaceOverviewUsage _workspaceOverviewUsage() {
+    final workspaceName = _workspaceOverviewChatScope?.workspaceName?.trim();
+    return WorkspaceOverviewUsage(
+      workspaceName: workspaceName == null || workspaceName.isEmpty
+          ? null
+          : workspaceName,
+      conversationCount: _workspaceOverviewChatScope?.chats.length,
+      contributions: _workspaceOverviewContributions.state,
+      mountedFolders: _workspaceOverviewMountedFolderModels(),
+      mountedFoldersLoading: _workspaceOverviewMountedFoldersLoading,
+      mountedFoldersError: _workspaceOverviewMountedFoldersError,
+    );
+  }
+
+  /// Selects a tab in the requested physical workspace pane.
+  void _selectTab(int index, {int paneIndex = 0}) {
+    setState(() {
+      _setSelectedIndexForPane(paneIndex, index);
+    });
+    final tabs = _tabsForPane(paneIndex);
+    if (index >= 0 && index < tabs.length) {
+      final tab = tabs[index];
+      if (tab.kind == WorkspaceTabKind.browser &&
+          tab.browserSessionId != null &&
+          tab.browserSessionId!.isNotEmpty) {
+        try {
+          _browserViewStore.selectSession(tab.browserSessionId!);
+        } catch (_) {}
+      }
+    }
+  }
+
+  void _openSingletonTab(WorkspaceTab tab) {
+    final existingIndex = _session.tabs.indexWhere(
+      (item) => item.kind == tab.kind,
+    );
+    setState(() {
+      if (existingIndex >= 0) {
+        _session.tabs[existingIndex] = tab;
+        _session.selectedIndex = existingIndex;
+      } else {
+        _session.tabs.add(tab);
+        _session.selectedIndex = _session.tabs.length - 1;
+      }
+    });
+  }
+
+  void _openBrowserTab({
+    String? url,
+    String? localFilePath,
+    String? workspaceHtmlPath,
+    String? userAgent,
+    Map<String, String>? headers,
+  }) {
+    unawaited(
+      _openBrowserTabAsync(
+        url: url,
+        localFilePath: localFilePath,
+        workspaceHtmlPath: workspaceHtmlPath,
+        userAgent: userAgent,
+        headers: headers,
+      ),
+    );
+  }
+
+  void _openBrowserSessionTab(
+    WorkspaceBrowserTabState tabState, {
+    String? absolutePath,
+    String? workspaceHtmlPath,
+    String? userAgent,
+    Map<String, String>? headers,
+  }) {
+    if (!mounted) {
+      return;
+    }
+    final existingIndex = _session.tabs.indexWhere(
+      (item) =>
+          item.kind == WorkspaceTabKind.browser &&
+          item.browserSessionId == tabState.id,
+    );
+    final title = tabState.title.trim().isNotEmpty
+        ? tabState.title.trim()
+        : (tabState.siteHost.isNotEmpty ? tabState.siteHost : '浏览器');
+    final tab = WorkspaceTab(
+      kind: WorkspaceTabKind.browser,
+      title: title,
+      icon: Icons.public,
+      browserSessionId: tabState.id,
+      url: tabState.url,
+      absolutePath: absolutePath,
+      workspaceHtmlPath: workspaceHtmlPath,
+      userAgent: userAgent,
+      headers: headers,
+    );
+    setState(() {
+      if (existingIndex >= 0) {
+        _session.tabs[existingIndex] = tab;
+        _session.selectedIndex = existingIndex;
+      } else {
+        _session.tabs.add(tab);
+        _session.selectedIndex = _session.tabs.length - 1;
+      }
+    });
+    _browserViewStore.selectSession(tabState.id);
+  }
+
+  Future<void> _openBrowserTabAsync({
+    String? url,
+    String? localFilePath,
+    String? workspaceHtmlPath,
+    String? userAgent,
+    Map<String, String>? headers,
+  }) async {
+    try {
+      final htmlPath = workspaceHtmlPath?.trim();
+      if (htmlPath != null && htmlPath.isNotEmpty) {
+        final existingIndex = _session.tabs.indexWhere(
+          (item) =>
+              item.kind == WorkspaceTabKind.browser &&
+              item.workspaceHtmlPath == htmlPath,
+        );
+        if (existingIndex >= 0) {
+          setState(() {
+            _session.selectedIndex = existingIndex;
+          });
+          final existingTab = _session.tabs[existingIndex];
+          if (existingTab.browserSessionId != null) {
+            _browserViewStore.selectSession(existingTab.browserSessionId!);
+          }
+          return;
+        }
+      } else {
+        final filePath = localFilePath?.trim();
+        if (filePath != null && filePath.isNotEmpty) {
+          final existingIndex = _session.tabs.indexWhere(
+            (item) =>
+                item.kind == WorkspaceTabKind.browser &&
+                item.absolutePath == filePath,
+          );
+          if (existingIndex >= 0) {
+            setState(() {
+              _session.selectedIndex = existingIndex;
+            });
+            final existingTab = _session.tabs[existingIndex];
+            if (existingTab.browserSessionId != null) {
+              _browserViewStore.selectSession(existingTab.browserSessionId!);
+            }
+            return;
+          }
+        }
+      }
+
+      final WorkspaceBrowserTabState tabState;
+      if (htmlPath != null && htmlPath.isNotEmpty) {
+        tabState = await _browserViewStore.openWorkspaceHtmlTab(
+          htmlPath,
+          initialUrl: url,
+        );
+      } else {
+        final filePath = localFilePath?.trim();
+        if (filePath != null && filePath.isNotEmpty) {
+          tabState = await _browserViewStore.openLocalFileTab(filePath);
+        } else {
+          tabState = await _browserViewStore.openTab(
+            url: url,
+            userAgent: userAgent,
+            headers: headers,
+          );
+        }
+      }
+      if (!mounted) {
+        return;
+      }
+      _openBrowserSessionTab(
+        tabState,
+        absolutePath: localFilePath,
+        workspaceHtmlPath: workspaceHtmlPath,
+        userAgent: userAgent,
+        headers: headers,
+      );
+    } catch (error, stackTrace) {
+      ClientLogger.e(
+        'open browser tab failed',
+        tag: 'WorkspacePanel',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      if (mounted) {
+        AppToastController.instance.show('打开浏览器失败: $error');
+      }
+    }
+  }
+
+  Future<WebVisitResponse> _openWebVisitTab(WebVisitRequest request) {
+    final completer = Completer<WebVisitResponse>();
+    _webVisitCompleters[request.requestId] = completer;
+    final tab = WorkspaceTab(
+      kind: WorkspaceTabKind.webVisit,
+      title: _webVisitTabTitle(request),
+      icon: Icons.travel_explore,
+      webVisitRequest: request,
+    );
+    setState(() {
+      _session.tabs.add(tab);
+      _session.selectedIndex = _session.tabs.length - 1;
+    });
+    return completer.future;
+  }
+
+  String _webVisitTabTitle(WebVisitRequest request) {
+    final uri = Uri.tryParse(request.url.trim());
+    if (uri != null && uri.host.isNotEmpty) {
+      return uri.host;
+    }
+    return 'visit_web';
+  }
+
+  /// Builds one tab's content with callbacks bound to its physical pane.
+  Widget _buildTabContent(WorkspaceTab tab, {int paneIndex = 0}) {
+    return WorkspaceTabContent(
+      tab: tab,
+      workspacePath: widget.workspacePath,
+      fileDirectory: widget.fileDirectory,
+      workspaceUsage: _workspaceOverviewUsage(),
+      terminalSessionCountListenable: _terminalSessionCount,
+      browserSessionCountListenable: _browserSessionCount,
+      onListWorkspaceFiles: widget.onListWorkspaceFiles,
+      onMutateWorkspaceFile: widget.onMutateWorkspaceFile == null
+          ? null
+          : _mutateWorkspaceFile,
+      fileClipboard: _fileClipboard,
+      onListWorkspaceBindingDirectories:
+          widget.onListWorkspaceBindingDirectories,
+      onReadWorkspaceTextFile: widget.onReadWorkspaceTextFile,
+      onChooseFileOpener: () => _chooseFileOpener(tab),
+      onFileQuote: (text) {
+        final input = tab.pluginPresentation?.input;
+        if (mounted &&
+            _containsWorkspaceTab(tab) &&
+            input is Map &&
+            input['chatId'] == widget.currentChatId) {
+          widget.onFileQuote?.call(tab.title, text);
+        }
+      },
+      onFileDirty: (dirty) {
+        if (!_containsWorkspaceTab(tab)) return;
+        if (dirty) {
+          _session.dirtyPluginFiles.add(tab);
+        } else {
+          _session.dirtyPluginFiles.remove(tab);
+        }
+      },
+      onReadWorkspaceFileBytes: widget.onReadWorkspaceFileBytes,
+      onWriteWorkspaceFileBytes: widget.onWriteWorkspaceFileBytes,
+      onOpenWorkspaceFile: widget.onOpenWorkspaceFile,
+      onOpenFile: _openFileTab,
+      onOpenFolder: _openMountedFolder,
+      onAddFolder: _openWorkspaceBindingPickerTab,
+      filesListingRevision: _filesListingRevision,
+      terminalSessionsListenable: _terminalSessionsNotifier,
+      onOpenTerminal: _createAndOpenTerminalSession,
+      onChooseTerminal: _chooseAndOpenTerminalSession,
+      onOpenTerminalSessions: _showTerminalSessionPicker,
+      onOpenBrowserSessions: _showBrowserSessionPicker,
+      onOpenBrowser: _openBrowserTab,
+      onSelectTerminalSession: _openTerminalSessionTab,
+      onCloseTerminalSession: _handleCloseTerminalSession,
+      onSelectBrowserTab: _openBrowserSessionTab,
+      onCloseBrowserSession: _handleCloseBrowserSession,
+      pluginHomeContent: EmbeddedPluginSurfaceHost(
+        catalog: _embeddedContributions,
+        surface: 'workspace_home',
+        instanceIdentity: (widget.currentChatId, widget.workspacePath),
+        hostState: {
+          ..._session.pluginHostState,
+          'workspacePath': widget.workspacePath,
+        },
+        entryPadding: const EdgeInsets.only(bottom: 12),
+      ),
+      onFinishWebVisit: (tab, response) =>
+          _finishWebVisitTab(tab, response, paneIndex: paneIndex),
+      onCloseCurrentTab: () => _closeWorkspaceTab(tab, paneIndex: paneIndex),
+      onOpenWorkspaceCreator: _showCreateWorkspaceDialog,
+      onBindWorkspace: _bindWorkspaceFolder,
+      onUnbindWorkspace: _showUnbindWorkspaceDialog,
+      onChooseExistingWorkspace: _openWorkspaceBindingPickerTab,
+      splitMarkdownContent: (content) =>
+          widget.chatCore.splitMarkdownContent(content: content),
+    );
+  }
+
+  /// Creates the configured default immediately when the user presses the plus button.
+  Future<void> _createAndOpenTerminalSession() async {
+    final info = await _terminalSessions.terminalInfo();
+    if (!mounted) return;
+    final terminal = info.types.firstWhere(
+      (entry) =>
+          entry.terminal == info.terminal &&
+          entry.terminalType == info.terminalType,
+    );
+    await _launchTerminalProfile(terminal);
+  }
+
+  /// Opens the alternate-profile picker without changing the saved default.
+  Future<void> _chooseAndOpenTerminalSession() async {
+    final info = await _terminalSessions.terminalInfo();
+    if (!mounted) return;
+    final terminal = await _selectTerminalType(info);
+    if (!mounted || terminal == null) return;
+    await _launchTerminalProfile(terminal);
+  }
+
+  /// Starts the selected immutable profile in the current conversation's file directory.
+  Future<void> _launchTerminalProfile(
+    core_proxy.RuntimeTerminalTypeInfo terminal,
+  ) async {
+    final name = TerminalLabels.runtimeName(
+      AppLocalizations.of(context)!,
+      terminal,
+    );
+    await launchWorkspaceTerminal(
+      context: context,
+      terminal: terminal.terminal,
+      terminalType: terminal.terminalType,
+      launch: () async {
+        final workingDirectory = _manualTerminalWorkingDirectory();
+        final sessionId = await _terminalSessions.startPtySession(
+          sessionName: '${_nextManualTerminalSessionName()} · $name',
+          terminal: terminal.terminal,
+          terminalType: terminal.terminalType,
+          workingDirectory: workingDirectory,
+          rows: 24,
+          columns: 80,
+        );
+        final sessions = await _terminalSessions.listSessions();
+        final session = sessions.firstWhere(
+          (item) => item.sessionId == sessionId,
+        );
+        if (!mounted) {
+          return;
+        }
+        _updateTerminalSessionEntries(sessions);
+        _openTerminalSessionTab(session);
+      },
+    );
+  }
+
+  /// Prompts the user to choose one terminal implementation exposed by the active host.
+  Future<core_proxy.RuntimeTerminalTypeInfo?> _selectTerminalType(
+    core_proxy.RuntimeTerminalInfo terminalInfo,
+  ) {
+    return showDialog<core_proxy.RuntimeTerminalTypeInfo>(
+      context: context,
+      builder: (context) {
+        final theme = Theme.of(context);
+        final l10n = AppLocalizations.of(context)!;
+        final availableTypes = terminalInfo.types
+            .where((item) => item.available)
+            .toList(growable: false);
+        return AlertDialog(
+          title: Text(l10n.terminalProfileSelect),
+          content: SizedBox(
+            width: 460,
+            child: availableTypes.isEmpty
+                ? Text(
+                    l10n.terminalProfilesUnavailable,
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  )
+                : RadioGroup<String>(
+                    groupValue:
+                        '${terminalInfo.terminal}\u0000${terminalInfo.terminalType}',
+                    onChanged: (value) {
+                      final selected = availableTypes.firstWhere(
+                        (item) =>
+                            '${item.terminal}\u0000${item.terminalType}' ==
+                            value,
+                      );
+                      Navigator.of(context).pop(selected);
+                    },
+                    child: ListView.separated(
+                      shrinkWrap: true,
+                      itemCount: terminalInfo.types.length,
+                      separatorBuilder: (context, index) =>
+                          const Divider(height: 1),
+                      itemBuilder: (context, index) {
+                        final item = terminalInfo.types[index];
+                        return ListTile(
+                          enabled: item.available,
+                          leading: Radio<String>(
+                            value: '${item.terminal}\u0000${item.terminalType}',
+                            enabled: item.available,
+                          ),
+                          title: Text(TerminalLabels.runtimeName(l10n, item)),
+                          subtitle: Text(
+                            TerminalLabels.interpreter(l10n, item.terminalType),
+                          ),
+                          onTap: item.available
+                              ? () => Navigator.of(context).pop(item)
+                              : null,
+                        );
+                      },
+                    ),
+                  ),
+          ),
+          actions: <Widget>[
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: Text(l10n.cancel),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  /// Returns a VFS locator whose filesystem is resolved by the selected terminal host.
+  String _manualTerminalWorkingDirectory() {
+    final directory =
+        widget.fileDirectory?.trim() ?? widget.workspacePath?.trim();
+    if (directory == null || directory.isEmpty) {
+      throw StateError('当前对话的文件目录尚未就绪');
+    }
+    return directory;
+  }
+
+  String _nextManualTerminalSessionName() {
+    final manualCount = _terminalSessionEntries
+        .where((session) => session.sessionName.trim().startsWith('手动终端'))
+        .length;
+    return '手动终端 ${manualCount + 1}';
+  }
+
+  Future<void> _showTerminalSessionPicker() async {
+    final sessions = await _terminalSessions.listSessions();
+    if (!mounted) {
+      return;
+    }
+    _updateTerminalSessionEntries(sessions);
+    await showDialog<void>(
+      context: context,
+      builder: (context) {
+        final theme = Theme.of(context);
+        var dialogSessions = sessions;
+        final closingSessionIds = <String>{};
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            Future<void> closeSession(
+              WorkspaceTerminalSessionInfo session,
+            ) async {
+              setDialogState(() {
+                closingSessionIds.add(session.sessionId);
+              });
+              _removeTerminalTabsForSession(session.sessionId);
+              await _closeManualTerminalSession(session.sessionId);
+              final updatedSessions = await _terminalSessions.listSessions();
+              if (!mounted) {
+                return;
+              }
+              _updateTerminalSessionEntries(updatedSessions);
+              setDialogState(() {
+                closingSessionIds.remove(session.sessionId);
+                dialogSessions = updatedSessions;
+              });
+            }
+
+            return AlertDialog(
+              title: const Text('终端会话'),
+              contentPadding: const EdgeInsets.fromLTRB(24, 16, 24, 8),
+              content: SizedBox(
+                width: 520,
+                child: dialogSessions.isEmpty
+                    ? Text(
+                        '当前没有终端会话',
+                        style: theme.textTheme.bodyMedium?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      )
+                    : ConstrainedBox(
+                        constraints: const BoxConstraints(maxHeight: 420),
+                        child: ListView.separated(
+                          shrinkWrap: true,
+                          itemCount: dialogSessions.length,
+                          separatorBuilder: (context, index) =>
+                              const Divider(height: 1),
+                          itemBuilder: (context, index) {
+                            final session = dialogSessions[index];
+                            final isClosing = closingSessionIds.contains(
+                              session.sessionId,
+                            );
+                            return ListTile(
+                              dense: true,
+                              contentPadding: EdgeInsets.zero,
+                              title: Text(session.title),
+                              subtitle: Padding(
+                                padding: const EdgeInsets.only(top: 4),
+                                child: Text(
+                                  _terminalSessionSubtitle(session),
+                                  maxLines: 3,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                              trailing: IconButton(
+                                tooltip: '结束进程',
+                                onPressed: isClosing
+                                    ? null
+                                    : () => closeSession(session),
+                                icon: isClosing
+                                    ? const SizedBox.square(
+                                        dimension: 18,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                        ),
+                                      )
+                                    : const Icon(Icons.stop_circle_outlined),
+                              ),
+                              onTap: () {
+                                Navigator.of(context).pop();
+                                _openTerminalSessionTab(session);
+                              },
+                            );
+                          },
+                        ),
+                      ),
+              ),
+              actions: <Widget>[
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(),
+                  child: const Text('关闭'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Future<void> _showBrowserSessionPicker() async {
+    final sessions = await _browserSessions.listSessions();
+    if (!mounted) {
+      return;
+    }
+    await showDialog<void>(
+      context: context,
+      builder: (context) {
+        final theme = Theme.of(context);
+        var dialogSessions = sessions;
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            Future<void> closeSession(String sessionId) async {
+              await _browserSessions.close(sessionId);
+              final updated = await _browserSessions.listSessions();
+              if (!context.mounted) {
+                return;
+              }
+              setDialogState(() {
+                dialogSessions = updated;
+              });
+            }
+
+            return AlertDialog(
+              title: const Text('浏览器会话'),
+              contentPadding: const EdgeInsets.fromLTRB(24, 16, 24, 8),
+              content: SizedBox(
+                width: 520,
+                child: dialogSessions.isEmpty
+                    ? Text(
+                        '当前没有浏览器会话',
+                        style: theme.textTheme.bodyMedium?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      )
+                    : ConstrainedBox(
+                        constraints: const BoxConstraints(maxHeight: 420),
+                        child: ListView.separated(
+                          shrinkWrap: true,
+                          itemCount: dialogSessions.length,
+                          separatorBuilder: (context, index) =>
+                              const Divider(height: 1),
+                          itemBuilder: (context, index) {
+                            final session = dialogSessions[index];
+                            return ListTile(
+                              dense: true,
+                              contentPadding: EdgeInsets.zero,
+                              title: Text(session.title),
+                              subtitle: Padding(
+                                padding: const EdgeInsets.only(top: 4),
+                                child: Text(
+                                  _browserSessionSubtitle(session),
+                                  maxLines: 3,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                              trailing: IconButton(
+                                tooltip: '关闭会话',
+                                onPressed: () {
+                                  unawaited(closeSession(session.sessionId));
+                                },
+                                icon: const Icon(Icons.close),
+                              ),
+                              onTap: () async {
+                                Navigator.of(context).pop();
+                                final tabState = await _browserViewStore
+                                    .attachSession(session);
+                                if (!mounted) {
+                                  return;
+                                }
+                                _openBrowserSessionTab(tabState);
+                              },
+                            );
+                          },
+                        ),
+                      ),
+              ),
+              actions: <Widget>[
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(),
+                  child: const Text('关闭'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  void _updateTerminalSessionEntries(
+    List<WorkspaceTerminalSessionInfo> sessions,
+  ) {
+    _terminalSessionEntries = sessions;
+    _terminalSessionCount.value = sessions.length;
+    _terminalSessionsNotifier.value = sessions;
+  }
+
+  Future<void> _handleCloseTerminalSession(
+    WorkspaceTerminalSessionInfo session,
+  ) async {
+    _removeTerminalTabsForSession(session.sessionId);
+    await _closeManualTerminalSession(session.sessionId);
+    await _refreshTerminalSessionEntries();
+  }
+
+  Future<void> _handleCloseBrowserSession(String sessionId) async {
+    setState(() {
+      _session.tabs.removeWhere(
+        (t) =>
+            t.kind == WorkspaceTabKind.browser &&
+            t.browserSessionId == sessionId,
+      );
+    });
+    await _browserSessions.close(sessionId);
+  }
+
+  /// Retains the last snapshot when a background refresh cannot reach the host.
+  Future<void> _refreshTerminalSessionEntries() async {
+    try {
+      final sessions = await _terminalSessions.listSessions();
+      if (!mounted) {
+        return;
+      }
+      _updateTerminalSessionEntries(sessions);
+    } catch (error, stackTrace) {
+      debugPrint('Failed to refresh terminal sessions: $error\n$stackTrace');
+    }
+  }
+
+  /// Updates the browser session counter from the owner registry.
+  void _handleBrowserSessionRegistryChanged() {
+    _browserSessionCount.value = _browserSessionRegistry.sessions.length;
+  }
+
+  /// Synchronizes open browser tab titles and removes closed browser sessions.
+  void _handleBrowserViewStoreChanged() {
+    if (!mounted) {
+      return;
+    }
+    bool needsSetState = false;
+
+    for (final paneIndex in <int>[0, 1]) {
+      final tabs = _tabsForPane(paneIndex);
+      for (int i = tabs.length - 1; i >= 0; i--) {
+        final tab = tabs[i];
+        if (tab.kind == WorkspaceTabKind.browser &&
+            tab.browserSessionId != null &&
+            tab.browserSessionId!.isNotEmpty) {
+          final sessionState = _browserViewStore.tabById(tab.browserSessionId!);
+          if (sessionState == null) {
+            tabs.removeAt(i);
+            final selectedIndex = _selectedIndexForPane(paneIndex);
+            if (selectedIndex >= tabs.length) {
+              _setSelectedIndexForPane(
+                paneIndex,
+                (tabs.length - 1).clamp(0, tabs.length - 1),
+              );
+            }
+            needsSetState = true;
+          } else {
+            final newTitle = sessionState.title.trim().isNotEmpty
+                ? sessionState.title.trim()
+                : (sessionState.siteHost.isNotEmpty
+                      ? sessionState.siteHost
+                      : '浏览器');
+            if (tab.title != newTitle || tab.url != sessionState.url) {
+              tabs[i] = WorkspaceTab(
+                kind: tab.kind,
+                title: newTitle,
+                icon: tab.icon,
+                closable: tab.closable,
+                browserSessionId: tab.browserSessionId,
+                url: sessionState.url,
+                absolutePath: tab.absolutePath,
+                workspaceHtmlPath: tab.workspaceHtmlPath,
+                userAgent: tab.userAgent,
+                headers: tab.headers,
+              );
+              needsSetState = true;
+            }
+          }
+        }
+      }
+    }
+    if (needsSetState) {
+      setState(() {
+        _collapseEmptyPane();
+      });
+    }
+  }
+
+  /// Removes closed browser sessions from both tab groups.
+  void _removeBrowserTabsForSession(String sessionId) {
+    final selectedTab = _session.tabs[_session.selectedIndex];
+    setState(() {
+      _session.tabs.removeWhere((tab) => tab.browserSessionId == sessionId);
+      final secondarySelected = _session.secondaryTabs.isEmpty
+          ? null
+          : _session.secondaryTabs[_session.secondarySelectedIndex];
+      _session.secondaryTabs.removeWhere(
+        (tab) => tab.browserSessionId == sessionId,
+      );
+      _session.secondarySelectedIndex = _clampSelectedIndex(
+        secondarySelected == null
+            ? 0
+            : _session.secondaryTabs.indexOf(secondarySelected),
+        _session.secondaryTabs,
+      );
+      _collapseEmptyPane();
+      final preservedIndex = _session.tabs.indexOf(selectedTab);
+      if (preservedIndex >= 0) {
+        _session.selectedIndex = preservedIndex;
+      } else {
+        _session.selectedIndex = _session.selectedIndex
+            .clamp(0, _session.tabs.length - 1)
+            .toInt();
+      }
+    });
+  }
+
+  /// Removes closed terminal sessions from both tab groups.
+  void _removeTerminalTabsForSession(String sessionId) {
+    final selectedTab = _session.tabs[_session.selectedIndex];
+    setState(() {
+      _session.tabs.removeWhere((tab) => tab.terminalSessionId == sessionId);
+      final secondarySelected = _session.secondaryTabs.isEmpty
+          ? null
+          : _session.secondaryTabs[_session.secondarySelectedIndex];
+      _session.secondaryTabs.removeWhere(
+        (tab) => tab.terminalSessionId == sessionId,
+      );
+      _session.secondarySelectedIndex = _clampSelectedIndex(
+        secondarySelected == null
+            ? 0
+            : _session.secondaryTabs.indexOf(secondarySelected),
+        _session.secondaryTabs,
+      );
+      _collapseEmptyPane();
+      final preservedIndex = _session.tabs.indexOf(selectedTab);
+      if (preservedIndex >= 0) {
+        _session.selectedIndex = preservedIndex;
+      } else {
+        _session.selectedIndex = _session.selectedIndex
+            .clamp(0, _session.tabs.length - 1)
+            .toInt();
+      }
+    });
+  }
+
+  String _terminalSessionSubtitle(WorkspaceTerminalSessionInfo session) {
+    final workingDir = session.workingDir.trim();
+    const prefix = 'PTY';
+    if (workingDir.isNotEmpty) {
+      return 'UUID · ${session.sessionId}\n$prefix · $workingDir';
+    }
+    return 'UUID · ${session.sessionId}\n$prefix · ${session.terminalType}';
+  }
+
+  String _browserSessionSubtitle(core_proxy.RuntimeBrowserSessionInfo session) {
+    return 'UUID · ${session.sessionId}\n${session.currentUrl}';
+  }
+
+  void _openTerminalSessionTab(WorkspaceTerminalSessionInfo session) {
+    final existingIndex = _session.tabs.indexWhere(
+      (tab) => tab.terminalSessionId == session.sessionId,
+    );
+    final tab = WorkspaceTab(
+      kind: WorkspaceTabKind.terminal,
+      title: session.title,
+      icon: Icons.terminal,
+      terminalSessionId: session.sessionId,
+      terminalType: session.terminalType,
+      terminalWorkingDir: session.workingDir,
+    );
+    setState(() {
+      if (existingIndex >= 0) {
+        _session.tabs[existingIndex] = tab;
+        _session.selectedIndex = existingIndex;
+      } else {
+        _session.tabs.add(tab);
+        _session.selectedIndex = _session.tabs.length - 1;
+      }
+    });
+  }
+
+  /// Shows the workspace creation dialog without opening a setup tab.
+  void _showCreateWorkspaceDialog() {
+    showDialog<void>(
+      context: context,
+      builder: (context) =>
+          _CreateWorkspaceDialog(onCreateWorkspace: _createWorkspace),
+    );
+  }
+
+  /// Confirms detaching only this chat, keeping workspace files intact.
+  Future<void> _showUnbindWorkspaceDialog() async {
+    final chatId = widget.currentChatId;
+    if (_workspaceUnbindDialogOpen || chatId == null) {
+      return;
+    }
+    final workspacePath = widget.workspacePath;
+    final onUnbindWorkspace = widget.onUnbindWorkspace;
+    _workspaceUnbindDialogOpen = true;
+    try {
+      await showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => WorkspaceUnbindDialog(
+          onUnbindWorkspace: () async {
+            // A chat switch while the confirmation is open must not detach
+            // the newly selected chat or a different workspace binding.
+            if (!mounted ||
+                widget.currentChatId != chatId ||
+                widget.workspacePath != workspacePath) {
+              throw StateError(
+                AppLocalizations.of(context)!.workspaceUnbindChanged,
+              );
+            }
+            await onUnbindWorkspace();
+          },
+        ),
+      );
+    } finally {
+      _workspaceUnbindDialogOpen = false;
+    }
+  }
+
+  /// Keeps open documents on their new path and removes previews of deleted files.
+  Future<void> _mutateWorkspaceFile(
+    WorkspaceFileOperation operation,
+    String path,
+    String? destination,
+  ) async {
+    final chatId = widget.currentChatId;
+    bool affected(WorkspaceTab tab) =>
+        (tab.kind == WorkspaceTabKind.filePreview ||
+            tab.kind == WorkspaceTabKind.files) &&
+        (tab.filePath == path || tab.filePath?.startsWith('$path/') == true);
+    if (operation != WorkspaceFileOperation.copy &&
+        _session.dirtyPluginFiles.any(affected)) {
+      throw StateError(
+        AppLocalizations.of(context)!.workspacePluginUnsavedChanges,
+      );
+    }
+    if (operation != WorkspaceFileOperation.copy &&
+        [
+          ..._session.tabs,
+          ..._session.secondaryTabs,
+        ].any((tab) => affected(tab) && tab.textDocument?.isSaving == true)) {
+      throw StateError(AppLocalizations.of(context)!.workspaceFileSaving);
+    }
+    await widget.onMutateWorkspaceFile!(operation, path, destination);
+    if (!mounted ||
+        widget.currentChatId != chatId ||
+        operation == WorkspaceFileOperation.copy) {
+      return;
+    }
+    WorkspaceFileEntry? destinationEntry;
+    if (destination != null) {
+      final slash = destination.lastIndexOf('/');
+      try {
+        final siblings = await widget.onListWorkspaceFiles(
+          slash < 0 ? '' : destination.substring(0, slash),
+        );
+        destinationEntry = siblings
+            .where((entry) => entry.relativePath == destination)
+            .firstOrNull;
+      } catch (_) {
+        // The mutation already succeeded. Relative paths still allow reading and
+        // saving if the destination's listing is temporarily unavailable.
+      }
+    }
+    if (!mounted || widget.currentChatId != chatId) return;
+    setState(() {
+      for (var pane = 0; pane < 2; pane++) {
+        final tabs = _tabsForPane(pane);
+        for (var index = tabs.length - 1; index >= 0; index--) {
+          final tab = tabs[index];
+          if (!affected(tab)) continue;
+          if (operation == WorkspaceFileOperation.delete) {
+            final selected = _selectedIndexForPane(pane);
+            tabs.removeAt(index);
+            if (selected >= index) _setSelectedIndexForPane(pane, selected - 1);
+          } else {
+            final suffix = tab.filePath!.substring(path.length);
+            final newPath = '$destination$suffix';
+            tabs[index] = tab.withFileLocation(
+              newPath,
+              destinationEntry == null
+                  ? null
+                  : '${destinationEntry.path}$suffix',
+            );
+          }
+        }
+      }
+      _collapseEmptyPane();
+    });
+  }
+
+  /// Opens the file tree for one mounted workspace folder.
+  void _openMountedFolder(WorkspaceMountedFolder folder) {
+    final relativePath = folder.relativePath.trim();
+    final title = folder.name.trim();
+    setState(() {
+      _session.tabIdentitySequence += 1;
+      _session.tabs.add(
+        WorkspaceTab(
+          kind: WorkspaceTabKind.files,
+          title: title,
+          icon: Icons.folder_outlined,
+          filePath: relativePath,
+          identityToken: 'mounted-folder-$_session.tabIdentitySequence',
+        ),
+      );
+      _session.selectedIndex = _session.tabs.length - 1;
+    });
+  }
+
+  /// Opens the workspace folder picker for binding or mounting.
+  void _openWorkspaceBindingPickerTab() {
+    final l10n = AppLocalizations.of(context)!;
+    _openSingletonTab(
+      WorkspaceTab(
+        kind: WorkspaceTabKind.workspacePicker,
+        title: widget.hasBoundWorkspace ? l10n.workspaceAddFolderTitle : '',
+        icon: Icons.folder_open_outlined,
+      ),
+    );
+  }
+
+  /// Binds or mounts the selected folder, then shows the workspace file tree.
+  Future<void> _bindWorkspaceFolder(String workspace) async {
+    await widget.onBindWorkspace(workspace);
+    if (!mounted) {
+      return;
+    }
+    if (widget.hasBoundWorkspace) {
+      unawaited(_refreshWorkspaceOverviewMountedFolders());
+    }
+    setState(() {
+      _filesListingRevision += 1;
+    });
+    _replacePickerTabWithFilesTab();
+  }
+
+  /// Creates a named workspace and switches the workspace panel back to files.
+  Future<void> _createWorkspace(String name) async {
+    await widget.onCreateWorkspace(name);
+    if (!mounted) {
+      return;
+    }
+    if (widget.hasBoundWorkspace) {
+      unawaited(_refreshWorkspaceOverviewMountedFolders());
+    }
+    setState(() {
+      _filesListingRevision += 1;
+    });
+    _replacePickerTabWithFilesTab();
+  }
+
+  /// Replaces the workspace picker tab with the workspace files tab.
+  void _replacePickerTabWithFilesTab() {
+    final targetIndex = _session.tabs.indexWhere(
+      (tab) => tab.kind == WorkspaceTabKind.workspacePicker,
+    );
+    if (targetIndex < 0) {
+      return;
+    }
+    final selectedTab = _session.tabs[_session.selectedIndex];
+    final selectedWasTarget =
+        selectedTab.kind == WorkspaceTabKind.workspacePicker;
+    setState(() {
+      _session.tabs.removeWhere(
+        (tab) => tab.kind == WorkspaceTabKind.workspacePicker,
+      );
+      var filesIndex = _session.tabs.indexWhere(
+        (tab) => tab.kind == WorkspaceTabKind.files,
+      );
+      if (filesIndex < 0) {
+        _session.tabs.add(
+          const WorkspaceTab(
+            kind: WorkspaceTabKind.files,
+            title: '',
+            icon: Icons.folder_outlined,
+          ),
+        );
+        filesIndex = _session.tabs.length - 1;
+      }
+      if (selectedWasTarget) {
+        _session.selectedIndex = filesIndex;
+        return;
+      }
+      final preservedIndex = _session.tabs.indexOf(selectedTab);
+      _session.selectedIndex = preservedIndex >= 0
+          ? preservedIndex
+          : _session.selectedIndex.clamp(0, _session.tabs.length - 1).toInt();
+    });
+  }
+
+  /// Builds a stable workspace tab identity for diffing tab lists.
+  String _tabIdentity(WorkspaceTab tab) {
+    switch (tab.kind) {
+      case WorkspaceTabKind.home:
+        return 'home';
+      case WorkspaceTabKind.workspacePicker:
+        return 'workspacePicker';
+      case WorkspaceTabKind.files:
+        return 'files';
+      case WorkspaceTabKind.terminal:
+        final sessionId = tab.terminalSessionId;
+        return 'terminal-${sessionId != null && sessionId.isNotEmpty ? sessionId : tab.identityToken}';
+      case WorkspaceTabKind.browser:
+        final sessionId = tab.browserSessionId;
+        return 'browser-${sessionId != null && sessionId.isNotEmpty ? sessionId : tab.identityToken}';
+      case WorkspaceTabKind.webVisit:
+        final requestId = tab.webVisitRequest?.requestId;
+        return 'webVisit-${requestId != null && requestId.isNotEmpty ? requestId : tab.identityToken}';
+      case WorkspaceTabKind.filePreview:
+        final path = tab.absolutePath ?? tab.filePath;
+        return 'filePreview-${path != null && path.isNotEmpty ? path : tab.identityToken}';
+      case WorkspaceTabKind.plugin:
+        if (tab.pluginPresentation != null) {
+          return 'plugin-page-${tab.identityToken}';
+        }
+        final pluginId = tab.pluginEntryId ?? tab.pluginUiModuleId;
+        return 'plugin-${pluginId != null && pluginId.isNotEmpty ? pluginId : tab.identityToken}';
+    }
+  }
+
+  /// Closes a snapshot sequentially, stopping when a save prompt is cancelled.
+  Future<void> _closeTabs(List<WorkspaceTab> targets) async {
+    for (final tab in targets) {
+      if (!mounted) return;
+      final paneIndex = _session.secondaryTabs.contains(tab) ? 1 : 0;
+      final index = _tabsForPane(paneIndex).indexOf(tab);
+      if (index < 0 || !tab.closable) continue;
+      await _closeTab(index, paneIndex: paneIndex);
+      if (!mounted || _containsWorkspaceTab(tab)) return;
+    }
+  }
+
+  /// Confirms unsaved changes before closing a tab from its physical pane.
+  Future<void> _closeTab(int index, {int paneIndex = 0}) async {
+    final tabs = _tabsForPane(paneIndex);
+    if (index < 0 || index >= tabs.length) {
+      return;
+    }
+    final tab = tabs[index];
+    if (!tab.closable && tab.pluginEntryId == null) {
+      return;
+    }
+    if (_session.dirtyPluginFiles.contains(tab)) {
+      if (!await _confirmDiscardPluginFile() || !mounted) return;
+    }
+    final document = tab.textDocument;
+    if (document != null && (document.isDirty || document.isSaving)) {
+      final confirmed = await confirmWorkspaceTextClose(
+        context,
+        document: document,
+        write: (text) => widget.onWriteWorkspaceFileBytes(
+          tab.filePath!,
+          Uint8List.fromList(utf8.encode(text)),
+        ),
+      );
+      if (!mounted || !confirmed) return;
+    }
+    // Tab positions can change while the close dialog is open.
+    final currentIndex = tabs.indexOf(tab);
+    if (currentIndex < 0) return;
+    setState(() {
+      final selectedIndex = _selectedIndexForPane(paneIndex);
+      _session.dirtyPluginFiles.remove(tab);
+      tabs.removeAt(currentIndex);
+      if (selectedIndex == currentIndex) {
+        _setSelectedIndexForPane(paneIndex, currentIndex - 1);
+      } else if (selectedIndex > currentIndex) {
+        _setSelectedIndexForPane(paneIndex, selectedIndex - 1);
+      }
+      _collapseEmptyPane();
+    });
+    if (tab.kind == WorkspaceTabKind.plugin) {
+      final entryId = tab.pluginEntryId;
+      final controller = widget.sidebarDockController;
+      if (entryId != null && controller != null) {
+        controller.move(
+          entryId,
+          location: SidebarDockLocation.primary,
+          insertionIndex: controller.primaryEntries.length,
+        );
+      }
+    }
+    if (tab.kind == WorkspaceTabKind.terminal) {
+      final sessionId = tab.terminalSessionId;
+      if (sessionId != null && sessionId.trim().isNotEmpty) {
+        unawaited(_closeManualTerminalSession(sessionId));
+      }
+    }
+    if (tab.kind == WorkspaceTabKind.browser) {
+      final sessionId = tab.browserSessionId;
+      if (sessionId != null && sessionId.trim().isNotEmpty) {
+        _browserViewStore.closeSession(sessionId);
+      }
+    }
+    if (tab.kind == WorkspaceTabKind.webVisit) {
+      final request = tab.webVisitRequest;
+      if (request != null) {
+        _completeWebVisitRequest(
+          request.requestId,
+          WebVisitResponse(
+            requestId: request.requestId,
+            success: false,
+            error: 'visit_web cancelled',
+          ),
+        );
+      }
+    }
+  }
+
+  /// Selects a tab after a content widget requests activation.
+  /// Closes a tab after its content widget requests closure.
+  void _closeWorkspaceTab(WorkspaceTab tab, {int paneIndex = 0}) {
+    final tabs = _tabsForPane(paneIndex);
+    final index = tabs.indexOf(tab);
+    if (index < 0) {
+      return;
+    }
+    unawaited(_closeTab(index, paneIndex: paneIndex));
+  }
+
+  /// Completes a web visit and removes its tab from the owning pane.
+  void _finishWebVisitTab(
+    WorkspaceTab tab,
+    WebVisitResponse response, {
+    int paneIndex = 0,
+  }) {
+    final request = tab.webVisitRequest;
+    if (request == null) {
+      return;
+    }
+    _completeWebVisitRequest(request.requestId, response);
+    final tabs = _tabsForPane(paneIndex);
+    final index = tabs.indexOf(tab);
+    if (index >= 0) {
+      setState(() {
+        final selectedIndex = _selectedIndexForPane(paneIndex);
+        tabs.removeAt(index);
+        if (selectedIndex == index) {
+          _setSelectedIndexForPane(paneIndex, index - 1);
+        } else if (selectedIndex > index) {
+          _setSelectedIndexForPane(paneIndex, selectedIndex - 1);
+        }
+        _collapseEmptyPane();
+      });
+    }
+  }
+
+  void _completeWebVisitRequest(String requestId, WebVisitResponse response) {
+    final completer = _webVisitCompleters.remove(requestId);
+    if (completer != null && !completer.isCompleted) {
+      completer.complete(response);
+    }
+  }
+
+  /// Closes the host PTY after removed terminal widgets dispose listeners.
+  Future<void> _closeManualTerminalSession(String sessionId) async {
+    await WidgetsBinding.instance.endOfFrame;
+    await _terminalSessions.closePtySession(sessionId);
+  }
+
+  /// Shares file preview navigation with Markdown links in the chat pane.
+  Future<void> _openFileTab(WorkspaceFileEntry entry) => _session.openFile(
+    path: entry.path,
+    relativePath: entry.relativePath,
+    readText: widget.onReadWorkspaceTextFile,
+    resolveOpener: () async =>
+        (await _fileOpeners(entry.path, entry.relativePath)).firstOrNull,
+  );
+
+  Future<List<PluginWorkspacePresentation>> _fileOpeners(
+    String path,
+    String relativePath,
+  ) => PluginWorkspacePresentation.forFile(
+    clients: _coreClients,
+    path: path,
+    relativePath: relativePath,
+    language: Localizations.localeOf(context).languageCode,
+    chatId: widget.currentChatId,
+  );
+
+  Future<void> _chooseFileOpener(WorkspaceTab tab) async {
+    final path = tab.filePath;
+    if (path == null) return;
+    final chatId = widget.currentChatId;
+    final l10n = AppLocalizations.of(context)!;
+    try {
+      final openers = await _fileOpeners(tab.absolutePath ?? path, path);
+      if (!mounted ||
+          !_containsWorkspaceTab(tab) ||
+          chatId != widget.currentChatId)
+        return;
+      final current = tab.pluginPresentation?.identity;
+      final selected = await showDialog<int>(
+        context: context,
+        builder: (context) => SimpleDialog(
+          title: Text(l10n.workspaceOpenWith),
+          children: [
+            for (final (index, opener) in <PluginWorkspacePresentation?>[
+              null,
+              ...openers,
+            ].indexed)
+              SimpleDialogOption(
+                onPressed: () => Navigator.pop(context, index),
+                child: Row(
+                  children: [
+                    Icon(
+                      current == opener?.identity
+                          ? Icons.radio_button_checked
+                          : Icons.radio_button_unchecked,
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        opener?.title ?? l10n.workspaceBuiltInPreview,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+          ],
+        ),
+      );
+      if (!mounted ||
+          selected == null ||
+          chatId != widget.currentChatId ||
+          !_containsWorkspaceTab(tab))
+        return;
+      final opener = selected == 0 ? null : openers[selected - 1];
+      if (opener?.identity == current) return;
+      if (_session.dirtyPluginFiles.contains(tab) &&
+          (!await _confirmDiscardPluginFile() || !mounted))
+        return;
+      var document = tab.textDocument;
+      if (opener != null &&
+          document != null &&
+          (document.isDirty || document.isSaving)) {
+        final confirmed = await confirmWorkspaceTextClose(
+          context,
+          document: document,
+          write: (text) => widget.onWriteWorkspaceFileBytes(
+            path,
+            Uint8List.fromList(utf8.encode(text)),
+          ),
+        );
+        if (!confirmed) return;
+      }
+      if (opener != null) document = null;
+      if (opener == null &&
+          (tab.previewKind == WorkspaceFilePreviewKind.text ||
+              tab.previewKind == WorkspaceFilePreviewKind.markdown)) {
+        document = WorkspaceTextDocument(
+          await widget.onReadWorkspaceTextFile(path),
+        );
+      }
+      if (!mounted || chatId != widget.currentChatId) return;
+      final pane = _session.secondaryTabs.contains(tab) ? 1 : 0;
+      final tabs = _tabsForPane(pane);
+      final index = tabs.indexOf(tab);
+      if (index < 0) return;
+      setState(() {
+        _session.dirtyPluginFiles.remove(tab);
+        tabs[index] = tab.withFileOpener(opener, document);
+        _setSelectedIndexForPane(pane, index);
+      });
+    } catch (error) {
+      if (mounted)
+        ScaffoldMessenger.maybeOf(
+          context,
+        )?.showSnackBar(SnackBar(content: Text('$error')));
+    }
+  }
+
+  Future<bool> _confirmDiscardPluginFile() async {
+    final l10n = AppLocalizations.of(context)!;
+    return await showDialog<bool>(
+          context: context,
+          builder: (dialogContext) => AlertDialog(
+            title: Text(l10n.workspaceUnsavedChangesTitle),
+            content: Text(l10n.workspacePluginUnsavedChanges),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext, false),
+                child: Text(l10n.cancel),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext, true),
+                child: Text(l10n.workspaceDiscardChanges),
+              ),
+            ],
+          ),
+        ) ??
+        false;
+  }
+}
+
+enum _WorkspaceDropZone { center, left, right, top, bottom }
+
+/// Renders and handles the draggable divider between workspace panes.
+class _WorkspacePaneDivider extends StatelessWidget {
+  const _WorkspacePaneDivider({
+    required this.axis,
+    required this.extent,
+    required this.onDelta,
+  });
+
+  final WorkspaceSplitAxis axis;
+  final double extent;
+  final void Function(double delta, double extent) onDelta;
+
+  /// Builds a resize handle with the cursor matching its orientation.
+  @override
+  Widget build(BuildContext context) {
+    final vertical = axis == WorkspaceSplitAxis.vertical;
+    final color = Theme.of(context).colorScheme.outlineVariant;
+    return MouseRegion(
+      cursor: vertical
+          ? SystemMouseCursors.resizeColumn
+          : SystemMouseCursors.resizeRow,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onHorizontalDragUpdate: vertical
+            ? (details) => onDelta(details.delta.dx, extent)
+            : null,
+        onVerticalDragUpdate: vertical
+            ? null
+            : (details) => onDelta(details.delta.dy, extent),
+        child: SizedBox(
+          width: vertical ? 9 : double.infinity,
+          height: vertical ? double.infinity : 9,
+          child: Center(
+            child: DecoratedBox(
+              decoration: BoxDecoration(color: color.withValues(alpha: 0.7)),
+              child: SizedBox(
+                width: vertical ? 1 : double.infinity,
+                height: vertical ? double.infinity : 1,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Displays the workspace creation form and owns its text controller.
+class _CreateWorkspaceDialog extends StatefulWidget {
+  const _CreateWorkspaceDialog({required this.onCreateWorkspace});
+
+  final Future<void> Function(String name) onCreateWorkspace;
+
+  /// Creates the state that owns the workspace creation form.
+  @override
+  State<_CreateWorkspaceDialog> createState() => _CreateWorkspaceDialogState();
+}
+
+/// Manages the workspace creation form lifecycle.
+class _CreateWorkspaceDialogState extends State<_CreateWorkspaceDialog> {
+  final TextEditingController _nameController = TextEditingController();
+  bool _dialogBusy = false;
+  String? _dialogError;
+
+  /// Submits the workspace name and closes the dialog after creation.
+  Future<void> _submitCreateWorkspace() async {
+    if (_dialogBusy) {
+      return;
+    }
+    final l10n = AppLocalizations.of(context)!;
+    final name = _nameController.text.trim();
+    if (name.isEmpty) {
+      setState(() {
+        _dialogError = l10n.workspaceNameHint;
+      });
+      return;
+    }
+    setState(() {
+      _dialogBusy = true;
+      _dialogError = null;
+    });
+    try {
+      await widget.onCreateWorkspace(name);
+      if (mounted) {
+        Navigator.of(context).pop();
+      }
+    } catch (error, stackTrace) {
+      debugPrint('Workspace creation failed: $error\n$stackTrace');
+      if (mounted) {
+        setState(() {
+          _dialogError = error.toString();
+        });
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _dialogBusy = false;
+        });
+      }
+    }
+  }
+
+  /// Releases the controller owned by the dialog state.
+  /// Releases subscriptions and invalidates every asynchronous overview request.
+  @override
+  void dispose() {
+    _nameController.dispose();
+    super.dispose();
+  }
+
+  /// Builds the workspace creation form.
+  @override
+  Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
+    return AlertDialog(
+      title: Text(l10n.workspaceCreateTitle),
+      content: SizedBox(
+        width: 420,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              TextField(
+                controller: _nameController,
+                autofocus: true,
+                enabled: !_dialogBusy,
+                decoration: InputDecoration(
+                  labelText: l10n.workspaceNameLabel,
+                  hintText: l10n.workspaceNameHint,
+                ),
+              ),
+              if (_dialogError != null) ...<Widget>[
+                const SizedBox(height: 10),
+                Text(
+                  _dialogError!,
+                  style: TextStyle(color: Theme.of(context).colorScheme.error),
+                ),
+              ],
+              const SizedBox(height: 14),
+            ],
+          ),
+        ),
+      ),
+      actions: <Widget>[
+        TextButton(
+          onPressed: _dialogBusy ? null : () => Navigator.of(context).pop(),
+          child: Text(l10n.cancel),
+        ),
+        FilledButton(
+          onPressed: _dialogBusy
+              ? null
+              : () {
+                  unawaited(_submitCreateWorkspace());
+                },
+          child: Text(l10n.bind),
+        ),
+      ],
+    );
+  }
+}

@@ -1,0 +1,1159 @@
+use crate::commands::util::{parse_bool_arg, parse_f32_arg};
+use crate::output::CoreCommandOutput;
+use operit_model::ApiKeyInfo::ApiKeyInfo;
+use operit_model::FunctionType::FunctionType;
+use operit_model::ModelCatalog::ModelCatalog;
+use operit_model::ModelConfigData::{
+    ModelBuiltinTool, ModelContextSpec, ModelPricing, ModelSummarySettings, ProviderProfile,
+    ResolvedModelConfig,
+};
+use operit_model::ModelParameter::ModelParameter;
+use operit_model::ModelThinking::{ModelThinkingSettings, ModelThinkingSpec, ThinkingLevel};
+use operit_runtime::core::application::OperitApplication::OperitApplication;
+use operit_runtime::data::preferences::FunctionalConfigManager::{
+    FunctionModelBinding, FunctionalConfigManager,
+};
+use operit_runtime::data::preferences::ModelConfigManager::ModelConfigManager;
+use operit_runtime::services::CodexOAuthService::CodexOAuthService;
+use serde_json::{json, Value};
+
+struct ModelCommand;
+
+impl ModelCommand {
+    /// Returns the model configuration manager.
+    fn modelManager(&mut self) -> ModelConfigManager {
+        ModelConfigManager::default()
+    }
+
+    /// Returns the functional model binding manager.
+    fn functionalManager(&mut self) -> FunctionalConfigManager {
+        FunctionalConfigManager::default()
+    }
+}
+
+/// Runs model provider, model profile, and functional binding commands.
+pub async fn run_model_command(
+    application: &OperitApplication,
+    args: &[String],
+    output: &mut CoreCommandOutput,
+) -> Result<(), String> {
+    let context = application.hostManager.clone();
+    let mut command = ModelCommand;
+    if args.is_empty() {
+        print_model_usage(output);
+        return Ok(());
+    }
+
+    match args[0].as_str() {
+        "codex-status" if args.len() == 1 => {
+            let status = CodexOAuthService::getInstance().sessionStatus()?;
+            output.push_stdout_line(
+                serde_json::to_string_pretty(&status).map_err(|error| error.to_string())?,
+            );
+            output.setJsonStdout(json!(status));
+        }
+        "codex-logout" if args.len() == 1 => {
+            CodexOAuthService::getInstance().logout()?;
+            output.push_stdout_line("Signed out of ChatGPT Codex");
+            output.setJsonStdout(json!({"signedOut": true}));
+        }
+        "test" if args.len() == 3 => {
+            let report = application
+                .test_model_connection(args[1].clone(), args[2].clone())
+                .await?;
+            output.push_stdout_line(
+                serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?,
+            );
+            output.setJsonStdout(json!(report));
+        }
+        "provider-test-key" if args.len() == 3 => {
+            let provider = command
+                .modelManager()
+                .getProviderProfile(&args[1])
+                .map_err(|error| error.to_string())?;
+            let report = application
+                .test_provider_api_key(provider, args[2].clone())
+                .await?;
+            output.push_stdout_line(format!(
+                "API key {}: {:?}",
+                report.id, report.availabilityStatus
+            ));
+            output.setJsonStdout(json!(report));
+        }
+        "providers-export" if args.len() == 1 => {
+            let document = command.modelManager().exportAllProviders()?;
+            output
+                .setJsonStdout(serde_json::from_str(&document).map_err(|error| error.to_string())?);
+            output.push_stdout_line(document);
+        }
+        "providers-import" if args.len() == 2 => {
+            let content = crate::commands::util::read_content_arg(&context, &args[1])?;
+            let result = command
+                .modelManager()
+                .importAllProvidersFromBackupContent(&content)?;
+            output.push_stdout_line(
+                serde_json::to_string_pretty(&result).map_err(|error| error.to_string())?,
+            );
+            output.setJsonStdout(json!(result));
+        }
+        "provider-save" if args.len() == 2 => {
+            let provider = serde_json::from_str(&crate::commands::util::read_content_arg(
+                &context, &args[1],
+            )?)
+            .map_err(|error| error.to_string())?;
+            let provider = command
+                .modelManager()
+                .updateProviderProfile(provider)
+                .map_err(|error| error.to_string())?;
+            print_provider_profile(&provider, output);
+            output.setJsonStdout(provider_profile_json(&provider));
+        }
+        "provider-delete" if args.len() == 2 => {
+            command
+                .modelManager()
+                .deleteProvider(&args[1])
+                .map_err(|error| error.to_string())?;
+            output.push_stdout_line(format!("Deleted provider {}", args[1]));
+            output.setJsonStdout(json!({"providerId": args[1], "deleted": true}));
+        }
+        "delete" if args.len() == 3 => {
+            command
+                .modelManager()
+                .deleteModel(&args[1], &args[2])
+                .map_err(|error| error.to_string())?;
+            output.push_stdout_line(format!("Deleted model {} / {}", args[1], args[2]));
+            output
+                .setJsonStdout(json!({"providerId": args[1], "modelId": args[2], "deleted": true}));
+        }
+        "provider-type-list" => {
+            let mut providers = ModelCatalog::providers().map_err(|error| error.to_string())?;
+            providers.sort_by(|left, right| left.providerTypeId.cmp(&right.providerTypeId));
+            output.push_stdout_line(format!("Provider types: {}", providers.len()));
+            for provider in &providers {
+                output.push_stdout_line(format!(
+                    "- {} | {} | fixed models: {} | {}",
+                    provider.providerTypeId,
+                    provider.displayName,
+                    provider.models.len(),
+                    provider.defaultEndpoint
+                ));
+            }
+            output.setJsonStdout(
+                serde_json::to_value(&providers).map_err(|error| error.to_string())?,
+            );
+        }
+        "provider-list" => {
+            let providers = command
+                .modelManager()
+                .getProviderProfiles()
+                .map_err(|error| error.to_string())?;
+            output.push_stdout_line(format!("Providers: {}", providers.len()));
+            for provider in &providers {
+                output.push_stdout_line(format!(
+                    "- {} | {} | {} | models: {} | {}",
+                    provider.id,
+                    provider.name,
+                    provider.providerTypeId,
+                    provider.models.len(),
+                    provider.endpoint
+                ));
+            }
+            output.setJsonStdout(json!({
+                "providers": providers
+                    .iter()
+                    .map(provider_profile_json)
+                    .collect::<Vec<_>>()
+            }));
+        }
+        "provider-show" => {
+            let providerId =
+                requiredArg(args, 1, "usage: operit2 model provider-show <provider-id>")?;
+            let provider = command
+                .modelManager()
+                .getProviderProfile(providerId)
+                .map_err(|error| error.to_string())?;
+            print_provider_profile(&provider, output);
+            output.setJsonStdout(provider_profile_json(&provider));
+        }
+        "provider-create" => {
+            let name = requiredArg(
+                args,
+                1,
+                "usage: operit2 model provider-create <name> <provider-type-id> <endpoint>",
+            )?
+            .to_string();
+            let providerTypeId = requiredArg(
+                args,
+                2,
+                "usage: operit2 model provider-create <name> <provider-type-id> <endpoint>",
+            )?
+            .to_string();
+            let endpoint = requiredArg(
+                args,
+                3,
+                "usage: operit2 model provider-create <name> <provider-type-id> <endpoint>",
+            )?
+            .to_string();
+            let providerId = command
+                .modelManager()
+                .createProvider(name.clone(), providerTypeId.clone(), endpoint.clone())
+                .map_err(|error| error.to_string())?;
+            output.push_stdout_line(format!("Created provider {providerId}"));
+            output.setJsonStdout(json!({
+                "providerId": providerId,
+                "name": name,
+                "providerTypeId": providerTypeId,
+                "endpoint": endpoint
+            }));
+        }
+        "provider-set-key" => {
+            let providerId = requiredArg(
+                args,
+                1,
+                "usage: operit2 model provider-set-key <provider-id> <api-key>",
+            )?;
+            let apiKey = requiredArg(
+                args,
+                2,
+                "usage: operit2 model provider-set-key <provider-id> <api-key>",
+            )?
+            .to_string();
+            let apiKeyLength = apiKey.len();
+            let manager = command.modelManager();
+            let mut provider = manager
+                .getProviderProfile(providerId)
+                .map_err(|error| error.to_string())?;
+            provider.apiKey = apiKey;
+            manager
+                .updateProviderProfile(provider)
+                .map_err(|error| error.to_string())?;
+            output.push_stdout_line(format!("Updated provider API key for {providerId}"));
+            output.push_stdout_line(format!("API key length: {apiKeyLength}"));
+            output.setJsonStdout(json!({
+                "providerId": providerId,
+                "apiKeyLength": apiKeyLength,
+                "updated": true
+            }));
+        }
+        "provider-set-endpoint" => {
+            let providerId = requiredArg(
+                args,
+                1,
+                "usage: operit2 model provider-set-endpoint <provider-id> <endpoint>",
+            )?;
+            let endpoint = requiredArg(
+                args,
+                2,
+                "usage: operit2 model provider-set-endpoint <provider-id> <endpoint>",
+            )?
+            .to_string();
+            let manager = command.modelManager();
+            let mut provider = manager
+                .getProviderProfile(providerId)
+                .map_err(|error| error.to_string())?;
+            provider.endpoint = endpoint.clone();
+            manager
+                .updateProviderProfile(provider)
+                .map_err(|error| error.to_string())?;
+            output.push_stdout_line(format!("Updated provider endpoint for {providerId}"));
+            output.push_stdout_line(format!("Endpoint: {endpoint}"));
+            output.setJsonStdout(json!({
+                "providerId": providerId,
+                "endpoint": endpoint,
+                "updated": true
+            }));
+        }
+        "provider-model-available-list" => {
+            let usage =
+                "usage: operit2 model provider-model-available-list <provider-id> [fetched|all]";
+            let providerId = requiredArg(args, 1, usage)?;
+            let includeHistory = match args.get(2).map(String::as_str) {
+                None | Some("fetched") => false,
+                Some("all") => true,
+                Some(other) => {
+                    return Err(format!(
+                        "invalid model list scope: {other}; expected fetched | all"
+                    ));
+                }
+            };
+            let mut models = command
+                .modelManager()
+                .getAvailableProviderModels(providerId)
+                .map_err(|error| error.to_string())?;
+            if !includeHistory {
+                models.retain(|model| model.isFetched());
+            }
+            models.sort_by(|left, right| left.modelId.cmp(&right.modelId));
+            let scope = if includeHistory {
+                "all, including history"
+            } else {
+                "fetched"
+            };
+            output.push_stdout_line(format!(
+                "Available provider models ({scope}): {}",
+                models.len()
+            ));
+            for model in &models {
+                output.push_stdout_line(format!(
+                    "- {} | source: {:?} | recognized as: {} | pricing: {} | context: {} | capabilities: {}",
+                    model.modelId,
+                    model.source,
+                    model.catalogModelId.as_deref().unwrap_or("-"),
+                    model.pricing.is_some(),
+                    model.context.is_some(),
+                    model.capabilities.is_some()
+                ));
+            }
+            output.setJsonStdout(serde_json::to_value(&models).map_err(|error| error.to_string())?);
+        }
+        "provider-model-add" => {
+            let providerId = requiredArg(
+                args,
+                1,
+                "usage: operit2 model provider-model-add <provider-id> <model-id>",
+            )?;
+            let modelId = requiredArg(
+                args,
+                2,
+                "usage: operit2 model provider-model-add <provider-id> <model-id>",
+            )?;
+            let manager = command.modelManager();
+            let available = manager
+                .getAvailableProviderModels(providerId)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|model| model.modelId == modelId)
+                .ok_or_else(|| {
+                    format!(
+                        "{providerId} does not list {modelId}; use provider-model-create to add it by id"
+                    )
+                })?;
+            let modelId = manager
+                .addProviderModelFromAvailable(providerId, available)
+                .map_err(|error| error.to_string())?;
+            output.push_stdout_line(format!("Added provider model {modelId}"));
+            output.setJsonStdout(json!({
+                "providerId": providerId,
+                "modelId": modelId,
+                "added": true
+            }));
+        }
+        "provider-model-create" => {
+            let providerId = requiredArg(
+                args,
+                1,
+                "usage: operit2 model provider-model-create <provider-id> <model-id>",
+            )?;
+            let modelId = requiredArg(
+                args,
+                2,
+                "usage: operit2 model provider-model-create <provider-id> <model-id>",
+            )?
+            .to_string();
+            let modelId = command
+                .modelManager()
+                .createProviderModel(providerId, modelId)
+                .map_err(|error| error.to_string())?;
+            output.push_stdout_line(format!("Created provider model {modelId}"));
+            output.setJsonStdout(json!({
+                "providerId": providerId,
+                "modelId": modelId,
+                "created": true
+            }));
+        }
+        "catalog-status" | "catalog-refresh" => {
+            let manager = command.modelManager();
+            let status = if args[0] == "catalog-refresh" {
+                manager.refreshModelCatalog()
+            } else {
+                manager.getModelCatalogStatus()
+            }
+            .map_err(|error| error.to_string())?;
+            output.push_stdout_line(match status.updatedAt {
+                Some(updatedAt) => {
+                    format!("models.dev catalog downloaded at {updatedAt} (Unix ms)")
+                }
+                None => "models.dev catalog not downloaded yet".to_string(),
+            });
+            if let Some(error) = &status.lastError {
+                output.push_stdout_line(format!("Last download failed: {error}"));
+            }
+            output.setJsonStdout(serde_json::to_value(&status).map_err(|error| error.to_string())?);
+        }
+        "list" => {
+            let mut summaries = command
+                .modelManager()
+                .getAllModelSummaries()
+                .map_err(|error| error.to_string())?;
+            summaries.sort_by(|left, right| {
+                left.providerName
+                    .cmp(&right.providerName)
+                    .then(left.modelId.cmp(&right.modelId))
+            });
+            output.push_stdout_line(format!("Configured models: {}", summaries.len()));
+            for summary in &summaries {
+                output.push_stdout_line(format!(
+                    "- {}:{} | {} | {}",
+                    summary.providerId,
+                    summary.modelId,
+                    summary.providerName,
+                    summary.providerTypeId
+                ));
+            }
+            output.setJsonStdout(
+                serde_json::to_value(&summaries).map_err(|error| error.to_string())?,
+            );
+        }
+        "show" => {
+            let providerId = args
+                .get(1)
+                .map(String::as_str)
+                .unwrap_or(ModelConfigManager::DEFAULT_PROVIDER_ID);
+            let modelId = args
+                .get(2)
+                .map(String::as_str)
+                .unwrap_or(ModelConfigManager::DEFAULT_MODEL_ID);
+            let config = command
+                .modelManager()
+                .getResolvedModelConfig(providerId, modelId)
+                .map_err(|error| error.to_string())?;
+            print_resolved_model_config(&config, output);
+            output.setJsonStdout(resolved_model_config_json(&config));
+        }
+        "use" => {
+            let providerId =
+                requiredArg(args, 1, "usage: operit2 model use <provider-id> <model-id>")?
+                    .to_string();
+            let modelId =
+                requiredArg(args, 2, "usage: operit2 model use <provider-id> <model-id>")?
+                    .to_string();
+            command
+                .functionalManager()
+                .setModelForFunction(FunctionType::CHAT, providerId.clone(), modelId.clone())
+                .map_err(|error| error.to_string())?;
+            output.push_stdout_line(format!("Updated chat model to {providerId}:{modelId}"));
+            output.setJsonStdout(json!({
+                "functionType": "CHAT",
+                "providerId": providerId,
+                "modelId": modelId,
+                "updated": true
+            }));
+        }
+        "params" => {
+            let providerId = args
+                .get(1)
+                .map(String::as_str)
+                .unwrap_or(ModelConfigManager::DEFAULT_PROVIDER_ID);
+            let modelId = args
+                .get(2)
+                .map(String::as_str)
+                .unwrap_or(ModelConfigManager::DEFAULT_MODEL_ID);
+            let params = command
+                .modelManager()
+                .getModelParametersForModel(providerId, modelId)
+                .map_err(|error| error.to_string())?;
+            output.push_stdout_line(format!("Model parameters: {}", params.len()));
+            for param in &params {
+                output.push_stdout_line(format!(
+                    "- {} | api: {} | enabled: {} | value: {}",
+                    param.id, param.apiName, param.isEnabled, param.currentValue
+                ));
+            }
+            output.setJsonStdout(serde_json::to_value(&params).map_err(|error| error.to_string())?);
+        }
+        "parameters" => {
+            let providerId = requiredArg(
+                args,
+                1,
+                "usage: operit2 model parameters <provider-id> <model-id> <parameters-json>",
+            )?;
+            let modelId = requiredArg(
+                args,
+                2,
+                "usage: operit2 model parameters <provider-id> <model-id> <parameters-json>",
+            )?;
+            let parametersJson = requiredArg(
+                args,
+                3,
+                "usage: operit2 model parameters <provider-id> <model-id> <parameters-json>",
+            )?;
+            let parameters =
+                serde_json::from_str::<Vec<ModelParameter<serde_json::Value>>>(parametersJson)
+                    .map_err(|error| error.to_string())?;
+            command
+                .modelManager()
+                .updateParametersForModel(providerId, modelId, parameters.clone())
+                .map_err(|error| error.to_string())?;
+            output.push_stdout_line(format!("Updated parameters for {providerId}:{modelId}"));
+            output.setJsonStdout(json!({
+                "providerId": providerId,
+                "modelId": modelId,
+                "parameters": parameters,
+                "updated": true
+            }));
+        }
+        "builtin-tools" => {
+            let providerId = requiredArg(
+                args,
+                1,
+                "usage: operit2 model builtin-tools <provider-id> <model-id> <builtin-tools-json>",
+            )?;
+            let modelId = requiredArg(
+                args,
+                2,
+                "usage: operit2 model builtin-tools <provider-id> <model-id> <builtin-tools-json>",
+            )?;
+            let builtinToolsJson = requiredArg(
+                args,
+                3,
+                "usage: operit2 model builtin-tools <provider-id> <model-id> <builtin-tools-json>",
+            )?;
+            let builtinTools = serde_json::from_str::<Vec<ModelBuiltinTool>>(builtinToolsJson)
+                .map_err(|error| error.to_string())?;
+            command
+                .modelManager()
+                .updateBuiltinToolsForModel(providerId, modelId, builtinTools.clone())
+                .map_err(|error| error.to_string())?;
+            output.push_stdout_line(format!("Updated builtin tools for {providerId}:{modelId}"));
+            output.setJsonStdout(json!({
+                "providerId": providerId,
+                "modelId": modelId,
+                "builtinTools": builtinTools,
+                "updated": true
+            }));
+        }
+        "context-show" => {
+            let providerId = args
+                .get(1)
+                .map(String::as_str)
+                .unwrap_or(ModelConfigManager::DEFAULT_PROVIDER_ID);
+            let modelId = args
+                .get(2)
+                .map(String::as_str)
+                .unwrap_or(ModelConfigManager::DEFAULT_MODEL_ID);
+            let config = command
+                .modelManager()
+                .getResolvedModelConfig(providerId, modelId)
+                .map_err(|error| error.to_string())?;
+            print_context_spec(&config.providerId, &config.modelId, &config.context, output);
+            output.setJsonStdout(json!({
+                "providerId": config.providerId,
+                "modelId": config.modelId,
+                "context": config.context
+            }));
+        }
+        "context-set" => {
+            let providerId = requiredArg(
+                args,
+                1,
+                "usage: operit2 model context-set <provider-id> <model-id> <max-context-length>",
+            )?;
+            let modelId = requiredArg(
+                args,
+                2,
+                "usage: operit2 model context-set <provider-id> <model-id> <max-context-length>",
+            )?;
+            let maxContextLength = parse_f32_arg(
+                args.get(3),
+                "usage: operit2 model context-set <provider-id> <model-id> <max-context-length>",
+            )?;
+            let context = ModelContextSpec { maxContextLength };
+            let model = command
+                .modelManager()
+                .updateContextForModel(providerId, modelId, context.clone())
+                .map_err(|error| error.to_string())?;
+            output.push_stdout_line(format!("Updated context for {providerId}:{modelId}"));
+            print_context_spec(providerId, modelId, &context, output);
+            output.setJsonStdout(json!({
+                "providerId": providerId,
+                "modelId": modelId,
+                "context": context,
+                "model": model,
+                "updated": true
+            }));
+        }
+        "summary-show" => {
+            let providerId = args
+                .get(1)
+                .map(String::as_str)
+                .unwrap_or(ModelConfigManager::DEFAULT_PROVIDER_ID);
+            let modelId = args
+                .get(2)
+                .map(String::as_str)
+                .unwrap_or(ModelConfigManager::DEFAULT_MODEL_ID);
+            let config = command
+                .modelManager()
+                .getResolvedModelConfig(providerId, modelId)
+                .map_err(|error| error.to_string())?;
+            print_summary_settings(&config.providerId, &config.modelId, &config.summary, output);
+            output.setJsonStdout(json!({
+                "providerId": config.providerId,
+                "modelId": config.modelId,
+                "summary": config.summary
+            }));
+        }
+        "summary-set" => {
+            if args.len() != 5 {
+                return Err("usage: operit2 model summary-set <provider-id> <model-id> <enable-summary> <summary-token-threshold>".to_string());
+            }
+            let providerId = requiredArg(args, 1, "usage: operit2 model summary-set <provider-id> <model-id> <enable-summary> <summary-token-threshold>")?;
+            let modelId = requiredArg(args, 2, "usage: operit2 model summary-set <provider-id> <model-id> <enable-summary> <summary-token-threshold>")?;
+            let enableSummary = parse_bool_arg(args.get(3), "usage: operit2 model summary-set <provider-id> <model-id> <enable-summary> <summary-token-threshold>")?;
+            let summaryTokenThreshold = parse_f32_arg(args.get(4), "usage: operit2 model summary-set <provider-id> <model-id> <enable-summary> <summary-token-threshold>")?;
+            let summary = ModelSummarySettings {
+                enableSummary,
+                summaryTokenThreshold,
+            };
+            let model = command
+                .modelManager()
+                .updateSummaryForModel(providerId, modelId, summary.clone())
+                .map_err(|error| error.to_string())?;
+            output.push_stdout_line(format!("Updated summary for {providerId}:{modelId}"));
+            print_summary_settings(providerId, modelId, &summary, output);
+            output.setJsonStdout(json!({
+                "providerId": providerId,
+                "modelId": modelId,
+                "summary": summary,
+                "model": model,
+                "updated": true
+            }));
+        }
+        "thinking" => {
+            let usage = "usage: operit2 model thinking <provider-id> <model-id> [off|enabled|minimal|low|medium|high|xhigh|max]";
+            let providerId = requiredArg(args, 1, usage)?;
+            let modelId = requiredArg(args, 2, usage)?;
+            let manager = command.modelManager();
+            let settings = match args.get(3) {
+                Some(name) => {
+                    let level = ThinkingLevel::fromName(name)
+                        .ok_or_else(|| format!("unknown thinking level `{name}`; {usage}"))?;
+                    manager
+                        .setThinkingLevelForModel(providerId, modelId, level)
+                        .map_err(|error| error.to_string())?
+                }
+                None => manager
+                    .getThinkingSettingsForModel(providerId, modelId)
+                    .map_err(|error| error.to_string())?,
+            };
+            print_thinking_settings(providerId, modelId, &settings, output);
+            output.setJsonStdout(json!({
+                "providerId": providerId,
+                "modelId": modelId,
+                "thinking": settings,
+                "updated": args.get(3).is_some(),
+            }));
+        }
+        "function-list" => {
+            let mut rows = functionTypes()
+                .into_iter()
+                .map(|functionType| {
+                    command
+                        .functionalManager()
+                        .getModelBindingForFunction(functionType.clone())
+                        .map(|binding| (functionType, binding))
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            rows.sort_by(|left, right| functionTypeName(&left.0).cmp(functionTypeName(&right.0)));
+            output.push_stdout_line(format!("Function model bindings: {}", rows.len()));
+            for (functionType, binding) in &rows {
+                output.push_stdout_line(format!(
+                    "- {} -> {}:{}",
+                    functionTypeName(functionType),
+                    binding.providerId,
+                    binding.modelId
+                ));
+            }
+            output.setJsonStdout(json!({
+                "bindings": rows
+                    .iter()
+                    .map(|(functionType, binding)| function_binding_json(functionType, binding))
+                    .collect::<Vec<_>>()
+            }));
+        }
+        "function-show" => {
+            let functionType = parseFunctionType(requiredArg(
+                args,
+                1,
+                "usage: operit2 model function-show <function-type>",
+            )?)?;
+            let binding = command
+                .functionalManager()
+                .getModelBindingForFunction(functionType.clone())
+                .map_err(|error| error.to_string())?;
+            output.push_stdout_line(format!(
+                "{} -> {}:{}",
+                functionTypeName(&functionType),
+                binding.providerId,
+                binding.modelId
+            ));
+            output.setJsonStdout(function_binding_json(&functionType, &binding));
+        }
+        "function-set" => {
+            let functionType = parseFunctionType(requiredArg(
+                args,
+                1,
+                "usage: operit2 model function-set <function-type> <provider-id> <model-id>",
+            )?)?;
+            let providerId = requiredArg(
+                args,
+                2,
+                "usage: operit2 model function-set <function-type> <provider-id> <model-id>",
+            )?
+            .to_string();
+            let modelId = requiredArg(
+                args,
+                3,
+                "usage: operit2 model function-set <function-type> <provider-id> <model-id>",
+            )?
+            .to_string();
+            command
+                .functionalManager()
+                .setModelForFunction(functionType.clone(), providerId.clone(), modelId.clone())
+                .map_err(|error| error.to_string())?;
+            output.push_stdout_line(format!(
+                "Updated {} -> {}:{}",
+                functionTypeName(&functionType),
+                providerId,
+                modelId
+            ));
+            output.setJsonStdout(json!({
+                "functionType": functionTypeName(&functionType),
+                "providerId": providerId,
+                "modelId": modelId,
+                "updated": true
+            }));
+        }
+        "function-follow-chat" => {
+            match &args[1..] {
+                [function] => command
+                    .functionalManager()
+                    .setFunctionFollowChat(parseFunctionType(function)?),
+                [] => command.functionalManager().setAllFunctionsFollowChat(),
+                _ => return Err("usage: operit2 model function-follow-chat [function-type]".into()),
+            }
+            .map_err(|error| error.to_string())?;
+            output.push_stdout_line("Function bindings now follow the chat model");
+            output.setJsonStdout(json!({"followsChat": true, "functionType": args.get(1)}));
+        }
+        "spec-reset" | "provider-key-failures-clear" | "thinking-spec" | "profile-save" => {
+            let usage = "usage: operit2 model <spec-reset <provider> <model>|provider-key-failures-clear <provider>|thinking-spec <provider> <model> <json|null>|profile-save <provider> <profile-json|@vfs-file>>";
+            let provider = requiredArg(args, 1, usage)?;
+            let manager = command.modelManager();
+            let value = match args[0].as_str() {
+                "spec-reset" if args.len() == 3 => json!(manager
+                    .clearModelSpecOverrides(provider, &args[2])
+                    .map_err(|error| error.to_string())?),
+                "provider-key-failures-clear" if args.len() == 2 => {
+                    manager
+                        .clearProviderApiKeyFailures(provider)
+                        .map_err(|error| error.to_string())?;
+                    json!({"providerId": provider, "cleared": true})
+                }
+                "thinking-spec" if args.len() == 4 => {
+                    let spec: Option<ModelThinkingSpec> = serde_json::from_str(
+                        &crate::commands::util::read_content_arg(&context, &args[3])?,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    json!(manager
+                        .setThinkingOverrideForModel(provider, &args[2], spec)
+                        .map_err(|error| error.to_string())?)
+                }
+                "profile-save" if args.len() == 3 => {
+                    let profile = serde_json::from_str(&crate::commands::util::read_content_arg(
+                        &context, &args[2],
+                    )?)
+                    .map_err(|error| error.to_string())?;
+                    json!(manager
+                        .updateModelProfile(provider, profile)
+                        .map_err(|error| error.to_string())?)
+                }
+                _ => return Err(usage.into()),
+            };
+            output.push_stdout_line(
+                serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?,
+            );
+            output.setJsonStdout(value);
+        }
+        "function-reset" => {
+            if let Some(functionTypeValue) = args.get(1) {
+                let functionType = parseFunctionType(functionTypeValue)?;
+                command
+                    .functionalManager()
+                    .resetFunctionConfig(functionType.clone())
+                    .map_err(|error| error.to_string())?;
+                output.push_stdout_line(format!("Reset {}", functionTypeName(&functionType)));
+                output.setJsonStdout(json!({
+                    "functionType": functionTypeName(&functionType),
+                    "reset": true
+                }));
+            } else {
+                command
+                    .functionalManager()
+                    .resetAllFunctionConfigs()
+                    .map_err(|error| error.to_string())?;
+                output.push_stdout_line("Reset all function model bindings");
+                output.setJsonStdout(json!({ "resetAll": true }));
+            }
+        }
+        _ => print_model_usage(output),
+    }
+
+    Ok(())
+}
+
+/// Returns one required command argument.
+fn requiredArg<'a>(args: &'a [String], index: usize, usage: &str) -> Result<&'a str, String> {
+    args.get(index)
+        .map(String::as_str)
+        .ok_or_else(|| usage.to_string())
+}
+
+/// Parses a functional model role accepted by the model command.
+fn parseFunctionType(value: &str) -> Result<FunctionType, String> {
+    match value {
+        "CHAT" => Ok(FunctionType::CHAT),
+        "SUMMARY" => Ok(FunctionType::SUMMARY),
+        "TITLE_GENERATION" => Ok(FunctionType::TITLE_GENERATION),
+        "MEMORY" => Ok(FunctionType::MEMORY),
+        "UI_CONTROLLER" => Ok(FunctionType::UI_CONTROLLER),
+        "TRANSLATION" => Ok(FunctionType::TRANSLATION),
+        "GREP" => Ok(FunctionType::GREP),
+        "ROLE_RESPONSE_PLANNER" => Ok(FunctionType::ROLE_RESPONSE_PLANNER),
+        "IMAGE_RECOGNITION" => Ok(FunctionType::IMAGE_RECOGNITION),
+        "AUDIO_RECOGNITION" => Ok(FunctionType::AUDIO_RECOGNITION),
+        "VIDEO_RECOGNITION" => Ok(FunctionType::VIDEO_RECOGNITION),
+        other => Err(format!("invalid FunctionType: {other}")),
+    }
+}
+
+/// Lists functional model roles supported by the model command.
+fn functionTypes() -> Vec<FunctionType> {
+    vec![
+        FunctionType::CHAT,
+        FunctionType::SUMMARY,
+        FunctionType::TITLE_GENERATION,
+        FunctionType::MEMORY,
+        FunctionType::UI_CONTROLLER,
+        FunctionType::TRANSLATION,
+        FunctionType::GREP,
+        FunctionType::ROLE_RESPONSE_PLANNER,
+        FunctionType::IMAGE_RECOGNITION,
+        FunctionType::AUDIO_RECOGNITION,
+        FunctionType::VIDEO_RECOGNITION,
+    ]
+}
+
+/// Formats a functional model role for command output.
+fn functionTypeName(functionType: &FunctionType) -> &'static str {
+    match functionType {
+        FunctionType::CHAT => "CHAT",
+        FunctionType::SUMMARY => "SUMMARY",
+        FunctionType::TITLE_GENERATION => "TITLE_GENERATION",
+        FunctionType::MEMORY => "MEMORY",
+        FunctionType::UI_CONTROLLER => "UI_CONTROLLER",
+        FunctionType::TRANSLATION => "TRANSLATION",
+        FunctionType::GREP => "GREP",
+        FunctionType::ROLE_RESPONSE_PLANNER => "ROLE_RESPONSE_PLANNER",
+        FunctionType::IMAGE_RECOGNITION => "IMAGE_RECOGNITION",
+        FunctionType::AUDIO_RECOGNITION => "AUDIO_RECOGNITION",
+        FunctionType::VIDEO_RECOGNITION => "VIDEO_RECOGNITION",
+    }
+}
+
+/// Prints a provider profile without API key material.
+fn print_provider_profile(provider: &ProviderProfile, output: &mut CoreCommandOutput) {
+    output.push_stdout_line(format!("Provider {}", provider.id));
+    output.push_stdout_line(format!("Name: {}", provider.name));
+    output.push_stdout_line(format!("Type: {}", provider.providerType.name()));
+    output.push_stdout_line(format!("Endpoint: {}", provider.endpoint));
+    output.push_stdout_line(format!("API key length: {}", provider.apiKey.len()));
+    output.push_stdout_line(format!("Multiple keys: {}", provider.useMultipleApiKeys));
+    output.push_stdout_line(format!("API key pool size: {}", provider.apiKeyPool.len()));
+    output.push_stdout_line(format!("Current key index: {}", provider.currentKeyIndex));
+    output.push_stdout_line(format!("Key rotation mode: {}", provider.keyRotationMode));
+    output.push_stdout_line(format!("Custom headers: {}", provider.customHeaders));
+    output.push_stdout_line(format!(
+        "Request limit per minute: {}",
+        provider.requestLimitPerMinute
+    ));
+    output.push_stdout_line(format!(
+        "Max concurrent requests: {}",
+        provider.maxConcurrentRequests
+    ));
+    output.push_stdout_line(format!("Models: {}", provider.models.len()));
+    for model in &provider.models {
+        output.push_stdout_line(format!("- {}", model.id));
+    }
+}
+
+/// Prints a resolved model config without API key material.
+fn print_resolved_model_config(config: &ResolvedModelConfig, output: &mut CoreCommandOutput) {
+    output.push_stdout_line(format!("Model {}:{}", config.providerId, config.modelId));
+    output.push_stdout_line(format!("Provider: {}", config.providerName));
+    output.push_stdout_line(format!("Provider type: {}", config.apiProviderType.name()));
+    output.push_stdout_line(format!("Endpoint: {}", config.apiEndpoint));
+    output.push_stdout_line(format!("API key length: {}", config.apiKey.len()));
+    output.push_stdout_line(format!("Custom headers: {}", config.customHeaders));
+    output.push_stdout_line(format!(
+        "Request limit per minute: {}",
+        config.requestLimitPerMinute
+    ));
+    output.push_stdout_line(format!(
+        "Max concurrent requests: {}",
+        config.maxConcurrentRequests
+    ));
+    output.push_stdout_line(format!(
+        "Structured tools: {}",
+        config.request.supportsStructuredTools
+    ));
+    output.push_stdout_line(format!(
+        "Context tokens: {}",
+        config.context.maxContextLength
+    ));
+    output.push_stdout_line(format!("Direct image: {}", config.capabilities.directImage));
+    output.push_stdout_line(format!("Direct audio: {}", config.capabilities.directAudio));
+    output.push_stdout_line(format!("Direct video: {}", config.capabilities.directVideo));
+    output.push_stdout_line(format!("Tool calls: {}", config.capabilities.toolCall));
+    output.push_stdout_line(format!("Builtin tools: {}", config.builtinTools.len()));
+    output.push_stdout_line(format!("Parameters: {}", config.parameters.len()));
+    output.push_stdout_line(format!(
+        "Thinking level: {}",
+        match config.thinkingLevel {
+            Some(level) => level.name(),
+            None => "not adjustable",
+        }
+    ));
+    print_summary_settings(&config.providerId, &config.modelId, &config.summary, output);
+    print_pricing(config.pricing.as_ref(), output);
+}
+
+/// Prints context settings for one provider model.
+fn print_context_spec(
+    providerId: &str,
+    modelId: &str,
+    context: &ModelContextSpec,
+    output: &mut CoreCommandOutput,
+) {
+    output.push_stdout_line(format!("Context for {providerId}:{modelId}"));
+    output.push_stdout_line(format!("Max context length: {}", context.maxContextLength));
+}
+
+/// Prints summary settings for one provider model.
+/// Prints the thinking levels one model offers and the level its requests use.
+fn print_thinking_settings(
+    providerId: &str,
+    modelId: &str,
+    settings: &ModelThinkingSettings,
+    output: &mut CoreCommandOutput,
+) {
+    output.push_stdout_line(format!("Thinking for {providerId}:{modelId}"));
+    output.push_stdout_line(format!("Described by: {:?}", settings.source));
+    if settings.levels.is_empty() {
+        output.push_stdout_line(if settings.spec.alwaysOn() {
+            "Always thinks; there is no level to set"
+        } else {
+            "There is no level to set for this model"
+        });
+        return;
+    }
+    let levels = settings
+        .levels
+        .iter()
+        .map(|option| match option.budgetTokens {
+            Some(tokens) => format!("{} ({tokens} tokens)", option.level.name()),
+            None => option.level.name().to_string(),
+        })
+        .collect::<Vec<_>>();
+    output.push_stdout_line(format!("Levels: {}", levels.join(", ")));
+    if let Some(current) = settings.current {
+        output.push_stdout_line(if settings.chosen {
+            format!("Current: {}", current.name())
+        } else {
+            format!(
+                "Current: {} (carried over from the level set last)",
+                current.name()
+            )
+        });
+    }
+}
+
+fn print_summary_settings(
+    providerId: &str,
+    modelId: &str,
+    summary: &ModelSummarySettings,
+    output: &mut CoreCommandOutput,
+) {
+    output.push_stdout_line(format!("Summary for {providerId}:{modelId}"));
+    output.push_stdout_line(format!("Enabled: {}", summary.enableSummary));
+    output.push_stdout_line(format!(
+        "Token threshold: {}",
+        summary.summaryTokenThreshold
+    ));
+}
+
+/// Prints pricing settings for a resolved model.
+fn print_pricing(pricing: Option<&ModelPricing>, output: &mut CoreCommandOutput) {
+    match pricing {
+        Some(pricing) => {
+            output.push_stdout_line("Pricing");
+            output.push_stdout_line(format!("Billing mode: {:?}", pricing.billingMode));
+            output.push_stdout_line(format!(
+                "Input price per million: {}",
+                pricing.inputPricePerMillion
+            ));
+            output.push_stdout_line(format!(
+                "Cached input price per million: {}",
+                optional_number(pricing.cachedInputPricePerMillion)
+            ));
+            output.push_stdout_line(format!(
+                "Cache write price per million: {}",
+                optional_number(pricing.cacheWritePricePerMillion)
+            ));
+            output.push_stdout_line(format!(
+                "Output price per million: {}",
+                pricing.outputPricePerMillion
+            ));
+            output.push_stdout_line(format!("Price per request: {}", pricing.pricePerRequest));
+            output.push_stdout_line(format!("Currency: {}", pricing.currency.code()));
+        }
+        None => output.push_stdout_line("Pricing: not configured"),
+    }
+}
+
+/// Formats an optional number for command output.
+fn optional_number(value: Option<f64>) -> String {
+    match value {
+        Some(number) => number.to_string(),
+        None => "-".to_string(),
+    }
+}
+
+/// Builds a provider profile JSON document without API key material.
+fn provider_profile_json(provider: &ProviderProfile) -> Value {
+    json!({
+        "id": &provider.id,
+        "name": &provider.name,
+        "providerTypeId": &provider.providerTypeId,
+        "providerType": provider.providerType.name(),
+        "endpoint": &provider.endpoint,
+        "apiKeyLength": provider.apiKey.len(),
+        "useMultipleApiKeys": provider.useMultipleApiKeys,
+        "apiKeyPool": api_key_pool_json(&provider.apiKeyPool),
+        "currentKeyIndex": provider.currentKeyIndex,
+        "keyRotationMode": &provider.keyRotationMode,
+        "customHeaders": &provider.customHeaders,
+        "requestLimitPerMinute": provider.requestLimitPerMinute,
+        "maxConcurrentRequests": provider.maxConcurrentRequests,
+        "models": &provider.models
+    })
+}
+
+/// Builds a resolved model config JSON document without API key material.
+fn resolved_model_config_json(config: &ResolvedModelConfig) -> Value {
+    json!({
+        "providerId": &config.providerId,
+        "providerName": &config.providerName,
+        "modelId": &config.modelId,
+        "apiKeyLength": config.apiKey.len(),
+        "apiEndpoint": &config.apiEndpoint,
+        "apiProviderType": config.apiProviderType.name(),
+        "apiProviderTypeId": &config.apiProviderTypeId,
+        "useMultipleApiKeys": config.useMultipleApiKeys,
+        "apiKeyPool": api_key_pool_json(&config.apiKeyPool),
+        "currentKeyIndex": config.currentKeyIndex,
+        "keyRotationMode": &config.keyRotationMode,
+        "customHeaders": &config.customHeaders,
+        "requestLimitPerMinute": config.requestLimitPerMinute,
+        "maxConcurrentRequests": config.maxConcurrentRequests,
+        "pricing": &config.pricing,
+        "context": &config.context,
+        "capabilities": &config.capabilities,
+        "builtinTools": &config.builtinTools,
+        "request": &config.request,
+        "parameters": &config.parameters,
+        "thinking": &config.thinking,
+        "thinkingLevel": &config.thinkingLevel,
+        "summary": &config.summary,
+        "localRuntime": &config.localRuntime
+    })
+}
+
+/// Builds API key pool metadata without API key material.
+fn api_key_pool_json(apiKeyPool: &[ApiKeyInfo]) -> Vec<Value> {
+    apiKeyPool
+        .iter()
+        .map(|apiKey| {
+            json!({
+                "id": &apiKey.id,
+                "name": &apiKey.name,
+                "isEnabled": apiKey.isEnabled,
+                "availabilityStatus": &apiKey.availabilityStatus,
+                "usageCount": apiKey.usageCount,
+                "lastUsed": apiKey.lastUsed,
+                "errorCount": apiKey.errorCount,
+                "keyLength": apiKey.key.len()
+            })
+        })
+        .collect()
+}
+
+/// Builds one functional binding JSON row.
+fn function_binding_json(functionType: &FunctionType, binding: &FunctionModelBinding) -> Value {
+    json!({
+        "functionType": functionTypeName(functionType),
+        "providerId": &binding.providerId,
+        "modelId": &binding.modelId
+    })
+}
+
+/// Prints model command usage.
+fn print_model_usage(output: &mut CoreCommandOutput) {
+    let lines = [
+        "operit2 model codex-login <browser|device>",
+        "operit2 model provider-type-list",
+        "operit2 model provider-list",
+        "operit2 model provider-show <provider-id>",
+        "operit2 model test <provider-id> <model-id>",
+        "operit2 model provider-test-key <provider-id> <key-id>",
+        "operit2 model codex-status",
+        "operit2 model codex-logout",
+        "operit2 model provider-create <name> <provider-type-id> <endpoint>",
+        "operit2 model provider-set-key <provider-id> <api-key>",
+        "operit2 model provider-save <provider-json|@vfs-file>",
+        "operit2 model provider-delete <provider-id>",
+        "operit2 model providers-export",
+        "operit2 model providers-import <providers-json|@vfs-file>",
+        "operit2 model delete <provider-id> <model-id>",
+        "operit2 model provider-set-endpoint <provider-id> <endpoint>",
+        "operit2 model provider-model-available-list <provider-id> [fetched|all]",
+        "operit2 model provider-model-add <provider-id> <provider-model-id>",
+        "operit2 model provider-model-create <provider-id> <provider-model-id>",
+        "operit2 model catalog-status",
+        "operit2 model catalog-refresh",
+        "operit2 model list",
+        "operit2 model show [provider-id] [model-id]",
+        "operit2 model use <provider-id> <model-id>",
+        "operit2 model params [provider-id] [model-id]",
+        "operit2 model parameters <provider-id> <model-id> <parameters-json>",
+        "operit2 model builtin-tools <provider-id> <model-id> <builtin-tools-json>",
+        "operit2 model context-show [provider-id] [model-id]",
+        "operit2 model context-set <provider-id> <model-id> <max-context-length>",
+        "operit2 model summary-show [provider-id] [model-id]",
+        "operit2 model summary-set <provider-id> <model-id> <enable-summary> <summary-token-threshold>",
+        "operit2 model thinking <provider-id> <model-id> [off|enabled|minimal|low|medium|high|xhigh|max]",
+        "operit2 model function-list",
+        "operit2 model function-show <function-type>",
+        "operit2 model function-set <function-type> <provider-id> <model-id>",
+        "operit2 model function-reset [function-type]",
+        "operit2 model function-follow-chat [function-type]",
+        "operit2 model spec-reset <provider-id> <model-id>",
+        "operit2 model provider-key-failures-clear <provider-id>",
+        "operit2 model thinking-spec <provider-id> <model-id> <json|null|@vfs-file>",
+        "operit2 model profile-save <provider-id> <profile-json|@vfs-file>",
+    ];
+    for line in lines {
+        output.push_stdout_line(line);
+    }
+    output.setJsonStdout(json!({ "usage": lines.as_slice() }));
+}

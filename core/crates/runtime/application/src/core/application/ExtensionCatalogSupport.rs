@@ -1,0 +1,526 @@
+use std::collections::{BTreeMap, BTreeSet};
+
+use operit_plugin_sdk::toolpkg::ToolPkgParser::ToolPkgSourceType;
+use operit_store::ExtensionStore;
+use operit_tools::tools::mcp_runtime::MCPLocalServer::MCPLocalServer;
+use operit_tools::tools::packTool::RuntimePackageManager::ToolPkgLoadIssue;
+use operit_tools::tools::AIToolHandler::AIToolHandler;
+use serde::{Deserialize, Serialize};
+
+use super::MarketInstallSupport::{self, MarketInstallMarker};
+use super::OperitApplication::OperitApplication;
+
+/// Runs catalog I/O without occupying application locks or coordination workers.
+pub(super) fn run<T: Send + 'static>(
+    tools: AIToolHandler,
+    name: &'static str,
+    operation: impl FnOnce(&AIToolHandler) -> Result<T, String> + Send + 'static,
+) -> impl std::future::Future<Output = Result<T, String>> + 'static {
+    async move {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        tools.getContext().hostRuntimeTaskSchedulerHost.ok_or("Extension catalog requires a runtime scheduler")?
+            .scheduleHostRuntimeTask(name, Box::new(move || { let _ = sender.send(operation(&tools)); }))
+            .map_err(|error| error.to_string())?;
+        receiver.await.map_err(|error| error.to_string())?
+    }
+}
+
+/// One normalized card row for the package manager's local catalog views.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionCatalogEntry {
+    pub id: String,
+    pub kind: String,
+    pub source: String,
+    pub display_name: String,
+    pub description: String,
+    pub version: String,
+    pub authors: Vec<String>,
+    pub category: String,
+    pub scope: String,
+    pub activation_state: String,
+    pub runtime_state: String,
+    pub update_state: String,
+    pub is_customized: bool,
+    pub market_entry_id: Option<String>,
+    pub installed_market_version_id: Option<String>,
+    pub logo_resource_key: Option<String>,
+    pub logo_mime_type: Option<String>,
+    pub tool_count: usize,
+    pub subpackage_count: usize,
+    pub ui_module_count: usize,
+    pub has_ui: bool,
+    pub chat_sidebar_entry_ids: Vec<String>,
+    pub dependency_issue_count: usize,
+}
+
+/// An offline official extension that has not been installed yet.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionCatalogCandidate {
+    pub id: String,
+    pub kind: String,
+    pub display_name: String,
+    pub description: String,
+    pub version: String,
+    pub authors: Vec<String>,
+    pub category: String,
+    pub required_scope: Option<String>,
+    pub tool_count: usize,
+    pub subpackage_count: usize,
+}
+
+/// A load failure or nonfatal installation warning shown alongside valid rows.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionCatalogDiagnostic {
+    pub source_path: String,
+    pub package_id: Option<String>,
+    pub display_name: String,
+    pub code: String,
+    pub message: String,
+    pub package_kind: String,
+    pub can_delete: bool,
+}
+
+/// The complete local extension catalog used by the redesigned manager UI.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionCatalogSnapshot {
+    pub revision: i64,
+    pub installed: Vec<ExtensionCatalogEntry>,
+    pub bundled_available: Vec<ExtensionCatalogCandidate>,
+    pub diagnostics: Vec<ExtensionCatalogDiagnostic>,
+}
+
+/// The result of checking one installed marketplace entry against its latest version.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionCatalogUpdateCheck {
+    pub market_entry_id: String,
+    pub installed_version_id: String,
+    pub latest_version_id: String,
+    pub update_available: bool,
+}
+
+fn catalog_entry(
+    id: &str,
+    kind: &str,
+    scopes: &BTreeMap<String, String>,
+    marker: Option<&MarketInstallMarker>,
+    bundled_update: bool,
+) -> ExtensionCatalogEntry {
+    ExtensionCatalogEntry {
+        id: id.into(),
+        kind: kind.into(),
+        source: if marker.is_some() { "market" } else { "manual" }.into(),
+        scope: scopes.get(id).cloned().unwrap_or_else(|| "device".into()),
+        runtime_state: "ready".into(),
+        update_state: if bundled_update {
+            "available"
+        } else if marker.is_some() {
+            "unknown"
+        } else {
+            "noSource"
+        }.into(),
+        market_entry_id: marker.map(|marker| marker.entry_id.clone()),
+        installed_market_version_id: marker.map(|marker| marker.version_id.clone()),
+        ..Default::default()
+    }
+}
+
+/// Projects loaded package metadata without enumerating exportable source files.
+pub(super) fn snapshot(tools: &AIToolHandler) -> Result<ExtensionCatalogSnapshot, String> {
+    let package_scopes = extension_scopes(tools, "package")?;
+    let skill_scopes = extension_scopes(tools, "skill")?;
+    let mcp_scopes = extension_scopes(tools, "mcp")?;
+    let market_origins = MarketInstallSupport::installed_marker_origins(tools)?;
+
+    let mut bundled_updates = BTreeSet::<String>::new();
+    let mut bundled_available = Vec::<ExtensionCatalogCandidate>::new();
+
+    let packageManager = tools.getOrCreatePackageManager();
+    let mut manager = packageManager
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let plugin_runtimes = manager.getToolPkgContainerRuntimes();
+    let packages = manager.getExecutableAvailablePackages();
+    let enabled_names = BTreeSet::from_iter(manager.getEnabledPackageNames());
+    let customized_names = BTreeSet::from_iter(manager.getCustomizedPackageNames()?);
+    let bundled_candidates = manager.getBundledExternalPackageCandidates();
+    let load_issues = manager
+        .getToolPkgLoadIssues()
+        .into_iter()
+        .map(|issue| {
+            let can_delete = manager.canDeleteToolPkgLoadIssue(&issue)?;
+            Ok((issue, can_delete))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    drop(manager);
+
+    let plugin_owned_names = plugin_runtimes
+        .iter()
+        .flat_map(|runtime| runtime.subpackages.iter().map(|child| child.packageName.clone()))
+        .collect::<BTreeSet<_>>();
+
+    for candidate in &bundled_candidates {
+        if package_scopes.contains_key(&candidate.packageName) {
+            bundled_updates.insert(candidate.packageName.clone());
+            continue;
+        }
+        bundled_available.push(ExtensionCatalogCandidate {
+            id: candidate.packageName.clone(),
+            kind: if candidate.isToolPkg { "toolpkg" } else { "script" }.into(),
+            display_name: candidate.displayName.resolve(false),
+            description: candidate.description.resolve(false),
+            version: candidate.version.clone(),
+            authors: candidate.author.clone(),
+            category: candidate.category.clone(),
+            required_scope: candidate.requiredInstallationScope.clone(),
+            tool_count: candidate.toolCount,
+            subpackage_count: candidate.subpackageCount,
+        });
+    }
+
+    let mut installed = Vec::<ExtensionCatalogEntry>::new();
+    for runtime in &plugin_runtimes {
+        let market_marker = market_origins
+            .get(&("package".into(), runtime.packageName.clone()));
+        let source = match &runtime.sourceType {
+            ToolPkgSourceType::ASSET => "builtin",
+            ToolPkgSourceType::MARKET => "market",
+            ToolPkgSourceType::EXTERNAL => {
+                if customized_names.contains(&runtime.packageName) {
+                    "builtin"
+                } else if bundled_updates.contains(&runtime.packageName) {
+                    "bundled"
+                } else {
+                    "manual"
+                }
+            }
+        };
+        let enabled = enabled_names.contains(&runtime.packageName);
+        installed.push(ExtensionCatalogEntry {
+            source: source.into(),
+            display_name: runtime.displayName.resolve(false),
+            description: runtime.description.resolve(false),
+            version: runtime.version.clone(),
+            authors: runtime.author.clone(),
+            category: "ToolPkg".into(),
+            activation_state: if enabled { "enabled" } else { "disabled" }.into(),
+            runtime_state: if runtime.dependencyIssues.is_empty() {
+                "ready".into()
+            } else {
+                "error".into()
+            },
+            is_customized: customized_names.contains(&runtime.packageName),
+            logo_resource_key: runtime.logoResource.as_ref().map(|resource| resource.key.clone()),
+            logo_mime_type: runtime
+                .logoResource
+                .as_ref()
+                .map(|resource| resource.mime.clone()),
+            tool_count: runtime.subpackages.len(),
+            subpackage_count: runtime.subpackages.len(),
+            ui_module_count: runtime.uiModules.len(),
+            has_ui: !runtime.uiModules.is_empty() || !runtime.navigationEntries.is_empty(),
+            chat_sidebar_entry_ids: runtime
+                .navigationEntries
+                .iter()
+                .filter(|entry| entry.surface == "chat_sidebar_tabs")
+                .map(|entry| entry.id.clone())
+                .collect(),
+            dependency_issue_count: runtime.dependencyIssues.len(),
+            ..catalog_entry(
+                &runtime.packageName, "toolpkg", &package_scopes,
+                market_marker, bundled_updates.contains(&runtime.packageName),
+            )
+        });
+    }
+
+    for package in packages.values() {
+        if plugin_owned_names.contains(&package.name) || operit_tools::tools::a2a::A2ARepository::is_a2a_package(package) {
+            continue;
+        }
+        let market_marker = market_origins.get(&("package".into(), package.name.clone()));
+        let source = if customized_names.contains(&package.name) || package.is_built_in {
+            "builtin"
+        } else if market_marker.is_some() {
+            "market"
+        } else if bundled_updates.contains(&package.name) {
+            "bundled"
+        } else {
+            "manual"
+        };
+        let enabled = enabled_names.contains(&package.name);
+        let display_name = package.display_name.resolve(false);
+        installed.push(ExtensionCatalogEntry {
+            source: source.into(),
+            display_name: if display_name.trim().is_empty() {
+                package.name.clone()
+            } else {
+                display_name
+            },
+            description: package.description.resolve(false),
+            // Standalone scripts have no declared version; container versions come from runtimes.
+            version: String::new(),
+            authors: package.author.clone(),
+            category: package.category.clone(),
+            activation_state: if enabled { "enabled" } else { "disabled" }.into(),
+            is_customized: customized_names.contains(&package.name),
+            tool_count: package.tools.len(),
+            ..catalog_entry(
+                &package.name, "script", &package_scopes,
+                market_marker, bundled_updates.contains(&package.name),
+            )
+        });
+    }
+
+    let skill_repository = operit_tools::tools::skill_runtime::SkillRepository::SkillRepository::getInstance(&tools.getContext(), tools.runtimeSupport());
+    let (skills, skill_errors) = skill_repository.getAvailableSkillPackagesSnapshot();
+    for skill in skills.values() {
+        let market_marker = market_origins.get(&("skill".into(), skill.name.clone()));
+        let builtin = ExtensionStore::ExtensionStore::default()
+            .record("skill", &skill.name)?.settings["builtin"] == true;
+        let bundled_update = if market_marker.is_none() {
+            skill_repository.bundledSkillNeedsUpdate(skill)?
+        } else {
+            None
+        };
+        let builtin = builtin || (bundled_update.is_some()
+            && tools.runtimeSupport().builtinSkillNames().contains(&skill.name.as_str()));
+        installed.push(ExtensionCatalogEntry {
+            source: if market_marker.is_some() { "market" } else if builtin { "builtin" }
+                else if bundled_update.is_some() { "bundled" } else { "manual" }.into(),
+            update_state: match bundled_update {
+                Some(true) => "available",
+                Some(false) => "current",
+                None if market_marker.is_some() => "unknown",
+                None => "noSource",
+            }.into(),
+            display_name: skill_repository.readSkillDisplayName(skill)?,
+            description: skill.description.clone(),
+            category: "Skill".into(),
+            activation_state: if skill_repository.isSkillVisibleToAi(&skill.name) {
+                "aiVisible".into()
+            } else {
+                "aiHidden".into()
+            },
+            ..catalog_entry(&skill.name, "skill", &skill_scopes, market_marker, false)
+        });
+    }
+
+    let repository = operit_tools::tools::a2a::A2ARepository::A2ARepository::new(tools.getContext())?;
+    let a2a_scopes = extension_scopes(tools, "a2a")?;
+    for record in repository.records()? {
+        let loaded = repository.config(&record.id);
+        let valid = loaded.is_ok();
+        let config = loaded.unwrap_or_else(|_| serde_json::from_value(record.settings["agent"].clone()).unwrap_or_default());
+        let marker = market_origins.get(&("a2a".into(), record.id.clone()));
+        installed.push(ExtensionCatalogEntry {
+            display_name: config.card["name"].as_str().unwrap_or(&record.id).into(),
+            description: config.card["description"].as_str().unwrap_or(&config.url).into(),
+            version: config.card["version"].as_str().unwrap_or("").into(),
+            authors: config.card["provider"]["organization"].as_str().map(|v| vec![v.into()]).unwrap_or_default(),
+            category: "A2A".into(),
+            activation_state: if config.disabled {"disabled"} else {"enabled"}.into(),
+            runtime_state: if !valid || !packages.get(&operit_tools::tools::a2a::A2ARepository::package_name(&record.id)).is_some_and(operit_tools::tools::a2a::A2ARepository::is_a2a_package) {"error"} else if config.card.is_null() {"unconfigured"} else {"ready"}.into(),
+            tool_count: 3,
+            ..catalog_entry(&record.id, "a2a", &a2a_scopes, marker, false)
+        });
+    }
+
+    let mcp = MCPLocalServer::getInstance(&tools.getContext());
+    let servers = mcp.getAllMCPServersChecked()?;
+    let metadata = mcp.getAllPluginMetadata();
+    let statuses = mcp.getAllServerStatus();
+    for (server_id, server) in servers {
+        let display_metadata = metadata.get(&server_id);
+        let status = statuses.get(&server_id);
+        let market_marker = market_origins
+            .get(&("mcp".into(), server_id.clone()))
+            .or_else(|| market_origins.get(&("mcp_plugin".into(), server_id.clone())));
+        installed.push(ExtensionCatalogEntry {
+            display_name: display_metadata
+                .map(|value| value.name.clone())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| server_id.clone()),
+            description: display_metadata
+                .map(|value| value.description.clone())
+                .unwrap_or_default(),
+            version: display_metadata
+                .map(|value| value.version.clone())
+                .unwrap_or_default(),
+            authors: display_metadata
+                .map(|value| vec![value.author.clone()])
+                .unwrap_or_default(),
+            category: "MCP".into(),
+            scope: if server.command.trim().is_empty() {
+                mcp_scopes
+                    .get(&server_id)
+                    .cloned()
+                    .unwrap_or_else(|| "device".into())
+            } else {
+                "localOnly".into()
+            },
+            activation_state: if server.disabled { "disabled" } else { "enabled" }.into(),
+            runtime_state: if let Some(error) = status
+                .and_then(|value| value.errorMessage.as_ref())
+                .filter(|value| !value.trim().is_empty())
+            {
+                format!("error:{error}")
+            } else if status
+                .map(|value| value.lastStartTime > 0 && value.lastStartTime >= value.lastStopTime)
+                .unwrap_or(false)
+            {
+                "running".into()
+            } else {
+                "stopped".into()
+            },
+            tool_count: status
+                .and_then(|value| value.cachedTools.as_ref())
+                .map(|tools| tools.len())
+                .unwrap_or_default(),
+            ..catalog_entry(&server_id, "mcp", &mcp_scopes, market_marker, false)
+        });
+    }
+
+    installed.sort_by_cached_key(|entry| (entry.display_name.to_lowercase(), entry.id.clone()));
+    bundled_available.sort_by_cached_key(|entry| (entry.display_name.to_lowercase(), entry.id.clone()));
+
+    let mut diagnostics = load_issues
+        .into_iter()
+        .map(|(issue, can_delete)| ExtensionCatalogDiagnostic {
+            source_path: issue.sourcePath,
+            package_id: issue.packageName,
+            display_name: issue.displayName,
+            code: issue.code,
+            message: issue.message,
+            package_kind: issue.packageKind,
+            can_delete,
+        })
+        .collect::<Vec<_>>();
+    diagnostics.extend(skill_errors.into_iter().map(|(id, message)| {
+        ExtensionCatalogDiagnostic {
+            source_path: id.clone(),
+            package_id: Some(id),
+            display_name: "Skill".into(),
+            code: "skill_load_failed".into(),
+            message,
+            package_kind: "skill".into(),
+            can_delete: false,
+        }
+    }));
+    for kind in ["package", "skill", "mcp", "a2a"] {
+        for record in ExtensionStore::ExtensionStore::default().selection(kind)?.shadowed {
+            diagnostics.push(ExtensionCatalogDiagnostic {
+                source_path: ExtensionStore::recordPath(kind, &record.id, &record.scope)?,
+                package_id: Some(record.id.clone()),
+                display_name: record.id.clone(),
+                code: "duplicate_scope".into(),
+                message: format!("重复安装：{} 已使用 space 版本，local 版本已跳过，本地数据保留。", record.id),
+                package_kind: kind.into(),
+                can_delete: false,
+            });
+        }
+    }
+    diagnostics.sort_by_cached_key(|entry| (entry.display_name.to_lowercase(), entry.source_path.clone()));
+
+    Ok(ExtensionCatalogSnapshot {
+        revision: ExtensionStore::catalogRevisionFlow().value(),
+        installed,
+        bundled_available,
+        diagnostics,
+    })
+}
+
+pub(super) fn check_updates(
+    tools: &AIToolHandler,
+) -> Result<Vec<ExtensionCatalogUpdateCheck>, String> {
+    let mut results = Vec::new();
+    let mut checked_entry_ids = BTreeSet::new();
+    let api = operit_providers::market::MarketStatsApiService::MarketStatsApiService::new();
+    for marker in MarketInstallSupport::installed_marker_origins(tools)?.into_values()
+        .filter(|marker| checked_entry_ids.insert(marker.entry_id.clone()))
+    {
+        let entry = api.get_entry_by_id(&marker.entry_id)?;
+        let latest_version_id = entry
+            .latest_version
+            .map(|version| version.id.trim().to_string())
+            .unwrap_or_default();
+        let update_available = !latest_version_id.is_empty()
+            && latest_version_id != marker.version_id;
+        results.push(ExtensionCatalogUpdateCheck {
+            market_entry_id: marker.entry_id,
+            installed_version_id: marker.version_id,
+            update_available,
+            latest_version_id,
+        });
+    }
+    results.sort_by(|left, right| left.market_entry_id.cmp(&right.market_entry_id));
+    Ok(results)
+}
+
+pub(super) fn delete_diagnostic(
+    app: &OperitApplication,
+    diagnostic: ExtensionCatalogDiagnostic,
+) -> Result<bool, String> {
+    let issue = ToolPkgLoadIssue {
+        sourcePath: diagnostic.source_path,
+        packageName: diagnostic.package_id,
+        displayName: diagnostic.display_name,
+        code: diagnostic.code,
+        message: diagnostic.message,
+        packageKind: diagnostic.package_kind,
+    };
+    let packageManager = app.packageManager();
+    let mut manager = packageManager
+        .lock()
+        .map_err(|error| error.to_string())?;
+    manager.deleteToolPkgLoadIssue(issue)?;
+    Ok(true)
+}
+
+/// Reads scope ownership using runtime capabilities without borrowing the application.
+pub(super) fn extension_scopes(tools: &AIToolHandler, kind: &str) -> Result<BTreeMap<String, String>, String> {
+    let packageOwners = match kind {
+        "package" => {
+            let manager = tools.getOrCreatePackageManager();
+            let manager = manager.lock().map_err(|error| error.to_string())?;
+            Some(
+                manager
+                    .getTopLevelAvailablePackages()
+                    .into_keys()
+                    .collect::<std::collections::BTreeSet<_>>(),
+            )
+        }
+        "skill" => {
+            operit_tools::tools::skill_runtime::SkillRepository::SkillRepository::getInstance(&tools.getContext(), tools.runtimeSupport()).getAvailableSkillPackages();
+            None
+        }
+        "mcp" | "a2a" => None,
+        _ => return Err(format!("Unknown extension kind: {kind}")),
+    };
+    let mut result = BTreeMap::new();
+    for record in operit_store::ExtensionStore::ExtensionStore::default().activeRecords(kind)? {
+        // Stale owners and rejected packages must not invalidate the loaded catalog's scopes.
+        if packageOwners
+            .as_ref()
+            .is_some_and(|owners| !owners.contains(&record.id))
+        {
+            continue;
+        }
+        let scope = record.scope.clone();
+        result.insert(record.id.clone(), scope.clone());
+        if kind == "package" {
+            let members: Vec<String> =
+                serde_json::from_value(record.settings["members"].clone())
+                    .map_err(|e| e.to_string())?;
+            for member in members {
+                if member != record.id {
+                    result.insert(member, scope.clone());
+                }
+            }
+        }
+    }
+    Ok(result)
+}

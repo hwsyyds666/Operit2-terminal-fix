@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "toolpkg_id": "com.operit.plan_mode_bundle",
+  "version": "0.1.0",
+  "api_version": "2.0.0",
+  "main": "dist/main.js",
+  "display_name": {
+    "zh": "计划模式",
+    "en": "Plan Mode"
+  },
+  "description": {
+    "zh": "开启后 AI 先和你商量好计划、不改动文件，你确认后一键开始实施。",
+    "en": "When on, the AI plans with you first, changing no files until you approve and start it."
+  },
+  "logo": "package_logo",
+  "enabled_by_default": true,
+  "subpackages": [
+    {
+      "id": "plan_mode_tools",
+      "entry": "dist/packages/plan_mode_tools.js",
+      "display_name": {
+        "zh": "计划模式工具",
+        "en": "Plan Mode Tools"
+      },
+      "description": {
+        "zh": "读取和完成当前聊天的插件计划。",
+        "en": "Read and complete the current chat plan in plugin storage."
+      }
+    }
+  ],
+  "resources": [
+    {
+      "key": "package_logo",
+      "path": "resources/logo.svg",
+      "mime": "image/svg+xml"
+    }
+  ],
+  "installation_scope": "space"
+}

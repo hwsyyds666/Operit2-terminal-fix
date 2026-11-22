@@ -1,0 +1,62 @@
+//
+//  Generated file. Do not edit.
+//
+
+// clang-format off
+
+#include "generated_plugin_registrant.h"
+
+#include <audioplayers_windows/audioplayers_windows_plugin.h>
+#include <camera_windows/camera_windows.h>
+#include <desktop_drop/desktop_drop_plugin.h>
+#include <desktop_multi_window/desktop_multi_window_plugin.h>
+#include <desktop_widgets_windows/desktop_widgets_plugin.h>
+#include <dynamic_color/dynamic_color_plugin_c_api.h>
+#include <file_selector_windows/file_selector_windows.h>
+#include <floating_windows/floating_windows_plugin.h>
+#include <fvp/fvp_plugin_c_api.h>
+#include <geolocator_windows/geolocator_windows.h>
+#include <operit_keep_alive/operit_keep_alive_plugin.h>
+#include <operit_system_fonts/operit_system_fonts_plugin.h>
+#include <printing/printing_plugin.h>
+#include <record_windows/record_windows_plugin_c_api.h>
+#include <share_plus/share_plus_windows_plugin_c_api.h>
+#include <url_launcher_windows/url_launcher_windows.h>
+#include <webview_all_windows/webview_windows_plugin.h>
+
+void RegisterPlugins(flutter::PluginRegistry* registry) {
+  AudioplayersWindowsPluginRegisterWithRegistrar(
+      registry->GetRegistrarForPlugin("AudioplayersWindowsPlugin"));
+  CameraWindowsRegisterWithRegistrar(
+      registry->GetRegistrarForPlugin("CameraWindows"));
+  DesktopDropPluginRegisterWithRegistrar(
+      registry->GetRegistrarForPlugin("DesktopDropPlugin"));
+  DesktopMultiWindowPluginRegisterWithRegistrar(
+      registry->GetRegistrarForPlugin("DesktopMultiWindowPlugin"));
+  DesktopWidgetsPluginRegisterWithRegistrar(
+      registry->GetRegistrarForPlugin("DesktopWidgetsPlugin"));
+  DynamicColorPluginCApiRegisterWithRegistrar(
+      registry->GetRegistrarForPlugin("DynamicColorPluginCApi"));
+  FileSelectorWindowsRegisterWithRegistrar(
+      registry->GetRegistrarForPlugin("FileSelectorWindows"));
+  FloatingWindowsPluginRegisterWithRegistrar(
+      registry->GetRegistrarForPlugin("FloatingWindowsPlugin"));
+  FvpPluginCApiRegisterWithRegistrar(
+      registry->GetRegistrarForPlugin("FvpPluginCApi"));
+  GeolocatorWindowsRegisterWithRegistrar(
+      registry->GetRegistrarForPlugin("GeolocatorWindows"));
+  OperitKeepAlivePluginRegisterWithRegistrar(
+      registry->GetRegistrarForPlugin("OperitKeepAlivePlugin"));
+  OperitSystemFontsPluginRegisterWithRegistrar(
+      registry->GetRegistrarForPlugin("OperitSystemFontsPlugin"));
+  PrintingPluginRegisterWithRegistrar(
+      registry->GetRegistrarForPlugin("PrintingPlugin"));
+  RecordWindowsPluginCApiRegisterWithRegistrar(
+      registry->GetRegistrarForPlugin("RecordWindowsPluginCApi"));
+  SharePlusWindowsPluginCApiRegisterWithRegistrar(
+      registry->GetRegistrarForPlugin("SharePlusWindowsPluginCApi"));
+  UrlLauncherWindowsRegisterWithRegistrar(
+      registry->GetRegistrarForPlugin("UrlLauncherWindows"));
+  WebviewWindowsPluginRegisterWithRegistrar(
+      registry->GetRegistrarForPlugin("WebviewWindowsPlugin"));
+}

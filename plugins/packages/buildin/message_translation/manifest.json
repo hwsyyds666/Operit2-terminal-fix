@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "toolpkg_id": "com.operit.message_translation",
+  "version": "0.1.1",
+  "api_version": "2.0.0",
+  "main": "dist/main.js",
+  "display_name": {
+    "zh": "消息翻译",
+    "en": "Message Translation"
+  },
+  "description": {
+    "zh": "长按任意聊天消息就能翻译，原文和译文对照显示。",
+    "en": "Long-press any chat message to translate it; the original and translation are shown together."
+  },
+  "logo": "package_logo",
+  "enabled_by_default": true,
+  "subpackages": [],
+  "resources": [
+    {
+      "key": "package_logo",
+      "path": "resources/logo.svg",
+      "mime": "image/svg+xml"
+    }
+  ]
+}

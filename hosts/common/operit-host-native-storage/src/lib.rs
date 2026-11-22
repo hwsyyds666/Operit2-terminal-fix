@@ -1,0 +1,1700 @@
+mod secrets;
+pub use secrets::NativeFileSecretStore;
+
+use std::collections::{BTreeSet, HashMap};
+use std::fs;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
+#[cfg(windows)]
+use std::{ffi::OsStr, os::windows::ffi::OsStrExt};
+
+use operit_host_contract::{
+    ArchiveStagingHost, HostError, HostResult, RuntimeSqliteConnection, RuntimeSqliteHost,
+    RuntimeSqliteTransaction, RuntimeStorageEntry, RuntimeStorageHost, RuntimeStorageWriteHost,
+    RuntimeStorageWriteSession, SqliteRow, SqliteValue,
+};
+use rusqlite::types::Value;
+
+#[derive(Clone, Debug)]
+pub struct NativeRuntimeStorageHost {
+    runtimeRoot: PathBuf,
+    workspaceRoot: PathBuf,
+}
+
+/// Writes one runtime storage file through a private sibling staging path.
+struct NativeRuntimeStorageWriteSession {
+    targetPath: PathBuf,
+    temporaryPath: PathBuf,
+    file: Option<fs::File>,
+}
+
+impl NativeRuntimeStorageWriteSession {
+    /// Closes and atomically renames one staged runtime storage file.
+    fn commitInternal(&mut self, sync: bool, syncDirectory: bool) -> HostResult<()> {
+        let file = self
+            .file
+            .take()
+            .ok_or_else(|| HostError::new("Runtime storage write session is closed"))?;
+        if sync {
+            file.sync_all()?;
+        }
+        drop(file);
+        publishStagedFile(&self.temporaryPath, &self.targetPath, syncDirectory)?;
+        Ok(())
+    }
+}
+
+impl Drop for NativeRuntimeStorageWriteSession {
+    /// Removes an unpublished staging file when its write session is abandoned.
+    fn drop(&mut self) {
+        self.file.take();
+        if self.temporaryPath.exists() {
+            let _ = fs::remove_file(&self.temporaryPath);
+        }
+    }
+}
+
+impl RuntimeStorageWriteSession for NativeRuntimeStorageWriteSession {
+    /// Appends one chunk to the private staging file.
+    fn writeChunk(&mut self, chunk: &[u8]) -> HostResult<()> {
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| HostError::new("Runtime storage write session is closed"))?;
+        file.write_all(chunk)?;
+        Ok(())
+    }
+
+    /// Flushes the staged file and atomically publishes it at the requested path.
+    fn commit(mut self: Box<Self>) -> HostResult<()> {
+        self.commitInternal(true, true)
+    }
+
+    /// Keeps staged contents durable while allowing one directory flush per batch.
+    fn commitFile(mut self: Box<Self>) -> HostResult<()> {
+        self.commitInternal(true, false)
+    }
+
+    /// Atomically publishes the staged file without forcing a device flush.
+    fn commitFast(mut self: Box<Self>) -> HostResult<()> {
+        self.commitInternal(false, false)
+    }
+
+    /// Removes the private staging file without modifying the published target.
+    fn discard(mut self: Box<Self>) -> HostResult<()> {
+        self.file.take();
+        if self.temporaryPath.exists() {
+            fs::remove_file(&self.temporaryPath)?;
+        }
+        Ok(())
+    }
+}
+
+/// Names the Host-owned temporary archive namespace excluded from portable data.
+pub const ARCHIVE_STAGING_DIRECTORY_NAME: &str = "archive_staging";
+
+/// Bounds retention of legacy archives that predate cross-process ownership leases.
+const LEGACY_ARCHIVE_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Stages streamed archive uploads in the runtime-private temporary directory.
+#[derive(Clone, Debug)]
+pub struct NativeArchiveStagingHost {
+    stagingRoot: PathBuf,
+    uploads: Arc<Mutex<HashMap<String, NativeArchiveUpload>>>,
+}
+
+/// Tracks the declared length and lifecycle state of one current-process archive upload.
+#[derive(Debug)]
+struct NativeArchiveUpload {
+    expectedByteLength: Option<u64>,
+    sealed: bool,
+    files: NativeArchiveFiles,
+}
+
+/// Holds an archive lease until its temporary files have been removed.
+#[derive(Debug)]
+struct NativeArchiveFiles {
+    root: PathBuf,
+    id: String,
+    lease: Option<fs::File>,
+    removed: bool,
+}
+
+impl NativeArchiveFiles {
+    /// Removes temporary payloads while the caller holds the staging directory lock.
+    fn removeLocked(&mut self) -> HostResult<()> {
+        removeLeasedArchiveFiles(&self.root, &self.id, &mut self.lease)?;
+        self.removed = true;
+        Ok(())
+    }
+
+    /// Serializes explicit disposal with archive creation and abandoned-file collection.
+    fn remove(&mut self) -> HostResult<()> {
+        if self.removed { return Ok(()); }
+        let _directoryLease = lockArchiveDirectory(&self.root)?;
+        self.removeLocked()
+    }
+}
+
+impl Drop for NativeArchiveFiles {
+    /// Releases unpublished and sealed archives when their final Host owner closes.
+    fn drop(&mut self) {
+        if let Err(error) = self.remove() {
+            operit_host_contract::logHostError("ArchiveStagingCleanup", &error.message);
+        }
+    }
+}
+
+/// Locks staging mutations across Host instances without locking archive payload bytes.
+/// Uses fs2 because Rust 1.95 standard file locking does not support Android.
+fn lockArchiveDirectory(root: &Path) -> HostResult<fs::File> {
+    let file = fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
+        .open(root.join(".staging.lock"))?;
+    fs2::FileExt::lock_exclusive(&file)?;
+    Ok(file)
+}
+
+/// Deletes only a regular temporary file and treats an already removed file as complete.
+fn removeArchiveFile(path: &Path) -> HostResult<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            fs::remove_file(path)?;
+            Ok(())
+        }
+        Ok(_) => Err(HostError::new(format!("Archive staging entry is not a regular file: {}", path.display()))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Deletes archive payloads before releasing and removing their ownership lease.
+fn removeLeasedArchiveFiles(root: &Path, id: &str, lease: &mut Option<fs::File>) -> HostResult<()> {
+    for extension in ["upload", "sealed"] {
+        removeArchiveFile(&root.join(format!("{id}.{extension}")))?;
+    }
+    drop(lease.take());
+    removeArchiveFile(&root.join(format!("{id}.lease")))
+}
+
+impl NativeArchiveStagingHost {
+    /// Creates native archive staging beside one runtime data directory.
+    pub fn new(runtimeRoot: PathBuf) -> Self {
+        Self {
+            stagingRoot: Self::stagingRootForRuntimeRoot(&runtimeRoot),
+            uploads: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Resolves the archive staging root owned by one runtime root.
+    fn stagingRootForRuntimeRoot(runtimeRoot: &Path) -> PathBuf {
+        let parent = runtimeRoot
+            .parent()
+            .expect("runtime root must have a parent for archive staging");
+        let name = runtimeRoot
+            .file_name()
+            .expect("runtime root must have a final segment for archive staging");
+        parent.join(ARCHIVE_STAGING_DIRECTORY_NAME).join(name)
+    }
+
+    /// Collects abandoned archives for every runtime sharing a Host staging namespace.
+    pub fn cleanupAbandonedArchivesForRuntimeParent(runtimeParent: &Path) -> HostResult<()> {
+        Self::cleanupArchiveNamespace(&runtimeParent.join(ARCHIVE_STAGING_DIRECTORY_NAME), true)
+    }
+
+    /// Reclaims retired runtime owners through the same collection policy as the current owner.
+    fn cleanupArchiveNamespace(root: &Path, includeRecentLegacy: bool) -> HostResult<()> {
+        match fs::symlink_metadata(root) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {},
+            Ok(_) => return Err(HostError::new("Archive staging namespace is not a regular directory")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                return Err(HostError::new("Archive staging owner is not a regular directory"));
+            }
+            Self {
+                stagingRoot: entry.path(),
+                uploads: Arc::new(Mutex::new(HashMap::new())),
+            }.cleanupArchiveDirectory(includeRecentLegacy)?;
+        }
+        Ok(())
+    }
+
+    /// Reclaims abandoned transfers and expired legacy files across this staging namespace.
+    pub fn cleanupAbandonedArchives(&self) -> HostResult<()> {
+        let root = self.stagingRoot.parent().expect("archive staging root must have a namespace");
+        Self::cleanupArchiveNamespace(root, false)
+    }
+
+    /// Also collects recent unleased archives while maintenance owns exclusive storage access.
+    pub fn cleanupAbandonedArchivesDuringMaintenance(&self) -> HostResult<()> {
+        self.cleanupArchiveDirectory(true)
+    }
+
+    /// Locks an existing staging directory before collecting its abandoned transfers.
+    fn cleanupArchiveDirectory(&self, includeRecentLegacy: bool) -> HostResult<()> {
+        match fs::symlink_metadata(&self.stagingRoot) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {},
+            Ok(_) => return Err(HostError::new("Archive staging root is not a regular directory")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        let _directoryLease = lockArchiveDirectory(&self.stagingRoot)?;
+        self.cleanupAbandonedArchivesLocked(includeRecentLegacy)
+    }
+
+    /// Collects only recognized archive files under an already locked staging directory.
+    fn cleanupAbandonedArchivesLocked(&self, includeRecentLegacy: bool) -> HostResult<()> {
+        let mut ids = BTreeSet::new();
+        for entry in fs::read_dir(&self.stagingRoot)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !matches!(path.extension().and_then(|value| value.to_str()), Some("upload" | "sealed" | "lease")) { continue; }
+            if !entry.file_type()?.is_file() { return Err(HostError::new("Archive staging entry is not a regular file")); }
+            let id = path.file_stem().and_then(|value| value.to_str())
+                .ok_or_else(|| HostError::new("Archive staging filename is not valid UTF-8"))?;
+            self.validateArchiveId(id)?;
+            ids.insert(id.to_owned());
+        }
+        let now = SystemTime::now();
+        for id in ids {
+            let leasePath = self.stagingRoot.join(format!("{id}.lease"));
+            if !includeRecentLegacy && !leasePath.try_exists()? && !self.legacyArchiveExpired(&id, now)? { continue; }
+            let lease = fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&leasePath)?;
+            match fs2::FileExt::try_lock_exclusive(&lease) {
+                Ok(()) => {
+                    let mut lease = Some(lease);
+                    removeLeasedArchiveFiles(&self.stagingRoot, &id, &mut lease)?;
+                }
+                Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {},
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Preserves a legacy transfer if either payload was written within the retention period.
+    fn legacyArchiveExpired(&self, id: &str, now: SystemTime) -> HostResult<bool> {
+        for extension in ["upload", "sealed"] {
+            let path = self.stagingRoot.join(format!("{id}.{extension}"));
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(HostError::new("Archive staging entry is not a regular file"));
+            }
+            if now.duration_since(metadata.modified()?).unwrap_or_default() < LEGACY_ARCHIVE_RETENTION {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Creates an archive with an explicit upload or growable-export length contract.
+    fn createPendingArchive(
+        &self,
+        archiveId: &str,
+        expectedByteLength: Option<u64>,
+    ) -> HostResult<()> {
+        let path = self.uploadingArchivePath(archiveId)?;
+        let sealedPath = self.sealedArchivePath(archiveId)?;
+        self.cleanupAbandonedArchives()?;
+        let mut uploads = self
+            .uploads
+            .lock()
+            .map_err(|_| HostError::new("Archive staging upload state is poisoned"))?;
+        if uploads.contains_key(archiveId) {
+            return Err(HostError::new("Archive staging ID already exists"));
+        }
+        fs::create_dir_all(self.stagingRoot())?;
+        let _directoryLease = lockArchiveDirectory(&self.stagingRoot)?;
+        if sealedPath.exists() {
+            return Err(HostError::new("Archive staging ID already exists"));
+        }
+        let lease = fs::OpenOptions::new().create_new(true).read(true).write(true)
+            .open(self.stagingRoot.join(format!("{archiveId}.lease")))?;
+        fs2::FileExt::lock_exclusive(&lease)?;
+        if let Err(error) = fs::OpenOptions::new().create_new(true).write(true).open(path) {
+            drop(lease);
+            removeArchiveFile(&self.stagingRoot.join(format!("{archiveId}.lease")))
+                .map_err(|cleanup| HostError::new(format!("{error}; archive lease cleanup failed: {}", cleanup.message)))?;
+            return Err(error.into());
+        }
+        uploads.insert(
+            archiveId.to_string(),
+            NativeArchiveUpload {
+                expectedByteLength,
+                sealed: false,
+                files: NativeArchiveFiles { root: self.stagingRoot.clone(), id: archiveId.to_owned(), lease: Some(lease), removed: false },
+            },
+        );
+        Ok(())
+    }
+
+    /// Returns the private directory containing staged archive files.
+    fn stagingRoot(&self) -> PathBuf {
+        self.stagingRoot.clone()
+    }
+
+    /// Validates an opaque archive identifier supplied by the Core API.
+    fn validateArchiveId(&self, archiveId: &str) -> HostResult<()> {
+        if archiveId.is_empty()
+            || !archiveId
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return Err(HostError::new("Archive staging ID is invalid"));
+        }
+        Ok(())
+    }
+
+    /// Resolves one upload-in-progress path from a validated opaque archive ID.
+    fn uploadingArchivePath(&self, archiveId: &str) -> HostResult<PathBuf> {
+        self.validateArchiveId(archiveId)?;
+        Ok(self.stagingRoot().join(format!("{archiveId}.upload")))
+    }
+
+    /// Resolves one immutable sealed path from a validated opaque archive ID.
+    fn sealedArchivePath(&self, archiveId: &str) -> HostResult<PathBuf> {
+        self.validateArchiveId(archiveId)?;
+        Ok(self.stagingRoot().join(format!("{archiveId}.sealed")))
+    }
+}
+
+impl ArchiveStagingHost for NativeArchiveStagingHost {
+    /// Creates one empty private staging file without replacing an existing upload.
+    fn createArchive(&self, archiveId: &str, expectedByteLength: u64) -> HostResult<()> {
+        self.createPendingArchive(archiveId, Some(expectedByteLength))
+    }
+
+    /// Creates a growable output file for a streamed snapshot export.
+    fn createExportArchive(&self, archiveId: &str) -> HostResult<()> {
+        self.createPendingArchive(archiveId, None)
+    }
+
+    /// Writes a bounded export range without loading the archive into memory.
+    fn writeExportArchive(&self, archiveId: &str, offset: u64, chunk: &[u8]) -> HostResult<()> {
+        if chunk.len() > 64 * 1024 {
+            return Err(HostError::new("Snapshot export chunk exceeds 64 KiB"));
+        }
+        let uploads = self
+            .uploads
+            .lock()
+            .map_err(|_| HostError::new("Archive staging state is poisoned"))?;
+        let upload = uploads
+            .get(archiveId)
+            .ok_or_else(|| HostError::new("Archive staging ID does not exist"))?;
+        if upload.sealed || upload.expectedByteLength.is_some() {
+            return Err(HostError::new("Archive is not an active snapshot export"));
+        }
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(self.uploadingArchivePath(archiveId)?)?;
+        if offset > file.metadata()?.len() {
+            return Err(HostError::new(
+                "Snapshot write starts beyond the current output",
+            ));
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(chunk)?;
+        Ok(())
+    }
+
+    /// Exposes the sealed staging file as a platform-saveable file reference.
+    fn archiveFileReference(&self, archiveId: &str) -> HostResult<String> {
+        let uploads = self
+            .uploads
+            .lock()
+            .map_err(|_| HostError::new("Archive staging state is poisoned"))?;
+        let upload = uploads
+            .get(archiveId)
+            .ok_or_else(|| HostError::new("Archive staging ID does not exist"))?;
+        if !upload.sealed {
+            return Err(HostError::new("Archive must be sealed before saving"));
+        }
+        self.sealedArchivePath(archiveId)?
+            .to_str()
+            .map(str::to_owned)
+            .ok_or_else(|| HostError::new("Snapshot file path is not valid UTF-8"))
+    }
+
+    /// Appends one ordered upload chunk to the private staging file.
+    fn appendArchive(&self, archiveId: &str, chunk: &[u8]) -> HostResult<()> {
+        let path = self.uploadingArchivePath(archiveId)?;
+        let uploads = self
+            .uploads
+            .lock()
+            .map_err(|_| HostError::new("Archive staging upload state is poisoned"))?;
+        let upload = uploads
+            .get(archiveId)
+            .ok_or_else(|| HostError::new("Archive staging ID does not exist"))?;
+        if upload.sealed {
+            return Err(HostError::new("Archive staging upload is already sealed"));
+        }
+        let currentByteLength = fs::metadata(&path)?.len();
+        let remainingByteLength = upload
+            .expectedByteLength
+            .ok_or_else(|| HostError::new("Export archives require ranged writes"))?
+            .checked_sub(currentByteLength)
+            .ok_or_else(|| {
+                HostError::new("Archive staging upload exceeds its declared byte length")
+            })?;
+        if u64::try_from(chunk.len())
+            .map_err(|_| HostError::new("Archive staging chunk length does not fit u64"))?
+            > remainingByteLength
+        {
+            return Err(HostError::new(
+                "Archive staging upload exceeds its declared byte length",
+            ));
+        }
+        let mut file = fs::OpenOptions::new().append(true).open(path)?;
+        file.write_all(chunk)?;
+        Ok(())
+    }
+
+    /// Flushes one staged upload and returns the resulting persisted byte length.
+    fn sealArchive(&self, archiveId: &str) -> HostResult<u64> {
+        let uploadingPath = self.uploadingArchivePath(archiveId)?;
+        let sealedPath = self.sealedArchivePath(archiveId)?;
+        let mut uploads = self
+            .uploads
+            .lock()
+            .map_err(|_| HostError::new("Archive staging upload state is poisoned"))?;
+        let upload = uploads
+            .get_mut(archiveId)
+            .ok_or_else(|| HostError::new("Archive staging ID does not exist"))?;
+        if upload.sealed {
+            return Ok(fs::metadata(sealedPath)?.len());
+        }
+        let actualByteLength = fs::metadata(&uploadingPath)?.len();
+        if upload
+            .expectedByteLength
+            .is_some_and(|expected| actualByteLength != expected)
+        {
+            return Err(HostError::new(
+                "Archive staging upload does not match its declared byte length",
+            ));
+        }
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&uploadingPath)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(uploadingPath, &sealedPath)?;
+        upload.sealed = true;
+        Ok(actualByteLength)
+    }
+
+    /// Reads one requested byte range from a staged upload.
+    fn readArchive(&self, archiveId: &str, offset: u64, length: usize) -> HostResult<Vec<u8>> {
+        let path = self.sealedArchivePath(archiveId)?;
+        let mut file = fs::File::open(path)?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut bytes = vec![0; length];
+        let count = file.read(&mut bytes)?;
+        bytes.truncate(count);
+        Ok(bytes)
+    }
+
+    /// Deletes one private staged upload before releasing its cross-process lease.
+    fn removeArchive(&self, archiveId: &str) -> HostResult<()> {
+        self.validateArchiveId(archiveId)?;
+        let mut uploads = self.uploads.lock()
+            .map_err(|_| HostError::new("Archive staging upload state is poisoned"))?;
+        if let Some(upload) = uploads.get_mut(archiveId) {
+            upload.files.remove()?;
+            uploads.remove(archiveId);
+        }
+        Ok(())
+    }
+}
+
+impl NativeRuntimeStorageHost {
+    /// Creates a native runtime storage host with explicit roots.
+    #[allow(non_snake_case)]
+    pub fn new(runtimeRoot: PathBuf, workspaceRoot: PathBuf) -> Self {
+        Self {
+            runtimeRoot,
+            workspaceRoot,
+        }
+    }
+
+    fn resolve(&self, path: &str) -> HostResult<PathBuf> {
+        let normalized = normalizeStoragePath(path)?;
+        let segments = normalized.iter().map(String::as_str).collect::<Vec<_>>();
+        match segments.as_slice() {
+            ["runtime", rest @ ..] => Ok(joinSegments(&self.runtimeRoot, rest)),
+            ["workspaces", rest @ ..] => Ok(joinSegments(&self.workspaceRoot, rest)),
+            ["secure", rest @ ..] => legacySecurePath(&self.runtimeRoot, rest),
+            _ => Err(HostError::new(format!(
+                "Runtime storage path must start with runtime/, workspaces/, or secure/: {path}"
+            ))),
+        }
+    }
+
+    fn managedRoot(&self, path: &str) -> HostResult<Option<&Path>> {
+        let normalized = normalizeStoragePath(path)?.join("/");
+        if normalized == "workspaces" || normalized.starts_with("workspaces/") {
+            return Ok(Some(self.workspaceRoot.as_path()));
+        }
+        if ["runtime/data/chat_outputs", "runtime/data/chat_attachments", "runtime/data/attachment_sources"].iter().any(|root|
+            normalized == *root || normalized.starts_with(&format!("{root}/")) || root.starts_with(&format!("{normalized}/"))) {
+            return Ok(Some(self.runtimeRoot.as_path()));
+        }
+        Ok(None)
+    }
+
+    // Enforce non-following workspace access at the actual storage boundary too:
+    // recheck components before reads/writes, rather than trusting an earlier listing.
+    fn resolveFile(&self, path: &str) -> HostResult<PathBuf> {
+        let resolved = self.resolve(path)?;
+        let segments = normalizeStoragePath(path)?;
+        if let Some(root) = self.managedRoot(path)? {
+            let mut current = root.to_path_buf();
+            for segment in segments.iter().skip(1) {
+                current.push(segment);
+                match fs::symlink_metadata(&current) {
+                    Ok(metadata) if isStorageLink(&metadata) =>
+                        return Err(HostError::new("Workspace storage does not follow links")),
+                    Ok(metadata) if !metadata.is_dir() && !metadata.is_file() =>
+                        return Err(HostError::new("Workspace storage requires a regular file or directory")),
+                    Ok(_) => {},
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(error) => return Err(storageIoError("Inspect storage path", &current, error)),
+                }
+            }
+        }
+        Ok(resolved)
+    }
+
+    /// Opens a staging writer, optionally retaining identity-private catalog permissions.
+    fn createWriteSessionInternal(
+        &self,
+        path: &str,
+        privateCatalog: bool,
+    ) -> HostResult<Box<dyn RuntimeStorageWriteSession>> {
+        let targetPath = self.resolveFile(path)?;
+        let parent = targetPath
+            .parent()
+            .ok_or_else(|| HostError::new("Runtime storage file has no parent directory"))?;
+        fs::create_dir_all(storageFsPath(parent)?)?;
+        let temporaryPath = Self::writeTemporaryPath(&targetPath)?;
+        let mut options = fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        if privateCatalog {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+        }
+        let file = options.open(storageFsPath(&temporaryPath)?)?;
+        Ok(Box::new(NativeRuntimeStorageWriteSession {
+            targetPath,
+            temporaryPath,
+            file: Some(file),
+        }))
+    }
+
+    /// Creates a unique sibling path used while one storage file is streamed.
+    fn writeTemporaryPath(targetPath: &Path) -> HostResult<PathBuf> {
+        let parent = targetPath
+            .parent()
+            .ok_or_else(|| HostError::new("Runtime storage file has no parent directory"))?;
+        let fileName = targetPath
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| HostError::new("Runtime storage file has an invalid name"))?;
+        Ok(parent.join(format!(".{fileName}.{}.partial", uuid::Uuid::new_v4())))
+    }
+}
+
+impl RuntimeStorageWriteHost for NativeRuntimeStorageHost {
+    /// Opens one private streaming write session for a validated storage path.
+    fn createWriteSession(&self, path: &str) -> HostResult<Box<dyn RuntimeStorageWriteSession>> {
+        self.createWriteSessionInternal(path, false)
+    }
+}
+
+impl RuntimeStorageHost for NativeRuntimeStorageHost {
+    fn openWriteSession(&self, path: &str) -> HostResult<Option<Box<dyn operit_host_contract::RuntimeStorageWriteSession>>> {
+        Ok(Some(self.createWriteSessionInternal(path, false)?))
+    }
+
+    fn openTransactionDatabase(&self, path: &str) -> operit_host_contract::HostResult<Box<dyn operit_host_contract::RuntimeSqliteConnection>> {
+        RuntimeSqliteHost::openSqliteDatabase(self, path)
+    }
+
+    fn runtimeRootDir(&self) -> Option<PathBuf> {
+        Some(self.runtimeRoot.clone())
+    }
+
+    fn workspaceRootDir(&self) -> Option<PathBuf> {
+        Some(self.workspaceRoot.clone())
+    }
+
+    fn readBytes(&self, path: &str) -> HostResult<Vec<u8>> {
+        let resolved = self.resolveFile(path)?;
+        fs::read(&resolved).map_err(|error| storageIoError("Read storage file", &resolved, error))
+    }
+
+    /// Reads one bounded byte range from native runtime storage.
+    fn readBytesRange(&self, path: &str, offset: u64, length: usize) -> HostResult<Vec<u8>> {
+        let resolved = self.resolveFile(path)?;
+        let mut file = fs::File::open(&resolved).map_err(|error| storageIoError("Open storage file", &resolved, error))?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut bytes = vec![0; length];
+        let count = file.read(&mut bytes)?;
+        bytes.truncate(count);
+        Ok(bytes)
+    }
+
+    fn writeBytes(&self, path: &str, content: &[u8]) -> HostResult<()> {
+        let mut session = self.createWriteSession(path)?;
+        session.writeChunk(content)?;
+        session.commitFast()
+    }
+
+    /// Reads native file metadata without opening or hashing file contents.
+    fn modifiedAt(&self, path: &str) -> HostResult<i64> {
+        let resolved = self.resolveFile(path)?;
+        let time = fs::metadata(&resolved).and_then(|metadata| metadata.modified())
+            .map_err(|error| storageIoError("Read storage metadata", &resolved, error))?;
+        let elapsed = time.duration_since(std::time::UNIX_EPOCH).map_err(|e| HostError::new(e.to_string()))?;
+        i64::try_from(elapsed.as_micros()).map_err(|e| HostError::new(e.to_string()))
+    }
+
+    /// Preserves the source modification time on every native platform.
+    fn setModifiedAt(&self, path: &str, modifiedAt: i64) -> HostResult<()> {
+        let micros = u64::try_from(modifiedAt).map_err(|e| HostError::new(e.to_string()))?;
+        let file = fs::OpenOptions::new().write(true).open(self.resolveFile(path)?)?;
+        file.set_times(fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_micros(micros)))?;
+        Ok(())
+    }
+
+    /// Flushes and atomically replaces an identity-private catalog.
+    fn writeBytesAtomically(&self, path: &str, content: &[u8]) -> HostResult<()> {
+        let mut session = self.createWriteSessionInternal(path, true)?;
+        session.writeChunk(content)?;
+        session.commit()
+    }
+
+    /// Appends bytes to a native runtime storage file.
+    fn appendBytes(&self, path: &str, content: &[u8]) -> HostResult<()> {
+        let path = self.resolveFile(path)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        file.write_all(content)?;
+        Ok(())
+    }
+
+    fn flushFile(&self, path: &str) -> HostResult<()> {
+        self.flushFiles(&[path])
+    }
+
+    fn flushFiles(&self, paths: &[&str]) -> HostResult<()> {
+        for path in paths {
+            fs::OpenOptions::new().write(true).open(self.resolveFile(path)?)?.sync_all()?;
+        }
+        self.flushDirectories(paths)
+    }
+
+    fn flushDirectories(&self, paths: &[&str]) -> HostResult<()> {
+        let mut parents = BTreeSet::new();
+        for path in paths {
+            let path = self.resolveFile(path)?;
+            if let Some(parent) = path.parent() { parents.insert(parent.to_path_buf()); }
+        }
+        #[cfg(unix)]
+        for parent in parents { fs::File::open(parent)?.sync_all()?; }
+        Ok(())
+    }
+
+    fn delete(&self, path: &str, recursive: bool) -> HostResult<()> {
+        let path = self.resolveFile(path)?;
+        if !path.try_exists().map_err(|error| storageIoError("Inspect storage deletion target", &path, error))? {
+            return Ok(());
+        }
+        if path.is_dir() {
+            if recursive {
+                fs::remove_dir_all(path)?;
+            } else {
+                fs::remove_dir(path)?;
+            }
+        } else {
+            fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    fn exists(&self, path: &str) -> HostResult<bool> {
+        let resolved = self.resolve(path)?;
+        if self.managedRoot(path)?.is_some() {
+            // A dangling link is still an occupied destination, never a new writable file.
+            return match fs::symlink_metadata(&resolved) {
+                Ok(_) => Ok(true),
+                // A former descendant also ceases to exist when its parent
+                // directory has been replaced by a regular file.
+                Err(error) if matches!(error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => Ok(false),
+                Err(error) => Err(storageIoError("Inspect storage path", &resolved, error)),
+            };
+        }
+        resolved.try_exists().map_err(|error| storageIoError("Inspect storage path", &resolved, error))
+    }
+
+    /// Lists children in the requested namespace, including overlapping physical roots.
+    fn list(&self, prefix: &str) -> HostResult<Vec<RuntimeStorageEntry>> {
+        let storagePrefix = normalizeStoragePath(prefix)?.join("/");
+        let directory = self.resolve(prefix)?;
+        let mut entries = Vec::new();
+        let managedRoot = self.managedRoot(prefix)?;
+        let managedWorkspace = managedRoot.is_some();
+        if let Some(root) = managedRoot {
+            // Never descend into links, even when a caller lists a linked directory directly.
+            // The configured workspace root itself is trusted; only its descendants are scanned.
+            let relative = directory.strip_prefix(root)
+                .map_err(|_| HostError::new("Workspace listing escaped its root"))?;
+            let mut current = root.to_path_buf();
+            for component in relative.components() {
+                current.push(component);
+                match fs::symlink_metadata(&current) {
+                    Ok(metadata) if isStorageLink(&metadata) => return Ok(entries),
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(entries),
+                    Err(error) => return Err(storageIoError("Inspect storage directory", &current, error)),
+                }
+            }
+        }
+        if !directory.try_exists().map_err(|error| storageIoError("Inspect storage directory", &directory, error))? {
+            return Ok(entries);
+        }
+        for entry in fs::read_dir(&directory).map_err(|error| storageIoError("List storage directory", &directory, error))? {
+            let entry = entry.map_err(|error| storageIoError("Read storage directory entry", &directory, error))?;
+            // The atomic writer stages a private sibling until commit; a killed
+            // process leaves it behind and no listing may ever publish it.
+            let name = entry.file_name();
+            if isPartialStagingFile(&name.to_string_lossy()) {
+                continue;
+            }
+            // A POSIX backslash is a literal filename character. Shared paths reject
+            // it for Windows portability; never turn it into an invented directory.
+            if managedWorkspace && name.to_string_lossy().contains('\\') {
+                continue;
+            }
+            let metadata = if managedWorkspace {
+                let metadata = match fs::symlink_metadata(entry.path()) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(storageIoError("Inspect storage entry", &entry.path(), error)),
+                };
+                // Do not copy link targets or try reading sockets, devices and FIFOs as files.
+                if isStorageLink(&metadata) || (!metadata.is_dir() && !metadata.is_file()) {
+                    continue;
+                }
+                metadata
+            } else {
+                entry.metadata().map_err(|error| storageIoError("Inspect storage entry", &entry.path(), error))?
+            };
+            entries.push(RuntimeStorageEntry {
+                path: prefixedPath(&storagePrefix, Path::new(&name)),
+                isDirectory: metadata.is_dir(),
+                size: metadata.len() as i64,
+            });
+        }
+        Ok(entries)
+    }
+}
+
+/// Detects the atomic writer's private `.{name}.{uuid}.partial` staging siblings.
+#[allow(non_snake_case)]
+fn isPartialStagingFile(name: &str) -> bool {
+    name.starts_with('.')
+        && name
+            .strip_suffix(".partial")
+            .and_then(|stem| stem.rsplit_once('.'))
+            .is_some_and(|(_, id)| uuid::Uuid::parse_str(id).is_ok())
+}
+
+/// Detects symbolic links and Windows junctions without resolving their targets.
+#[allow(non_snake_case)]
+fn isStorageLink(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        return metadata.file_attributes() & 0x400 != 0; // FILE_ATTRIBUTE_REPARSE_POINT
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+/// Publishes a closed staging file through the Host's platform-specific atomic replacement.
+#[allow(non_snake_case)]
+pub fn publishStagedFile(source: &Path, target: &Path, sync: bool) -> HostResult<()> {
+    atomicReplace(source, target)?;
+    if sync { syncParentDirectory(target)?; }
+    Ok(())
+}
+
+/// Persists the directory entry published by a durable write or journal append.
+#[allow(non_snake_case)]
+fn syncParentDirectory(path: &Path) -> HostResult<()> {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+/// Atomically publishes one sibling staging file over its target path.
+#[cfg(not(windows))]
+#[allow(non_snake_case)]
+fn atomicReplace(source: &Path, target: &Path) -> HostResult<()> {
+    fs::rename(source, target)?;
+    Ok(())
+}
+
+/// Atomically publishes one sibling staging file over its target path on Windows.
+#[cfg(windows)]
+#[allow(non_snake_case)]
+fn atomicReplace(source: &Path, target: &Path) -> HostResult<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let sourcePath = windowsExtendedPath(source)?;
+    let targetPath = windowsExtendedPath(target)?;
+    let source = widePath(sourcePath.as_os_str());
+    let target = widePath(targetPath.as_os_str());
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            target.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+/// Converts a storage path into the representation required by local file APIs.
+#[cfg(not(windows))]
+#[allow(non_snake_case)]
+fn storageFsPath(path: &Path) -> HostResult<PathBuf> {
+    Ok(path.to_path_buf())
+}
+
+/// Converts a storage path into extended-length Windows syntax for local file APIs.
+#[cfg(windows)]
+#[allow(non_snake_case)]
+fn storageFsPath(path: &Path) -> HostResult<PathBuf> {
+    windowsExtendedPath(path)
+}
+
+/// Converts one Windows path to extended-length syntax.
+#[cfg(windows)]
+#[allow(non_snake_case)]
+fn windowsExtendedPath(path: &Path) -> HostResult<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let text = absolute.to_string_lossy().replace('/', "\\");
+    if text.starts_with(r"\\?\") || text.starts_with(r"\??\") {
+        return Ok(absolute);
+    }
+    if text.starts_with(r"\\") {
+        return Ok(PathBuf::from(format!(
+            r"\\?\UNC\{}",
+            text.trim_start_matches('\\')
+        )));
+    }
+    Ok(PathBuf::from(format!(r"\\?\{}", text)))
+}
+
+/// Encodes one Windows path as a null-terminated UTF-16 string.
+#[cfg(windows)]
+#[allow(non_snake_case)]
+fn widePath(path: &OsStr) -> Vec<u16> {
+    path.encode_wide().chain(std::iter::once(0)).collect()
+}
+
+/// Resolves the legacy secure storage namespace beside the runtime root.
+fn legacySecurePath(runtimeRoot: &Path, segments: &[&str]) -> HostResult<PathBuf> {
+    let mut resolved = runtimeRoot.parent().map(Path::to_path_buf).ok_or_else(|| {
+        HostError::new(format!(
+            "Runtime root has no parent for secure storage: {}",
+            runtimeRoot.display()
+        ))
+    })?;
+    resolved.push("secure");
+    for segment in segments {
+        resolved.push(segment);
+    }
+    Ok(resolved)
+}
+
+/// Adds the physical operation path while preserving the system error classification.
+fn storageIoError(operation: &str, path: &Path, error: std::io::Error) -> HostError {
+    let mut error = HostError::from(error);
+    error.message = format!("{operation} {}: {}", path.display(), error.message);
+    error
+}
+
+/// Normalizes a runtime storage path into safe relative segments.
+fn normalizeStoragePath(path: &str) -> HostResult<Vec<String>> {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        return Err(HostError::new(format!(
+            "Runtime storage path must be relative: {}",
+            path.display()
+        )));
+    }
+    let mut segments = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(segment) => segments.push(segment.to_string_lossy().to_string()),
+            Component::CurDir => {}
+            _ => {
+                return Err(HostError::new(format!(
+                    "Invalid runtime storage path: {}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(segments)
+}
+
+/// Joins normalized storage path segments under a physical root.
+fn joinSegments(root: &Path, segments: &[&str]) -> PathBuf {
+    let mut resolved = root.to_path_buf();
+    for segment in segments {
+        resolved.push(segment);
+    }
+    resolved
+}
+
+/// Builds a storage path prefixed with its virtual top-level root.
+fn prefixedPath(prefix: &str, relative: &Path) -> String {
+    let relative = relative.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>().join("/");
+    if relative.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}/{relative}")
+    }
+}
+
+/// Opens a SQLite database under the native runtime storage root.
+impl RuntimeSqliteHost for NativeRuntimeStorageHost {
+    fn runtimeStorage(&self) -> Option<std::sync::Arc<dyn RuntimeStorageHost>> { Some(std::sync::Arc::new(self.clone())) }
+
+    fn openSqliteDatabase(&self, path: &str) -> HostResult<Box<dyn RuntimeSqliteConnection>> {
+        let path = self.resolve(path)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let connection =
+            rusqlite::Connection::open(path).map_err(|error| HostError::new(error.to_string()))?;
+        Ok(Box::new(RusqliteRuntimeConnection { connection }))
+    }
+}
+
+struct RusqliteRuntimeConnection {
+    connection: rusqlite::Connection,
+}
+
+macro_rules! sqlite_access {
+    ($field:ident) => {
+    fn execute(&mut self, sql: &str, params: Vec<SqliteValue>) -> HostResult<usize> {
+        let params = params.into_iter().map(toRusqliteValue).collect::<Vec<_>>();
+        self.$field
+            .execute(sql, rusqlite::params_from_iter(params))
+            .map_err(|error| HostError::new(error.to_string()))
+    }
+
+    fn query(&mut self, sql: &str, params: Vec<SqliteValue>) -> HostResult<Vec<SqliteRow>> {
+        queryRowsConnection(&self.$field, sql, params)
+    }
+
+    fn columnSize(&mut self,table:&str,column:&str,row:i64)->HostResult<usize> {
+        self.$field.blob_open(rusqlite::DatabaseName::Main,table,column,row,true).map(|blob|blob.len()).map_err(|e|HostError::new(e.to_string()))
+    }
+
+    fn readColumnRange(&mut self, table:&str, column:&str, row:i64, offset:usize, length:usize) -> HostResult<Vec<u8>> {
+        let blob=self.$field.blob_open(rusqlite::DatabaseName::Main,table,column,row,true).map_err(|e|HostError::new(e.to_string()))?;
+        let mut bytes=vec![0;length.min(blob.len().saturating_sub(offset))];
+        if !bytes.is_empty() { blob.read_at_exact(&mut bytes,offset).map_err(|e|HostError::new(e.to_string()))?; }
+        Ok(bytes)
+    }
+
+    fn visitRows(&mut self, sql:&str, params:Vec<SqliteValue>, visitor:&mut dyn FnMut(SqliteRow)->HostResult<()>) -> HostResult<()> {
+        let limit=rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH;
+        let previous=self.$field.set_limit(limit,9*1024*1024);
+        let result=(|| {
+            let params=params.into_iter().map(toRusqliteValue).collect::<Vec<_>>();
+            let mut statement=self.$field.prepare_cached(sql).map_err(|e|HostError::new(e.to_string()))?;
+            visitRows(&mut statement,params,visitor)
+        })();
+        self.$field.set_limit(limit,previous);
+        result
+    }
+
+    fn lastInsertRowId(&self) -> HostResult<i64> {
+        Ok(self.$field.last_insert_rowid())
+    }
+
+    };
+}
+
+impl RuntimeSqliteConnection for RusqliteRuntimeConnection {
+    fn executeBatch(&mut self, sql: &str) -> HostResult<()> {
+        self.connection
+            .execute_batch(sql)
+            .map_err(|error| HostError::new(error.to_string()))
+    }
+
+    sqlite_access!(connection);
+
+    fn beginTransaction(&mut self) -> HostResult<Box<dyn RuntimeSqliteTransaction + '_>> {
+        let transaction = self
+            .connection
+            // Reserve the writer before reading. Deferred read-then-write
+            // transactions can deadlock with another plugin connection and
+            // return SQLITE_BUSY immediately instead of using the busy timeout.
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| HostError::new(error.to_string()))?;
+        Ok(Box::new(RusqliteRuntimeTransaction { transaction }))
+    }
+}
+
+struct RusqliteRuntimeTransaction<'a> {
+    transaction: rusqlite::Transaction<'a>,
+}
+
+impl RuntimeSqliteTransaction for RusqliteRuntimeTransaction<'_> {
+    sqlite_access!(transaction);
+
+    fn commit(self: Box<Self>) -> HostResult<()> {
+        self.transaction
+            .commit()
+            .map_err(|error| HostError::new(error.to_string()))
+    }
+
+    /// Aborts the exact native host transaction and propagates SQLite rollback errors.
+    fn rollback(self: Box<Self>) -> HostResult<()> {
+        self.transaction
+            .rollback()
+            .map_err(|error| HostError::new(error.to_string()))
+    }
+}
+
+/// Reuses a connection-owned prepared query while keeping each row result owned.
+fn queryRowsConnection(
+    connection: &rusqlite::Connection,
+    sql: &str,
+    params: Vec<SqliteValue>,
+) -> HostResult<Vec<SqliteRow>> {
+    let params = params.into_iter().map(toRusqliteValue).collect::<Vec<_>>();
+    let mut statement = connection
+        .prepare_cached(sql)
+        .map_err(|error| HostError::new(error.to_string()))?;
+    let mut rows = Vec::new();
+    visitRows(&mut statement, params, &mut |row| { rows.push(row); Ok(()) })?;
+    Ok(rows)
+}
+
+fn visitRows(
+    statement: &mut rusqlite::Statement<'_>,
+    params: Vec<Value>,
+    visitor: &mut dyn FnMut(SqliteRow) -> HostResult<()>,
+) -> HostResult<()> {
+    let columns = statement
+        .column_names()
+        .into_iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let mut rows = statement
+        .query(rusqlite::params_from_iter(params))
+        .map_err(|error| HostError::new(error.to_string()))?;
+    while let Some(row) = rows
+        .next()
+        .map_err(|error| HostError::new(error.to_string()))?
+    {
+        let mut values = Vec::new();
+        for index in 0..columns.len() {
+            let value = row
+                .get::<_, Value>(index)
+                .map_err(|error| HostError::new(error.to_string()))?;
+            values.push(fromRusqliteValue(value));
+        }
+        visitor(SqliteRow {
+            columns: columns.clone(),
+            values,
+        })?;
+    }
+    Ok(())
+}
+
+fn toRusqliteValue(value: SqliteValue) -> Value {
+    match value {
+        SqliteValue::Null => Value::Null,
+        SqliteValue::Integer(value) => Value::Integer(value),
+        SqliteValue::Real(value) => Value::Real(value),
+        SqliteValue::Text(value) => Value::Text(value),
+        SqliteValue::Blob(value) => Value::Blob(value),
+    }
+}
+
+fn fromRusqliteValue(value: Value) -> SqliteValue {
+    match value {
+        Value::Null => SqliteValue::Null,
+        Value::Integer(value) => SqliteValue::Integer(value),
+        Value::Real(value) => SqliteValue::Real(value),
+        Value::Text(value) => SqliteValue::Text(value),
+        Value::Blob(value) => SqliteValue::Blob(value),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+    use std::time::{Duration, SystemTime};
+
+    use operit_host_contract::{ArchiveStagingHost, RuntimeStorageHost, RuntimeStorageWriteHost};
+
+    use super::{NativeArchiveStagingHost, NativeRuntimeStorageHost};
+
+    /// Listings retain the requested namespace when physical storage roots overlap.
+    #[test]
+    fn listings_preserve_namespaces_for_overlapping_roots() {
+        let root = std::env::temp_dir().join(format!("operit-storage-roots-{}", uuid::Uuid::new_v4()));
+        for (name, runtime, workspace) in [
+            ("equal", "shared", "shared"),
+            ("workspace-in-runtime", "shared", "shared/workspaces"),
+            ("runtime-in-workspace", "shared/runtime", "shared"),
+            ("secure-is-workspace", "runtime", "secure"),
+        ] {
+            let base = root.join(name);
+            let host = NativeRuntimeStorageHost::new(base.join(runtime), base.join(workspace));
+            for namespace in ["runtime", "workspaces", "secure"] {
+                host.writeBytes(&format!("{namespace}/project/{namespace}.txt"), namespace.as_bytes()).unwrap();
+            }
+            for namespace in ["runtime", "workspaces", "secure"] {
+                let directories = host.list(namespace).unwrap();
+                assert!(directories.iter().any(|entry| entry.path == format!("{namespace}/project")), "{name}: {directories:?}");
+                assert!(directories.iter().all(|entry| entry.path.starts_with(&format!("{namespace}/"))), "{name}: {directories:?}");
+                let prefix = format!("{namespace}/project");
+                let files = host.list(&format!("./{prefix}//")).unwrap();
+                assert!(!files.is_empty());
+                for entry in files {
+                    assert!(entry.path.starts_with(&format!("{prefix}/")), "{name}: {}", entry.path);
+                    let file = Path::new(&entry.path).file_stem().unwrap().to_str().unwrap();
+                    assert_eq!(host.readBytes(&entry.path).unwrap(), file.as_bytes(), "{name}: {}", entry.path);
+                }
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Literal POSIX backslashes stay filename characters outside the portable sync tree.
+    #[cfg(unix)]
+    #[test]
+    fn posix_filename_backslashes_are_not_rewritten_as_storage_separators() {
+        let root = std::env::temp_dir().join(format!("operit-posix-path-{}", uuid::Uuid::new_v4()));
+        let host = NativeRuntimeStorageHost::new(root.join("runtime"), root.join("workspaces"));
+        let path = r"runtime/cache/system-systemd\x2dcryptsetup.slice";
+        host.writeBytes(path, b"original").unwrap();
+        let entries = host.list("runtime/cache").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, path);
+        assert_eq!(host.readBytes(&entries[0].path).unwrap(), b"original");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Transactions reserve their writer before reads so independent plugin
+    /// connections cannot deadlock while upgrading a read lock to a write lock.
+    #[test]
+    fn sqlite_transactions_reserve_the_writer_before_reading() {
+        use operit_host_contract::RuntimeSqliteHost;
+        let root =
+            std::env::temp_dir().join(format!("operit-sqlite-lock-{}", uuid::Uuid::new_v4()));
+        let host = NativeRuntimeStorageHost::new(root.join("runtime"), root.join("workspaces"));
+        let mut first = host
+            .openSqliteDatabase("runtime/plugins/shared.db")
+            .unwrap();
+        let mut second = host
+            .openSqliteDatabase("runtime/plugins/shared.db")
+            .unwrap();
+        first
+            .executeBatch("CREATE TABLE data(value INTEGER)")
+            .unwrap();
+        second.executeBatch("PRAGMA busy_timeout = 0").unwrap();
+        let mut transaction = first.beginTransaction().unwrap();
+        transaction.query("SELECT * FROM data", vec![]).unwrap();
+        assert!(
+            second.beginTransaction().is_err(),
+            "a second writer must contend before reading"
+        );
+        transaction
+            .execute("INSERT INTO data VALUES(1)", vec![])
+            .unwrap();
+        transaction.commit().unwrap();
+        let mut transaction = second.beginTransaction().unwrap();
+        assert_eq!(
+            transaction
+                .query("SELECT * FROM data", vec![])
+                .unwrap()
+                .len(),
+            1
+        );
+        transaction
+            .execute("INSERT INTO data VALUES(2)", vec![])
+            .unwrap();
+        transaction.commit().unwrap();
+        drop(first);
+        drop(second);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Verifies that snapshot outputs grow, accept ZIP header updates, and expose sealed files.
+    #[test]
+    fn snapshot_export_is_file_backed_and_seekable() {
+        let root = std::env::temp_dir().join(format!("operit-snapshot-export-{}", uuid::Uuid::new_v4()));
+        let host = NativeArchiveStagingHost::new(root.join("runtime"));
+        host.createExportArchive("snapshot").unwrap();
+        assert!(host.archiveFileReference("snapshot").is_err());
+        assert!(host.appendArchive("snapshot", b"invalid").is_err());
+        let chunk = vec![42; 64 * 1024];
+        for index in 0..16 {
+            host.writeExportArchive("snapshot", index * chunk.len() as u64, &chunk).unwrap();
+        }
+        host.writeExportArchive("snapshot", 0, b"PK").unwrap();
+        assert_eq!(host.sealArchive("snapshot").unwrap(), 16 * chunk.len() as u64);
+        assert_eq!(host.readArchive("snapshot", 0, 4).unwrap(), [b'P', b'K', 42, 42]);
+        let reference = host.archiveFileReference("snapshot").unwrap();
+        assert_eq!(fs::metadata(&reference).unwrap().len(), 16 * chunk.len() as u64);
+        assert!(host.writeExportArchive("snapshot", 0, b"invalid").is_err());
+        host.removeArchive("snapshot").unwrap();
+        assert!(!std::path::Path::new(&reference).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Rejects oversized export writes and keeps exact-length upload validation unchanged.
+    #[test]
+    fn snapshot_export_rejects_invalid_writes_without_changing_upload_contracts() {
+        let root = std::env::temp_dir().join(format!("operit-snapshot-ranges-{}", uuid::Uuid::new_v4()));
+        let host = NativeArchiveStagingHost::new(root.join("runtime"));
+        host.createExportArchive("snapshot").unwrap();
+        assert!(host.writeExportArchive("snapshot", 1, b"gap").is_err());
+        assert!(host.writeExportArchive("snapshot", 0, &vec![0; 65537]).is_err());
+        assert_eq!(host.sealArchive("snapshot").unwrap(), 0);
+        host.createArchive("upload", 4).unwrap();
+        assert!(host.writeExportArchive("upload", 0, b"data").is_err());
+        host.appendArchive("upload", b"ab").unwrap();
+        assert!(host.sealArchive("upload").is_err());
+        host.appendArchive("upload", b"cd").unwrap();
+        assert_eq!(host.sealArchive("upload").unwrap(), 4);
+        host.removeArchive("snapshot").unwrap();
+        host.removeArchive("upload").unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_file_listing_skips_file_directory_broken_and_cyclic_links() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("operit-managed-links-{}", uuid::Uuid::new_v4()));
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), b"local only").unwrap();
+        let host = NativeRuntimeStorageHost::new(root.join("runtime"), root.join("workspaces"));
+        for prefix in ["workspaces", "runtime/data/chat_outputs", "runtime/data/chat_attachments", "runtime/data/attachment_sources"] {
+            let managed = root.join(prefix);
+            let body = managed.join("project");
+            fs::create_dir_all(&body).unwrap();
+            fs::write(body.join("normal.txt"), b"portable").unwrap();
+            symlink(outside.join("secret.txt"), body.join("file-link")).unwrap();
+            symlink(&outside, body.join("directory-link")).unwrap();
+            symlink(&body, body.join("loop")).unwrap();
+            symlink(body.join("missing"), body.join("broken-link")).unwrap();
+            symlink(&outside, managed.join("linked-directory")).unwrap();
+            let entries = host.list(&format!("{prefix}/project")).unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].path, format!("{prefix}/project/normal.txt"));
+            assert_eq!(host.list(prefix).unwrap().len(), 1);
+            for suffix in ["project/loop", "project/loop/loop", "project/directory-link", "linked-directory"] {
+                let path = format!("{prefix}/{suffix}");
+                assert!(host.list(&path).unwrap().is_empty(), "{path}");
+            }
+            for suffix in ["project/file-link", "project/directory-link/new.txt", "project/broken-link"] {
+                assert!(host.writeBytes(&format!("{prefix}/{suffix}"), b"overwrite").is_err());
+            }
+            let link = format!("{prefix}/project/file-link");
+            assert!(host.readBytes(&link).is_err());
+            assert!(host.readBytesRange(&link, 0, 4).is_err());
+            assert!(!outside.join("new.txt").exists());
+            assert_eq!(fs::read(outside.join("secret.txt")).unwrap(), b"local only");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Hides active write sessions in every namespace until commit and preserves the old file on discard.
+    #[test]
+    fn listings_publish_only_committed_atomic_writes() {
+        let root =
+            std::env::temp_dir().join(format!("operit-storage-stage-{}", uuid::Uuid::new_v4()));
+        let host = NativeRuntimeStorageHost::new(root.join("runtime"), root.join("workspaces"));
+        for prefix in [
+            "runtime/space/members",
+            "workspaces/project",
+            "secure/catalogs",
+        ] {
+            let path = format!("{prefix}/data.txt");
+            let mut session = host.createWriteSession(&path).unwrap();
+            session.writeChunk(b"original").unwrap();
+            assert!(host.list(prefix).unwrap().is_empty());
+            session.commit().unwrap();
+            let mut replacement = host.createWriteSession(&path).unwrap();
+            replacement.writeChunk(b"replacement").unwrap();
+            let files = host.list(prefix).unwrap();
+            assert_eq!(files.len(), 1);
+            assert_eq!(files[0].path, path);
+            assert_eq!(host.readBytes(&path).unwrap(), b"original");
+            replacement.discard().unwrap();
+            assert_eq!(host.list(prefix).unwrap().len(), 1);
+            assert_eq!(host.readBytes(&path).unwrap(), b"original");
+            let mut batched = host.createWriteSession(&path).unwrap();
+            batched.writeChunk(b"batched replacement").unwrap();
+            batched.commitFile().unwrap();
+            host.flushDirectories(&[&path]).unwrap();
+            assert_eq!(host.readBytes(&path).unwrap(), b"batched replacement");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Hides only the reserved staging grammar and leaves all physical entries untouched during listing.
+    #[test]
+    fn listings_hide_abandoned_staging_without_hiding_committed_dotfiles() {
+        let root =
+            std::env::temp_dir().join(format!("operit-storage-orphan-{}", uuid::Uuid::new_v4()));
+        let host = NativeRuntimeStorageHost::new(root.join("runtime"), root.join("workspaces"));
+        for prefix in [
+            "runtime/space/topology",
+            "workspaces/project",
+            "secure/catalogs",
+        ] {
+            let names = [
+                "record.preferences.json",
+                ".hidden.preferences.json",
+                "record.partial",
+                ".record.invalid.partial",
+                "record.3d75c4a5-2e81-4d0a-8f85-11ee23df1e79.partial",
+            ];
+            for name in names {
+                host.writeBytes(&format!("{prefix}/{name}"), b"{}").unwrap();
+            }
+            let staging = host
+                .resolve(prefix)
+                .unwrap()
+                .join(".record.preferences.json.3d75c4a5-2e81-4d0a-8f85-11ee23df1e79.partial");
+            fs::write(&staging, b"uncommitted").unwrap();
+            let mut paths = host
+                .list(prefix)
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.path)
+                .collect::<Vec<_>>();
+            paths.sort();
+            let mut expected = names.map(|name| format!("{prefix}/{name}")).to_vec();
+            expected.sort();
+            assert_eq!(paths, expected);
+            assert!(staging.exists(), "Listing must not delete a staging file");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Verifies that a native staged archive rejects excess bytes and seals only at its declared length.
+    #[test]
+    fn archive_staging_enforces_declared_length() {
+        let root =
+            std::env::temp_dir().join(format!("operit-archive-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("temporary archive test root must be created");
+        let host = NativeArchiveStagingHost::new(root.clone());
+        let stagingRoot = host.stagingRoot();
+
+        host.createArchive("archive", 4)
+            .expect("archive must be created");
+        host.appendArchive("archive", b"ab")
+            .expect("first archive chunk must append");
+        assert!(host.appendArchive("archive", b"cde").is_err());
+        assert!(host.sealArchive("archive").is_err());
+
+        host.appendArchive("archive", b"cd")
+            .expect("final archive chunk must append");
+        assert_eq!(host.sealArchive("archive").expect("archive must seal"), 4);
+        assert_eq!(
+            host.readArchive("archive", 0, 4)
+                .expect("sealed archive must be readable"),
+            b"abcd"
+        );
+
+        host.removeArchive("archive")
+            .expect("sealed archive must be removed");
+        fs::remove_dir_all(root).expect("temporary archive test root must be removed");
+        fs::remove_dir_all(stagingRoot).expect("temporary archive staging root must be removed");
+    }
+
+    /// Removes unfinished and sealed archives only when the final shared Host owner closes.
+    #[test]
+    fn archive_staging_lifetime_removes_files_after_last_owner() {
+        let root = std::env::temp_dir().join(format!("operit-archive-lifetime-{}", uuid::Uuid::new_v4()));
+        let host = NativeArchiveStagingHost::new(root.join("runtime"));
+        let shared = host.clone();
+        host.createExportArchive("sealed").unwrap();
+        host.writeExportArchive("sealed", 0, b"archive payload").unwrap();
+        host.sealArchive("sealed").unwrap();
+        host.createArchive("unfinished", 100).unwrap();
+        host.appendArchive("unfinished", b"partial").unwrap();
+        let sealed = host.sealedArchivePath("sealed").unwrap();
+        let unfinished = host.uploadingArchivePath("unfinished").unwrap();
+        drop(host);
+        assert!(sealed.exists());
+        assert!(unfinished.exists());
+        drop(shared);
+        assert!(!sealed.exists());
+        assert!(!unfinished.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Collects interrupted archives while preserving an independently leased active transfer.
+    #[test]
+    fn archive_staging_collects_abandoned_files_and_preserves_live_hosts() {
+        let root = std::env::temp_dir().join(format!("operit-archive-collection-{}", uuid::Uuid::new_v4()));
+        let active = NativeArchiveStagingHost::new(root.join("runtime"));
+        active.createExportArchive("active").unwrap();
+        active.writeExportArchive("active", 0, b"active payload").unwrap();
+        active.sealArchive("active").unwrap();
+        let staging = active.stagingRoot();
+        fs::write(staging.join("interrupted.upload"), b"interrupted payload").unwrap();
+        fs::write(staging.join("interrupted.lease"), b"").unwrap();
+        fs::write(staging.join("legacy.sealed"), b"legacy payload").unwrap();
+        fs::write(staging.join("orphan.lease"), b"").unwrap();
+        fs::write(staging.join("unrelated.txt"), b"preserved").unwrap();
+        let next = NativeArchiveStagingHost::new(root.join("runtime"));
+        next.createExportArchive("next").unwrap();
+        assert!(!staging.join("interrupted.upload").exists());
+        assert!(staging.join("legacy.sealed").exists());
+        next.cleanupAbandonedArchivesDuringMaintenance().unwrap();
+        assert!(!staging.join("legacy.sealed").exists());
+        assert!(!staging.join("orphan.lease").exists());
+        assert_eq!(active.readArchive("active", 0, 14).unwrap(), b"active payload");
+        assert_eq!(fs::read(staging.join("unrelated.txt")).unwrap(), b"preserved");
+        next.removeArchive("active").unwrap();
+        assert!(active.sealedArchivePath("active").unwrap().exists());
+        drop(next);
+        drop(active);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Reclaims expired unleased archives during transfers, including retired runtime owners.
+    #[test]
+    fn archive_staging_collects_expired_legacy_files_during_transfers() {
+        let root = std::env::temp_dir().join(format!("operit-archive-legacy-{}", uuid::Uuid::new_v4()));
+        let active = NativeArchiveStagingHost::new(root.join("runtime"));
+        active.createExportArchive("active").unwrap();
+        active.writeExportArchive("active", 0, b"active payload").unwrap();
+        active.sealArchive("active").unwrap();
+        let staging = active.stagingRoot();
+        let retired = staging.parent().unwrap().join("retired-identity");
+        fs::create_dir_all(&retired).unwrap();
+        let now = SystemTime::now();
+        let expired = now - Duration::from_secs(36 * 24 * 60 * 60);
+        let recent = now - Duration::from_secs(6 * 24 * 60 * 60);
+        let writeAt = |path: &Path, modified: SystemTime| {
+            fs::write(path, b"legacy payload").unwrap();
+            fs::OpenOptions::new().write(true).open(path).unwrap()
+                .set_times(fs::FileTimes::new().set_modified(modified)).unwrap();
+        };
+        writeAt(&staging.join("expired.upload"), expired);
+        writeAt(&retired.join("expired.sealed"), expired);
+        writeAt(&retired.join("recent.upload"), recent);
+        writeAt(&retired.join("future.upload"), now + Duration::from_secs(24 * 60 * 60));
+        writeAt(&retired.join("mixed.upload"), expired);
+        writeAt(&retired.join("mixed.sealed"), recent);
+        writeAt(&retired.join("unrelated.txt"), expired);
+        fs::OpenOptions::new().write(true).open(active.sealedArchivePath("active").unwrap()).unwrap()
+            .set_times(fs::FileTimes::new().set_modified(expired)).unwrap();
+        let next = NativeArchiveStagingHost::new(root.join("runtime"));
+        // Constructing a Host does not introduce startup collection.
+        assert!(staging.join("expired.upload").exists());
+        assert!(retired.join("expired.sealed").exists());
+        next.createArchive("next", 4).unwrap();
+        assert!(!staging.join("expired.upload").exists());
+        assert!(!staging.join("expired.lease").exists());
+        assert!(!retired.join("expired.sealed").exists());
+        assert!(!retired.join("expired.lease").exists());
+        for name in ["recent.upload", "future.upload", "mixed.upload", "mixed.sealed", "unrelated.txt"] {
+            assert!(retired.join(name).exists(), "{name}");
+        }
+        assert_eq!(active.readArchive("active", 0, 14).unwrap(), b"active payload");
+        next.cleanupAbandonedArchives().unwrap();
+        assert_eq!(active.readArchive("active", 0, 14).unwrap(), b"active payload");
+        next.appendArchive("next", b"test").unwrap();
+        next.sealArchive("next").unwrap();
+        assert_eq!(next.readArchive("next", 0, 4).unwrap(), b"test");
+        drop(next);
+        drop(active);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Keeps another process's live upload and export leased while reclaiming an abandoned archive.
+    #[test]
+    fn archive_staging_preserves_live_archives_across_processes() {
+        const ROOT_ENV: &str = "OPERIT_ARCHIVE_LIVE_TEST_ROOT";
+        if let Some(root) = std::env::var_os(ROOT_ENV) {
+            let host = NativeArchiveStagingHost::new(std::path::PathBuf::from(root).join("runtime"));
+            host.cleanupAbandonedArchivesDuringMaintenance().unwrap();
+            assert!(host.sealedArchivePath("active").unwrap().exists());
+            assert!(host.uploadingArchivePath("uploading").unwrap().exists());
+            assert!(!host.uploadingArchivePath("abandoned").unwrap().exists());
+            host.createArchive("child", 4).unwrap();
+            host.appendArchive("child", b"test").unwrap();
+            host.sealArchive("child").unwrap();
+            assert_eq!(host.readArchive("child", 0, 4).unwrap(), b"test");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("operit-archive-live-{}", uuid::Uuid::new_v4()));
+        let host = NativeArchiveStagingHost::new(root.join("runtime"));
+        host.createExportArchive("active").unwrap();
+        host.writeExportArchive("active", 0, b"live export").unwrap();
+        host.sealArchive("active").unwrap();
+        let expired = SystemTime::now() - Duration::from_secs(36 * 24 * 60 * 60);
+        fs::OpenOptions::new().write(true).open(host.sealedArchivePath("active").unwrap()).unwrap()
+            .set_times(fs::FileTimes::new().set_modified(expired)).unwrap();
+        host.createArchive("uploading", 100).unwrap();
+        host.appendArchive("uploading", b"live upload").unwrap();
+        fs::write(host.uploadingArchivePath("abandoned").unwrap(), b"abandoned").unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::archive_staging_preserves_live_archives_across_processes"])
+            .env(ROOT_ENV, &root).status().unwrap();
+        assert!(status.success());
+        assert_eq!(host.readArchive("active", 0, 11).unwrap(), b"live export");
+        assert_eq!(fs::read(host.uploadingArchivePath("uploading").unwrap()).unwrap(), b"live upload");
+        drop(host);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Reclaims files after a real child process exits without running Host destructors.
+    #[test]
+    fn archive_staging_collects_files_after_process_exit() {
+        const ROOT_ENV: &str = "OPERIT_ARCHIVE_EXIT_TEST_ROOT";
+        if let Some(root) = std::env::var_os(ROOT_ENV) {
+            let host = NativeArchiveStagingHost::new(std::path::PathBuf::from(root).join("runtime"));
+            host.createExportArchive("crashed").unwrap();
+            host.writeExportArchive("crashed", 0, b"persisted archive").unwrap();
+            host.sealArchive("crashed").unwrap();
+            host.createArchive("unfinished", 100).unwrap();
+            host.appendArchive("unfinished", b"partial archive").unwrap();
+            std::process::exit(0);
+        }
+        let root = std::env::temp_dir().join(format!("operit-archive-process-exit-{}", uuid::Uuid::new_v4()));
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::archive_staging_collects_files_after_process_exit"])
+            .env(ROOT_ENV, &root).status().unwrap();
+        assert!(status.success());
+        let host = NativeArchiveStagingHost::new(root.join("runtime"));
+        let sealed = host.sealedArchivePath("crashed").unwrap();
+        let unfinished = host.uploadingArchivePath("unfinished").unwrap();
+        assert!(sealed.exists());
+        assert!(unfinished.exists());
+        host.cleanupAbandonedArchives().unwrap();
+        assert!(!sealed.exists());
+        assert!(!unfinished.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Verifies that native runtime storage appends without rewriting earlier content.
+    #[test]
+    fn runtime_storage_appends_bytes() {
+        let root = std::env::temp_dir().join(format!(
+            "operit-runtime-storage-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let workspace_root = root.join("workspaces");
+        let host = NativeRuntimeStorageHost::new(root.clone(), workspace_root);
+
+        host.appendBytes("runtime/state/client.log", b"first\n")
+            .expect("first log entry must append");
+        host.appendBytes("runtime/state/client.log", b"second\n")
+            .expect("second log entry must append");
+
+        assert_eq!(
+            host.readBytes("runtime/state/client.log")
+                .expect("appended log must be readable"),
+            b"first\nsecond\n"
+        );
+
+        fs::remove_dir_all(root).expect("temporary runtime storage root must be removed");
+    }
+
+    /// Verifies staged runtime writes keep the previous file visible until atomic publication.
+    #[test]
+    fn runtime_storage_replaces_files_atomically() {
+        let root = std::env::temp_dir().join(format!(
+            "operit-runtime-storage-atomic-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let workspace_root = root.join("workspaces");
+        let host = NativeRuntimeStorageHost::new(root.clone(), workspace_root);
+        let path = "runtime/config/preferences/atomic.preferences.json";
+        host.writeBytes(path, b"previous")
+            .expect("initial file must be written");
+
+        let mut session = host
+            .createWriteSession(path)
+            .expect("replacement session must open");
+        session
+            .writeChunk(b"replacement")
+            .expect("replacement content must stage");
+        assert_eq!(
+            host.readBytes(path)
+                .expect("published file must remain readable while staging"),
+            b"previous"
+        );
+        session
+            .commitFast()
+            .expect("replacement content must publish atomically");
+        assert_eq!(
+            host.readBytes(path)
+                .expect("replacement file must be readable"),
+            b"replacement"
+        );
+
+        fs::remove_dir_all(root).expect("temporary runtime storage root must be removed");
+    }
+}

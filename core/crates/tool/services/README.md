@@ -1,0 +1,111 @@
+# operit-tools
+
+`operit-tools` owns the Operit2 tool system. Built-in tools, ToolPkg, MCP,
+skill packages, permission metadata, tool result data, and package execution
+surfaces live here.
+
+## Responsibilities
+
+- Register and execute built-in tools through `AIToolHandler`.
+- Define tool result data, tool execution parsing, permission metadata, and
+  tool access rules.
+- Own ToolPkg package loading, package manager behavior, package hook models,
+  and package resource helpers.
+- Capture Compose script and session requests as owned futures. `ToolPkgResourceReader`
+  performs archive and text-resource I/O after proxy dispatch releases the package manager.
+  It shares the existing cache lock and holds it through reads to serialize invalidation;
+  session publication rechecks the exact engine identity against concurrent context release.
+- Capture IPC state with `withReady` instead of cloning the runtime package manager.
+  IPC and public API calls load only their declared main entry through the revision-scoped
+  text cache. Cold calls decompress one entry and borrow immutable asset bytes; warm calls
+  reuse cached text. Full resource snapshots are loaded only when requested by UI sessions.
+  Both read forms share the same package slots and invalidation lifecycle. Resource I/O
+  runs outside the manager lock, and dispatch checks engine identity after loading.
+  Package reload and removal use the existing resource invalidation lifecycle.
+- Isolate every ToolPkg main-script registration in a temporary JavaScript engine so one package
+  cannot retain registration state or block later package scans.
+- Own MCP package models, MCP runtime repository code, MCP bridge helpers, and
+  MCP tool execution.
+- Own skill package models, skill manager behavior, and skill repository code.
+- Define child-crate interfaces for runtime-owned services in
+  `runtime_support.rs`.
+- Define the JS execution trait used by ToolPkg without owning the concrete JS
+  engine implementation.
+
+## Main Modules
+
+- `src/ToolExecutionManager.rs`: parses AI tool calls and coordinates tool
+  access checks.
+- `src/ConversationMarkupManager.rs`: parses and renders assistant/tool markup.
+- `src/runtime_support.rs`: tool-side contract implemented by
+  `operit-runtime`.
+- `src/tools/AIToolHandler.rs`: tool registry and tool invocation path.
+- `src/tools/ToolRegistration.rs`: built-in public and internal tool
+  registration.
+- `src/tools/defaultTool/`: standard file, HTTP, terminal, memory, browser,
+  system, Bluetooth, music, and web visit tools.
+- `src/tools/packTool/`: ToolPkg models, parsing, loading, manager, and hook
+  support.
+- `src/tools/mcp/` and `src/tools/mcp_runtime/`: MCP tool and runtime support.
+- `src/tools/skill/` and `src/tools/skill_runtime/`: skill package support.
+- `src/tools/javascript.rs`: `JsExecutionHost` support, package runtime adapters,
+  and the parent-injected `JsExecutionProvider` binding.
+
+## Runtime Support
+
+When tool code needs runtime-owned behavior, the interface is declared in this
+crate and implemented by `operit-runtime`. Examples include character-card tool
+access, bundled assets, environment variables, skill visibility, MCP
+description generation, chat operations, memory bindings, and structured file
+edits.
+
+## Boundary
+
+MCP and skill are part of this crate. Provider APIs are not tools and belong in
+`operit-providers`. The concrete JavaScript engine belongs in
+`operit-js-bridge`. This crate implements the SDK `JsExecutionHost` contract;
+the top-level runtime injects an SDK `JsExecutionProvider`.
+
+See `core/CRATE_BOUNDARIES.md` for the full dependency direction.
+
+## Concurrent Invocations
+
+All registered executors are `Send + Sync` services invoked through `&self`.
+The registry retains an `Arc` for each invocation and releases its own lock
+before validation, admission or execution. Calls with the same tool name can
+overlap, including nested package and CLI calls waiting on other chats.
+Arguments, captured caller context and results belong to each invocation.
+Resource services own synchronization for a specific terminal session, database
+handle or other mutable resource; the registry does not serialize entire tools.
+Replacing or removing a registration affects new calls while existing calls
+retain their original service. Built-in registration initializes once across
+concurrent callers. AI tool batches remain serial and preserve result order;
+scripts may dispatch multiple calls with `Promise.all`.
+
+## MCP Transport Lifecycle
+
+Remote MCP uses the HTTP Host for both POST responses and server event streams.
+Streamable HTTP opens its GET event channel after initialization; HTTP 405
+explicitly declares that the server does not provide this optional channel.
+An accepted HTTP 202 request waits for its matching JSON-RPC result on the
+existing channel under the original deadline. It never resends the tool POST.
+The POST stream is released after acknowledgment, and the GET stream belongs
+to the MCP session until that session closes.
+
+Local and remote tool discovery follow `nextCursor` through every page before
+marking a server ready. Repeated cursors, malformed pages and later-page errors
+fail initialization instead of publishing an incomplete tool catalog.
+
+## Finalized AI Tool Results
+
+`ToolExecutionManager` retains serial invocation ordering and aggregates each
+invocation's execution steps into one final result. `ToolExecutionBatch` formats
+those results once; the same finalized `message` is published to the chat stream
+and inserted into the next model request. Presentation adds only line boundaries.
+
+`MAX_SINGLE_TOOL_RESULT_MESSAGE_CHARS` bounds each serialized result, including
+its XML wrapper and explicit truncation marker, to 64,000 Unicode scalar values.
+Payload, wrapper, and marker use the same unit; UTF-8 byte lengths are diagnostic
+only. A batch retains every result in invocation order, including repeated tool
+names. There is no batch-wide truncation that can remove result slots. Request
+context-window admission remains the responsibility of conversation orchestration.

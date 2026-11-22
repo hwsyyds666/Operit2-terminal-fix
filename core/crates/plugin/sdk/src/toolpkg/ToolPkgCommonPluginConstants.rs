@@ -1,0 +1,148 @@
+pub const TOOLPKG_RUNTIME_COMPOSE_DSL: &str = "compose_dsl";
+
+pub const TOOLPKG_EVENT_APPLICATION_ON_CREATE: &str = "application_on_create";
+pub const TOOLPKG_EVENT_APPLICATION_ON_FOREGROUND: &str = "application_on_foreground";
+pub const TOOLPKG_EVENT_APPLICATION_ON_BACKGROUND: &str = "application_on_background";
+pub const TOOLPKG_EVENT_APPLICATION_ON_LOW_MEMORY: &str = "application_on_low_memory";
+pub const TOOLPKG_EVENT_APPLICATION_ON_TRIM_MEMORY: &str = "application_on_trim_memory";
+pub const TOOLPKG_EVENT_APPLICATION_ON_TERMINATE: &str = "application_on_terminate";
+pub const TOOLPKG_EVENT_ACTIVITY_ON_CREATE: &str = "activity_on_create";
+pub const TOOLPKG_EVENT_ACTIVITY_ON_START: &str = "activity_on_start";
+pub const TOOLPKG_EVENT_ACTIVITY_ON_RESUME: &str = "activity_on_resume";
+pub const TOOLPKG_EVENT_ACTIVITY_ON_PAUSE: &str = "activity_on_pause";
+pub const TOOLPKG_EVENT_ACTIVITY_ON_STOP: &str = "activity_on_stop";
+pub const TOOLPKG_EVENT_ACTIVITY_ON_DESTROY: &str = "activity_on_destroy";
+pub const TOOLPKG_EVENT_MESSAGE_PROCESSING: &str = "toolpkg_message_processing";
+pub const TOOLPKG_EVENT_XML_RENDER: &str = "toolpkg_xml_render";
+pub const TOOLPKG_EVENT_INPUT_MENU_TOGGLE: &str = "toolpkg_input_menu_toggle";
+pub const TOOLPKG_EVENT_CHAT_INPUT: &str = "toolpkg_chat_input";
+pub const TOOLPKG_EVENT_CHAT_VIEW: &str = "toolpkg_chat_view";
+/// Routes awaited text-only transformations without exposing structural message mutation.
+pub const TOOLPKG_EVENT_MESSAGE_TRANSFORM: &str = "toolpkg_message_transform";
+pub const TOOLPKG_EVENT_MESSAGE_STREAM_TRANSFORM: &str = "toolpkg_message_stream_transform";
+pub const TOOLPKG_REGISTRATION_MESSAGE_STREAM_TRANSFORM: &str = "ToolPkg.registerMessageStreamTransform";
+pub const TOOLPKG_REGISTRATION_MESSAGE_TRANSFORM_HOOK: &str = "ToolPkg.registerMessageTransformHook";
+pub const TOOLPKG_EVENT_CHAT_MESSAGE: &str = "toolpkg_chat_message";
+/// Routes the awaited generic conversation creation lifecycle envelope.
+pub const TOOLPKG_EVENT_CHAT_LIFECYCLE: &str = "toolpkg_chat_lifecycle";
+pub const TOOLPKG_EVENT_CHAT_MESSAGE_MENU_ITEM: &str = "toolpkg_chat_message_menu_item";
+pub const TOOLPKG_EVENT_CHAT_RUNTIME: &str = "toolpkg_chat_runtime";
+pub const TOOLPKG_EVENT_NAVIGATION_ENTRY_ACTION: &str = "toolpkg_navigation_entry_action";
+pub const TOOLPKG_EVENT_HOST_EVENT: &str = "toolpkg_host_event";
+pub const TOOLPKG_EVENT_TOOL_LIFECYCLE: &str = "toolpkg_tool_lifecycle";
+pub const TOOLPKG_EVENT_TOOL_PERMISSION: &str = "toolpkg_tool_permission";
+pub const TOOLPKG_EVENT_PROMPT_INPUT: &str = "toolpkg_prompt_input";
+pub const TOOLPKG_EVENT_PROMPT_HISTORY: &str = "toolpkg_prompt_history";
+pub const TOOLPKG_EVENT_PROMPT_ESTIMATE_HISTORY: &str = "toolpkg_prompt_estimate_history";
+pub const TOOLPKG_EVENT_SYSTEM_PROMPT_COMPOSE: &str = "toolpkg_system_prompt_compose";
+pub const TOOLPKG_EVENT_TOOL_PROMPT_COMPOSE: &str = "toolpkg_tool_prompt_compose";
+pub const TOOLPKG_EVENT_PROMPT_FINALIZE: &str = "toolpkg_prompt_finalize";
+pub const TOOLPKG_EVENT_PROMPT_ESTIMATE_FINALIZE: &str = "toolpkg_prompt_estimate_finalize";
+pub const TOOLPKG_EVENT_SUMMARY_GENERATE: &str = "toolpkg_summary_generate";
+pub const TOOLPKG_EVENT_CORE_COMMAND: &str = "toolpkg_core_command";
+pub const TOOLPKG_EVENT_AI_PROVIDER_LIST_MODELS: &str = "toolpkg_ai_provider_list_models";
+pub const TOOLPKG_EVENT_AI_PROVIDER_SEND_MESSAGE: &str = "toolpkg_ai_provider_send_message";
+pub const TOOLPKG_EVENT_AI_PROVIDER_TEST_CONNECTION: &str = "toolpkg_ai_provider_test_connection";
+pub const TOOLPKG_EVENT_AI_PROVIDER_CALCULATE_INPUT_TOKENS: &str =
+    "toolpkg_ai_provider_calculate_input_tokens";
+
+pub const TOOLPKG_REGISTRATION_TOOLBOX_UI_MODULE: &str = "ToolPkg.registerToolboxUiModule";
+pub const TOOLPKG_REGISTRATION_UI_ROUTE: &str = "ToolPkg.registerUiRoute";
+pub const TOOLPKG_REGISTRATION_CHAT_COMPOSER_SLOT: &str = "ToolPkg.registerChatComposerSlot";
+pub const TOOLPKG_REGISTRATION_NAVIGATION_ENTRY: &str = "ToolPkg.registerNavigationEntry";
+pub const TOOLPKG_REGISTRATION_DESKTOP_WIDGET: &str = "ToolPkg.registerDesktopWidget";
+pub const TOOLPKG_REGISTRATION_APP_LIFECYCLE_HOOK: &str = "ToolPkg.registerAppLifecycleHook";
+pub const TOOLPKG_REGISTRATION_MESSAGE_PROCESSING_PLUGIN: &str =
+    "ToolPkg.registerMessageProcessingPlugin";
+pub const TOOLPKG_REGISTRATION_XML_RENDER_PLUGIN: &str = "ToolPkg.registerXmlRenderPlugin";
+pub const TOOLPKG_REGISTRATION_INPUT_MENU_TOGGLE_PLUGIN: &str =
+    "ToolPkg.registerInputMenuTogglePlugin";
+pub const TOOLPKG_REGISTRATION_CHAT_INPUT_HOOK: &str = "ToolPkg.registerChatInputHook";
+pub const TOOLPKG_REGISTRATION_CHAT_VIEW_HOOK: &str = "ToolPkg.registerChatViewHook";
+pub const TOOLPKG_REGISTRATION_CHAT_MESSAGE_HOOK: &str = "ToolPkg.registerChatMessageHook";
+/// Names capture of the single registered conversation creation handler.
+pub const TOOLPKG_REGISTRATION_CHAT_LIFECYCLE_HOOK: &str = "ToolPkg.registerChatLifecycleHook";
+pub const TOOLPKG_REGISTRATION_CHAT_MESSAGE_MENU_ITEM: &str = "ToolPkg.registerChatMessageMenuItem";
+pub const TOOLPKG_REGISTRATION_CHAT_RESPONSE_HOOK: &str = "ToolPkg.registerChatResponseHook";
+pub const TOOLPKG_EVENT_CHAT_RESPONSE: &str = "chat_response";
+pub const TOOLPKG_REGISTRATION_CHAT_RUNTIME_HOOK: &str = "ToolPkg.registerChatRuntimeHook";
+pub const TOOLPKG_REGISTRATION_HOST_EVENT_HOOK: &str = "ToolPkg.registerHostEventHook";
+pub const TOOLPKG_REGISTRATION_TOOL_LIFECYCLE_HOOK: &str = "ToolPkg.registerToolLifecycleHook";
+pub const TOOLPKG_REGISTRATION_TOOL_PERMISSION_HOOK: &str = "ToolPkg.registerToolPermissionHook";
+pub const TOOLPKG_REGISTRATION_PROMPT_INPUT_HOOK: &str = "ToolPkg.registerPromptInputHook";
+pub const TOOLPKG_REGISTRATION_PROMPT_HISTORY_HOOK: &str = "ToolPkg.registerPromptHistoryHook";
+pub const TOOLPKG_REGISTRATION_PROMPT_ESTIMATE_HISTORY_HOOK: &str =
+    "ToolPkg.registerPromptEstimateHistoryHook";
+pub const TOOLPKG_REGISTRATION_SYSTEM_PROMPT_COMPOSE_HOOK: &str =
+    "ToolPkg.registerSystemPromptComposeHook";
+pub const TOOLPKG_REGISTRATION_TOOL_PROMPT_COMPOSE_HOOK: &str =
+    "ToolPkg.registerToolPromptComposeHook";
+pub const TOOLPKG_REGISTRATION_PROMPT_FINALIZE_HOOK: &str = "ToolPkg.registerPromptFinalizeHook";
+pub const TOOLPKG_REGISTRATION_PROMPT_ESTIMATE_FINALIZE_HOOK: &str =
+    "ToolPkg.registerPromptEstimateFinalizeHook";
+pub const TOOLPKG_REGISTRATION_SUMMARY_GENERATE_HOOK: &str = "ToolPkg.registerSummaryGenerateHook";
+pub const TOOLPKG_REGISTRATION_CORE_COMMAND: &str = "ToolPkg.registerCoreCommand";
+pub const TOOLPKG_REGISTRATION_AI_PROVIDER: &str = "ToolPkg.registerAiProvider";
+pub const TOOLPKG_REGISTRATION_MANIFEST_EXTENSION: &str = "ToolPkg.registerManifestExtension";
+
+pub const TOOLPKG_NAV_SURFACE_TOOLBOX: &str = "toolbox";
+pub const TOOLPKG_NAV_SURFACE_MAIN_SIDEBAR_PLUGINS: &str = "main_sidebar_plugins";
+pub const TOOLPKG_NAV_SURFACE_APP_BAR: &str = "app_bar";
+/// Names the existing navigation registry surface rendered in the chat attachment menu.
+pub const TOOLPKG_NAV_SURFACE_CHAT_ATTACHMENTS: &str = "chat_attachments";
+/// Names real plugin-owned UI routes embedded as tabs beside the built-in workspace tab.
+pub const TOOLPKG_NAV_SURFACE_CHAT_SIDEBAR_TABS: &str = "chat_sidebar_tabs";
+/// Names plugin-owned Compose DSL rows embedded above the native chat input statistics.
+pub const TOOLPKG_NAV_SURFACE_CHAT_INPUT_MENU: &str = "chat_input_menu";
+
+/// Names plugin-owned Compose DSL sections below chat statistics and above native controls.
+pub const TOOLPKG_NAV_SURFACE_CHAT_INPUT_MENU_SECTIONS: &str = "chat_input_menu_sections";
+/// Embeds plugin-owned content after an individual versioned chat message.
+pub const TOOLPKG_NAV_SURFACE_CHAT_MESSAGE_AFTER: &str = "chat_message_after";
+/// Opens plugin-owned pages inside the workspace without sidebar docking ownership.
+pub const TOOLPKG_NAV_SURFACE_WORKSPACE: &str = "workspace";
+/// Opens workspace files with matching filename extensions in a Compose route.
+pub const TOOLPKG_NAV_SURFACE_WORKSPACE_FILE: &str = "workspace_file";
+/// Embeds plugin-owned content on the workspace overview page.
+pub const TOOLPKG_NAV_SURFACE_WORKSPACE_HOME: &str = "workspace_home";
+
+/// Identifies surfaces that require one package-owned Compose DSL route.
+#[allow(non_snake_case)]
+pub(crate) fn isToolPkgEmbeddedUiSurface(surface: &str) -> bool {
+    matches!(surface,
+        TOOLPKG_NAV_SURFACE_CHAT_SIDEBAR_TABS
+        | TOOLPKG_NAV_SURFACE_CHAT_INPUT_MENU
+        | TOOLPKG_NAV_SURFACE_CHAT_INPUT_MENU_SECTIONS
+        | TOOLPKG_NAV_SURFACE_CHAT_MESSAGE_AFTER
+        | TOOLPKG_NAV_SURFACE_WORKSPACE
+        | TOOLPKG_NAV_SURFACE_WORKSPACE_FILE
+        | TOOLPKG_NAV_SURFACE_WORKSPACE_HOME
+    )
+}
+
+/// Requires an exact supported navigation surface without case folding or whitespace repair.
+#[allow(non_snake_case)]
+pub(crate) fn requireToolPkgNavigationSurface(surface: &str) -> Result<(), String> {
+    match surface {
+        TOOLPKG_NAV_SURFACE_TOOLBOX
+        | TOOLPKG_NAV_SURFACE_MAIN_SIDEBAR_PLUGINS
+        | TOOLPKG_NAV_SURFACE_APP_BAR
+        | TOOLPKG_NAV_SURFACE_CHAT_ATTACHMENTS
+        | TOOLPKG_NAV_SURFACE_CHAT_SIDEBAR_TABS
+        | TOOLPKG_NAV_SURFACE_CHAT_INPUT_MENU
+        | TOOLPKG_NAV_SURFACE_CHAT_INPUT_MENU_SECTIONS
+        | TOOLPKG_NAV_SURFACE_CHAT_MESSAGE_AFTER
+        | TOOLPKG_NAV_SURFACE_WORKSPACE
+        | TOOLPKG_NAV_SURFACE_WORKSPACE_FILE
+        | TOOLPKG_NAV_SURFACE_WORKSPACE_HOME => Ok(()),
+        _ => Err(format!("is unsupported: {surface}")),
+    }
+}
+
+pub const TOOLPKG_CHAT_COMPOSER_SLOT_ABOVE_INPUT: &str = "above_input";
+
+/// Builds the globally unique route id used by a ToolPkg UI route.
+#[allow(non_snake_case)]
+pub fn buildToolPkgRouteId(containerPackageName: &str, uiRouteId: &str) -> String {
+    format!("toolpkg:{containerPackageName}:ui:{uiRouteId}")
+}

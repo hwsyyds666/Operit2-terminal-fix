@@ -1,0 +1,85 @@
+// ignore_for_file: file_names
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart';
+import 'package:flutter/material.dart';
+import 'package:operit2/ui/features/chat/components/workspace/browser/tabs/WorkspaceBrowserTabModels.dart';
+import 'package:webview_all/webview_all.dart';
+import 'package:webview_all_windows/webview_all_windows.dart';
+
+import 'RuntimeBrowserOwner.dart';
+import 'RuntimeBrowserSurface.dart';
+
+class RuntimeBrowserOwnerSurfaceHost extends StatelessWidget {
+  /// Creates the runtime owner surface host around the application tree.
+  const RuntimeBrowserOwnerSurfaceHost({super.key, required this.child});
+
+  final Widget child;
+
+  /// Keeps every real owner WebView mounted independently from workspace views.
+  @override
+  Widget build(BuildContext context) {
+    final sessions = RuntimeBrowserOwner.instance;
+    return AnimatedBuilder(
+      animation: sessions,
+      child: child,
+      builder: (context, child) => Stack(
+        clipBehavior: Clip.hardEdge,
+        fit: StackFit.expand,
+        children: <Widget>[
+          child!,
+          for (final tab in sessions.tabs)
+            RuntimeBrowserSurface(
+              key: ValueKey(tab.id),
+              sessionId: tab.id,
+              child: RuntimeBrowserOwnerWebView(
+                tab: tab,
+                layoutControlsSurfaceSize: true,
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class RuntimeBrowserOwnerWebView extends StatelessWidget {
+  /// Creates a real owner WebView widget for one browser session.
+  const RuntimeBrowserOwnerWebView({
+    super.key,
+    required this.tab,
+    required this.layoutControlsSurfaceSize,
+  });
+
+  final WorkspaceBrowserTabState tab;
+  final bool layoutControlsSurfaceSize;
+
+  /// Lets the native browser surface claim every touch sequence immediately.
+  static final Set<Factory<OneSequenceGestureRecognizer>>
+  _browserGestureRecognizers = <Factory<OneSequenceGestureRecognizer>>{
+    Factory<EagerGestureRecognizer>(EagerGestureRecognizer.new),
+  };
+
+  /// Builds the platform WebView attached to the owner controller.
+  @override
+  Widget build(BuildContext context) {
+    final key = ValueKey<String>('runtime-browser-owner-${tab.id}');
+    final platformController = tab.controller.platform;
+    if (platformController is WindowsWebViewController) {
+      return WebViewWidget.fromPlatformCreationParams(
+        key: key,
+        params: WindowsWebViewWidgetCreationParams(
+          controller: platformController,
+          layoutDirection: Directionality.of(context),
+          gestureRecognizers: _browserGestureRecognizers,
+          layoutControlsSurfaceSize: layoutControlsSurfaceSize,
+        ),
+      );
+    }
+    return WebViewWidget(
+      key: key,
+      controller: tab.controller,
+      gestureRecognizers: _browserGestureRecognizers,
+    );
+  }
+}

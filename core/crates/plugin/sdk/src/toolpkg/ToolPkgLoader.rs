@@ -1,0 +1,228 @@
+use std::io::Cursor;
+use std::sync::Arc;
+
+use crate::javascript::{JsExecutionEngine, ToolPkgConfigScope};
+use crate::toolpkg::ToolPkgParser::{
+    ToolPkgArchiveParser, ToolPkgLoadResult, ToolPkgMainRegistrationParseResult, ToolPkgSourceType,
+};
+use crate::JsPackageLoader::JsPackageLoader;
+use operit_vfs::VisualFileSystem::VisualFileSystem;
+
+/// Loads ToolPkg archives and executes their main registration scripts.
+pub struct ToolPkgLoader;
+
+impl ToolPkgLoader {
+    /// Loads a ToolPkg archive through the supplied file-system host.
+    #[allow(non_snake_case)]
+    pub fn loadToolPkgFromExternalFile<FReportPackageLoadError>(
+        filesystem: &VisualFileSystem,
+        sourcePath: &str,
+        configScope: ToolPkgConfigScope,
+        jsEngine: &dyn JsExecutionEngine,
+        reportPackageLoadError: FReportPackageLoadError,
+    ) -> Result<ToolPkgLoadResult, String>
+    where
+        FReportPackageLoadError: Fn(&str, &str),
+    {
+        let archiveBytes = filesystem
+            .readFileBytes(sourcePath)
+            .map_err(|error| error.to_string())?;
+        Self::loadToolPkgFromArchiveBytes(
+            &archiveBytes,
+            ToolPkgSourceType::EXTERNAL,
+            sourcePath,
+            false,
+            configScope,
+            jsEngine,
+            reportPackageLoadError,
+        )
+    }
+
+    /// Loads a ToolPkg archive from an embedded non-core external asset.
+    #[allow(non_snake_case)]
+    pub fn loadToolPkgFromBundledExternalAsset<FReportPackageLoadError>(
+        assetName: &str,
+        bytes: &'static [u8],
+        jsEngine: &dyn JsExecutionEngine,
+        reportPackageLoadError: FReportPackageLoadError,
+    ) -> Result<ToolPkgLoadResult, String>
+    where
+        FReportPackageLoadError: Fn(&str, &str),
+    {
+        let scope = match ToolPkgArchiveParser::readInstallationScope(bytes)? {
+            Some(scope) => scope,
+            None => ToolPkgConfigScope::Device,
+        };
+        Self::loadToolPkgFromArchiveBytes(
+            bytes,
+            ToolPkgSourceType::EXTERNAL,
+            assetName,
+            false,
+            scope,
+            jsEngine,
+            reportPackageLoadError,
+        )
+    }
+
+    /// Loads a ToolPkg archive from embedded application asset bytes.
+    #[allow(non_snake_case)]
+    pub fn loadToolPkgFromBuiltInAsset<FReportPackageLoadError>(
+        assetName: &str,
+        bytes: &'static [u8],
+        jsEngine: &dyn JsExecutionEngine,
+        reportPackageLoadError: FReportPackageLoadError,
+    ) -> Result<ToolPkgLoadResult, String>
+    where
+        FReportPackageLoadError: Fn(&str, &str),
+    {
+        Self::loadToolPkgFromArchiveBytes(
+            bytes,
+            ToolPkgSourceType::ASSET,
+            assetName,
+            true,
+            ToolPkgConfigScope::Device,
+            jsEngine,
+            reportPackageLoadError,
+        )
+    }
+
+    /// Loads a raw protected ToolPkg ZIP after its local market installation seal has verified.
+    #[allow(non_snake_case)]
+    pub fn loadToolPkgFromMarketFile<FReportPackageLoadError>(
+        filesystem: &VisualFileSystem,
+        sourcePath: &str,
+        configScope: ToolPkgConfigScope,
+        jsEngine: &dyn JsExecutionEngine,
+        reportPackageLoadError: FReportPackageLoadError,
+    ) -> Result<ToolPkgLoadResult, String>
+    where
+        FReportPackageLoadError: Fn(&str, &str),
+    {
+        let archiveBytes = filesystem
+            .readFileBytes(sourcePath)
+            .map_err(|error| error.to_string())?;
+        Self::loadToolPkgFromArchiveBytes(
+            &archiveBytes,
+            ToolPkgSourceType::MARKET,
+            sourcePath,
+            false,
+            configScope,
+            jsEngine,
+            reportPackageLoadError,
+        )
+    }
+
+    /// Parses one already-unwrapped ToolPkg ZIP using its trusted source classification.
+    #[allow(non_snake_case)]
+    pub fn loadToolPkgFromArchiveBytes<FReportPackageLoadError>(
+        archiveBytes: &[u8],
+        sourceType: ToolPkgSourceType,
+        sourcePath: &str,
+        isBuiltIn: bool,
+        configScope: ToolPkgConfigScope,
+        jsEngine: &dyn JsExecutionEngine,
+        reportPackageLoadError: FReportPackageLoadError,
+    ) -> Result<ToolPkgLoadResult, String>
+    where
+        FReportPackageLoadError: Fn(&str, &str),
+    {
+        let requiredScope = ToolPkgArchiveParser::readInstallationScope(archiveBytes)?;
+        let configScope = match (isBuiltIn, requiredScope) {
+            (true, Some(scope)) => scope,
+            (false, Some(scope)) if scope != configScope => {
+                return Err(format!("ToolPkg requires {} installation scope, not {}", scope.as_str(), configScope.as_str()));
+            }
+            _ => configScope,
+        };
+        ToolPkgArchiveParser::readThemeTemplates(archiveBytes)?;
+        let cursor = Cursor::new(archiveBytes);
+        let mut archive = zip::ZipArchive::new(cursor).map_err(|error| error.to_string())?;
+        let entryIndex = ToolPkgArchiveParser::buildZipEntryIndex(&mut archive);
+        let textResources = Arc::new(readToolPkgTextResources(&mut archive, &entryIndex));
+        ToolPkgArchiveParser::parseToolPkgFromIndexedEntries(
+            &entryIndex,
+            |entryName| readIndexedTextResource(&textResources, &entryIndex, entryName),
+            |entryName| {
+                ToolPkgArchiveParser::readZipEntryPrefix(
+                    &mut archive,
+                    &entryIndex,
+                    entryName,
+                    crate::toolpkg::ToolPkgProtection::MARKET_ONLY_PROTECTION_HEADER_SIZE,
+                )
+            },
+            sourceType,
+            sourcePath,
+            isBuiltIn,
+            |jsContent, apiVersion, reportPackageLoadError| match JsPackageLoader::parse_with_default_api_version(jsContent, apiVersion) {
+                Ok(package) => Some(package),
+                Err(error) => {
+                    reportPackageLoadError(String::new(), error);
+                    None
+                }
+            },
+            |mainScriptText, toolPkgId, mainScriptPath, apiVersion, environmentNames| {
+                parseMainRegistration(
+                    mainScriptText,
+                    toolPkgId,
+                    mainScriptPath,
+                    apiVersion,
+                    environmentNames,
+                    configScope,
+                    jsEngine,
+                    textResources.clone(),
+                )
+            },
+            |packageName, error| reportPackageLoadError(&packageName, &error),
+        )
+    }
+}
+
+/// Parses declarations exported by a ToolPkg main registration script.
+#[allow(non_snake_case)]
+fn parseMainRegistration(
+    mainScriptText: &str,
+    toolPkgId: &str,
+    mainScriptPath: &str,
+    apiVersion: &str,
+    environmentNames: &[String],
+    configScope: ToolPkgConfigScope,
+    jsEngine: &dyn JsExecutionEngine,
+    textResources: Arc<std::collections::BTreeMap<String, String>>,
+) -> ToolPkgMainRegistrationParseResult {
+    crate::toolpkg::ToolPkgMainRegistrationScriptParser::ToolPkgMainRegistrationScriptParser::parseWithTextResources(
+        mainScriptText,
+        toolPkgId,
+        mainScriptPath,
+        apiVersion,
+        environmentNames,
+        configScope,
+        jsEngine,
+        Some(textResources),
+    )
+}
+
+/// Reads every UTF-8 archive entry for registration-time resource access.
+#[allow(non_snake_case)]
+fn readToolPkgTextResources<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    entryIndex: &crate::toolpkg::ToolPkgParser::ToolPkgEntryIndex,
+) -> std::collections::BTreeMap<String, String> {
+    let mut resources = std::collections::BTreeMap::new();
+    for entryName in &entryIndex.entryNames {
+        if let Some(text) = ToolPkgArchiveParser::readZipEntryText(archive, entryIndex, entryName) {
+            resources.insert(entryName.to_ascii_lowercase(), text);
+        }
+    }
+    resources
+}
+
+/// Resolves and reads one normalized text resource from the registration cache.
+#[allow(non_snake_case)]
+fn readIndexedTextResource(
+    textResources: &std::collections::BTreeMap<String, String>,
+    entryIndex: &crate::toolpkg::ToolPkgParser::ToolPkgEntryIndex,
+    rawPath: &str,
+) -> Option<String> {
+    let entryName = entryIndex.resolveEntryName(rawPath)?;
+    textResources.get(&entryName.to_ascii_lowercase()).cloned()
+}

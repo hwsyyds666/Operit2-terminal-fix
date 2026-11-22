@@ -1,0 +1,626 @@
+use crate::package::{
+    EnvVar, LocalizedText, PackageTool, PackageToolParameter, ToolPackage, ToolPackageState,
+};
+use crate::toolpkg::ToolPkgProtection;
+use operit_vfs::VisualFileSystem::VisualFileSystem;
+
+/// Loads and parses standalone JavaScript plugin packages.
+pub struct JsPackageLoader;
+
+impl JsPackageLoader {
+    /// Loads a JavaScript package through the supplied file-system host.
+    pub fn load_from_file(
+        filesystem: &VisualFileSystem,
+        sourcePath: &str,
+    ) -> Result<ToolPackage, String> {
+        let source_bytes = filesystem
+            .readFileBytes(sourcePath)
+            .map_err(|error| error.to_string())?;
+        let js_content = ToolPkgProtection::decodeUtf8(&source_bytes)?;
+        Self::parse(&js_content)
+    }
+
+    /// Parses a JavaScript package and attaches its script to every declared tool.
+    pub fn parse(js_content: &str) -> Result<ToolPackage, String> {
+        Self::parse_with_default_api_version(js_content, crate::toolpkg::ToolPkgApiVersion::TOOLPKG_API_VERSION_1_0_0)
+    }
+
+    /// Parses a subpackage with its container's API contract as the omitted-version default.
+    pub fn parse_with_default_api_version(js_content: &str, default_api_version: &str) -> Result<ToolPackage, String> {
+        let metadata_string = Self::extract_metadata(js_content);
+        let package_metadata = Self::parse_metadata_with_default_api_version(&metadata_string, js_content, default_api_version)?;
+        let tools = package_metadata
+            .tools
+            .into_iter()
+            .map(|tool| PackageTool {
+                script: js_content.to_string(),
+                ..tool
+            })
+            .collect::<Vec<_>>();
+        let states = package_metadata
+            .states
+            .into_iter()
+            .map(|state| ToolPackageState {
+                tools: state
+                    .tools
+                    .into_iter()
+                    .map(|tool| PackageTool {
+                        script: js_content.to_string(),
+                        ..tool
+                    })
+                    .collect(),
+                ..state
+            })
+            .collect();
+        Ok(ToolPackage {
+            tools,
+            states,
+            ..package_metadata
+        })
+    }
+
+    /// Parses package metadata represented as JSON, JSON5, or the supported HJSON-like form.
+    pub fn parse_metadata(metadata_string: &str, script: &str) -> Result<ToolPackage, String> {
+        Self::parse_metadata_with_default_api_version(metadata_string, script, crate::toolpkg::ToolPkgApiVersion::TOOLPKG_API_VERSION_1_0_0)
+    }
+
+    /// Applies the supplied container contract only when metadata omits api_version.
+    pub fn parse_metadata_with_default_api_version(metadata_string: &str, script: &str, default_api_version: &str) -> Result<ToolPackage, String> {
+        let object = Self::parse_metadata_object(metadata_string)?;
+
+        let name = string_field(&object, "name");
+        if name.is_empty() {
+            return Err("Package metadata must have a name".to_string());
+        }
+        let tools_value = object
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let tools = tools_value
+            .iter()
+            .map(|value| parse_package_tool(value, script))
+            .collect::<Result<Vec<_>, _>>()?;
+        let states = object
+            .get("states")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|value| parse_package_state(value, script))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let env = object
+            .get("env")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| items.iter().filter_map(parse_env_var).collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        Ok(ToolPackage {
+            name,
+            api_version: Self::parse_api_version_with_default(&object, default_api_version)?,
+            description: localized_text_field(object.get("description")),
+            tools,
+            states,
+            env,
+            is_built_in: bool_field(&object, "isBuiltIn") || bool_field(&object, "is_built_in"),
+            enabled_by_default: bool_field(&object, "enabledByDefault")
+                || bool_field(&object, "enabled_by_default"),
+            display_name: localized_text_field(
+                object
+                    .get("display_name")
+                    .or_else(|| object.get("displayName")),
+            ),
+            category: non_empty_or(string_field(&object, "category"), "Other"),
+            author: string_list_field(object.get("author")),
+        })
+    }
+
+    /// Validates the same API contracts as ToolPkg, defaulting omitted versions to v1.
+    pub fn parse_api_version(
+        object: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<String, String> {
+        Self::parse_api_version_with_default(object, crate::toolpkg::ToolPkgApiVersion::TOOLPKG_API_VERSION_1_0_0)
+    }
+
+    fn parse_api_version_with_default(object: &serde_json::Map<String, serde_json::Value>, default_api_version: &str) -> Result<String, String> {
+        use crate::toolpkg::ToolPkgApiVersion::{
+            requireSupportedToolPkgApiVersion,
+        };
+        let version = match object.get("api_version") {
+            Some(value) => value.as_str()
+                .ok_or("Script package metadata.api_version must be a string")?,
+            None => default_api_version,
+        };
+        requireSupportedToolPkgApiVersion(version)
+            .map(|version| version.to_string())
+            .map_err(|error| format!("Script package metadata.api_version: {error}"))
+    }
+
+    /// Parses standalone package metadata into its structured JSON object representation.
+    pub fn parse_metadata_object(
+        metadata_string: &str,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+        let normalized = normalize_hjson_like_metadata(metadata_string);
+        let value: serde_json::Value =
+            json5::from_str(&normalized).map_err(|error| error.to_string())?;
+        value
+            .as_object()
+            .cloned()
+            .ok_or_else(|| "Package metadata must be an object".to_string())
+    }
+
+    /// Extracts the `METADATA` block embedded in a JavaScript package.
+    pub fn extract_metadata(js_content: &str) -> String {
+        let metadata_pattern =
+            regex::Regex::new(r"/\*\s*METADATA\s*([\s\S]*?)\*/").expect("valid metadata regex");
+        metadata_pattern
+            .captures(js_content)
+            .and_then(|captures| captures.get(1))
+            .map(|metadata| metadata.as_str().trim().to_string())
+            .unwrap_or_else(|| "{}".to_string())
+    }
+}
+
+/// Returns the replacement when a parsed string is blank.
+fn non_empty_or(value: String, replacement: &str) -> String {
+    if value.trim().is_empty() {
+        replacement.to_string()
+    } else {
+        value
+    }
+}
+
+/// Reads a trimmed string field from a metadata object.
+fn string_field(object: &serde_json::Map<String, serde_json::Value>, key: &str) -> String {
+    object
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// Reads a permissive boolean field from a metadata object.
+fn bool_field(object: &serde_json::Map<String, serde_json::Value>, key: &str) -> bool {
+    match object.get(key) {
+        Some(serde_json::Value::Bool(value)) => *value,
+        Some(serde_json::Value::Number(value)) => value.as_i64().unwrap_or(0) != 0,
+        Some(serde_json::Value::String(value)) => {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes" | "on"
+            )
+        }
+        _ => false,
+    }
+}
+
+/// Parses localized text from a string or language-keyed object.
+fn localized_text_field(value: Option<&serde_json::Value>) -> LocalizedText {
+    match value {
+        Some(serde_json::Value::String(text)) => {
+            let mut values = std::collections::HashMap::new();
+            values.insert("default".to_string(), text.clone());
+            LocalizedText { values }
+        }
+        Some(serde_json::Value::Object(object)) => {
+            let mut values = std::collections::HashMap::new();
+            for (key, value) in object {
+                if let Some(text) = value.as_str() {
+                    values.insert(key.clone(), text.to_string());
+                }
+            }
+            LocalizedText { values }
+        }
+        _ => LocalizedText::default(),
+    }
+}
+
+/// Parses a string or string array into a normalized list.
+fn string_list_field(value: Option<&serde_json::Value>) -> Vec<String> {
+    match value {
+        Some(serde_json::Value::String(text)) => vec![text.trim().to_string()]
+            .into_iter()
+            .filter(|item| !item.is_empty())
+            .collect(),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Parses one package tool declaration.
+fn parse_package_tool(value: &serde_json::Value, script: &str) -> Result<PackageTool, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "Package tool must be an object".to_string())?;
+    let parameters = object
+        .get("parameters")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(parse_package_tool_parameter)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(PackageTool {
+        display: object
+            .get("display")
+            .filter(|value| !value.is_null())
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|error| error.to_string())?,
+        name: string_field(object, "name"),
+        description: localized_text_field(object.get("description")),
+        parameters,
+        script: script.to_string(),
+        advice: bool_field(object, "advice"),
+    })
+}
+
+/// Parses one package tool parameter declaration.
+fn parse_package_tool_parameter(value: &serde_json::Value) -> Option<PackageToolParameter> {
+    let object = value.as_object()?;
+    Some(PackageToolParameter {
+        name: string_field(object, "name"),
+        description: localized_text_field(object.get("description")),
+        parameter_type: non_empty_or(string_field(object, "type"), "string"),
+        required: object
+            .get("required")
+            .map(|_| bool_field(object, "required"))
+            .unwrap_or(true),
+    })
+}
+
+/// Parses one conditional package state.
+fn parse_package_state(
+    value: &serde_json::Value,
+    script: &str,
+) -> Result<ToolPackageState, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "Package state must be an object".to_string())?;
+    let tools = object
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| parse_package_tool(item, script))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    Ok(ToolPackageState {
+        id: string_field(object, "id"),
+        condition: non_empty_or(string_field(object, "condition"), "true"),
+        inherit_tools: object
+            .get("inheritTools")
+            .or_else(|| object.get("inherit_tools"))
+            .map(|_| bool_field(object, "inheritTools") || bool_field(object, "inherit_tools"))
+            .unwrap_or(false),
+        exclude_tools: object
+            .get("excludeTools")
+            .or_else(|| object.get("exclude_tools"))
+            .map(|value| string_list_field(Some(value)))
+            .unwrap_or_default(),
+        tools,
+    })
+}
+
+/// Parses one package environment variable declaration.
+fn parse_env_var(value: &serde_json::Value) -> Option<EnvVar> {
+    match value {
+        serde_json::Value::String(name) => Some(EnvVar {
+            name: name.trim().to_string(),
+            description: LocalizedText::default(),
+            required: true,
+            default_value: None,
+        }),
+        serde_json::Value::Object(object) => Some(EnvVar {
+            name: string_field(object, "name"),
+            description: localized_text_field(object.get("description")),
+            required: object
+                .get("required")
+                .map(|_| bool_field(object, "required"))
+                .unwrap_or(true),
+            default_value: object
+                .get("defaultValue")
+                .or_else(|| object.get("default_value"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        }),
+        _ => None,
+    }
+}
+
+/// Normalizes the supported HJSON-like package metadata into JSON5 text.
+fn normalize_hjson_like_metadata(input: &str) -> String {
+    let mut lines = Vec::new();
+    for raw_line in input.lines() {
+        let line = strip_inline_comment(raw_line).trim().to_string();
+        if line.is_empty() {
+            continue;
+        }
+        lines.push(normalize_bare_words(&line));
+    }
+
+    let mut output = String::new();
+    for (index, line) in lines.iter().enumerate() {
+        if index > 0 {
+            let previous = lines[index - 1].trim_end();
+            let current = line.trim_start();
+            if needs_comma_between(previous, current) {
+                output.push(',');
+            }
+            output.push('\n');
+        }
+        output.push_str(line);
+    }
+    output
+}
+
+/// Removes a line comment while preserving quoted content.
+fn strip_inline_comment(line: &str) -> String {
+    let mut in_string = false;
+    let mut quote = '\0';
+    let chars = line.chars().collect::<Vec<_>>();
+    let mut index = 0usize;
+    while index < chars.len() {
+        let ch = chars[index];
+        if in_string {
+            if ch == quote && (index == 0 || chars[index - 1] != '\\') {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if ch == '"' || ch == '\'' {
+            in_string = true;
+            quote = ch;
+            index += 1;
+            continue;
+        }
+        if ch == '/' && index + 1 < chars.len() && chars[index + 1] == '/' {
+            return chars[..index].iter().collect();
+        }
+        index += 1;
+    }
+    line.to_string()
+}
+
+/// Quotes bare metadata values while preserving JSON primitives and containers.
+fn normalize_bare_words(line: &str) -> String {
+    let mut out = String::new();
+    let chars = line.chars().collect::<Vec<_>>();
+    let mut index = 0usize;
+    let mut in_string = false;
+    let mut quote = '\0';
+    while index < chars.len() {
+        let ch = chars[index];
+        out.push(ch);
+        if in_string {
+            if ch == quote && (index == 0 || chars[index - 1] != '\\') {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if ch == '"' || ch == '\'' {
+            in_string = true;
+            quote = ch;
+            index += 1;
+            continue;
+        }
+        if ch == ':' {
+            let mut lookahead = index + 1;
+            while lookahead < chars.len() && chars[lookahead].is_whitespace() {
+                out.push(chars[lookahead]);
+                lookahead += 1;
+            }
+            if lookahead >= chars.len() {
+                index = lookahead;
+                continue;
+            }
+            let next = chars[lookahead];
+            if next == '"'
+                || next == '\''
+                || next == '{'
+                || next == '['
+                || next == '-'
+                || next.is_ascii_digit()
+            {
+                index = lookahead;
+                continue;
+            }
+            let mut end = lookahead;
+            while end < chars.len() {
+                let current = chars[end];
+                if current == ',' || current == '}' || current == ']' {
+                    break;
+                }
+                end += 1;
+            }
+            let raw_value = chars[lookahead..end].iter().collect::<String>();
+            let value = raw_value.trim();
+            let lower = value.to_ascii_lowercase();
+            if matches!(lower.as_str(), "true" | "false" | "null") || value.is_empty() {
+                out.push_str(value);
+            } else {
+                out.push('"');
+                out.push_str(&value.replace('"', "\\\""));
+                out.push('"');
+            }
+            index = end;
+            continue;
+        }
+        index += 1;
+    }
+    out
+}
+
+/// Returns whether two normalized metadata lines require a separating comma.
+fn needs_comma_between(previous: &str, current: &str) -> bool {
+    !(previous.is_empty()
+        || previous.ends_with(',')
+        || previous.ends_with('{')
+        || previous.ends_with('[')
+        || current.starts_with(',')
+        || current.starts_with('}')
+        || current.starts_with(']'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::JsPackageLoader;
+
+    #[test]
+    fn script_package_api_versions_are_validated_and_default_to_v1() {
+        for (declaration, expected) in [
+            ("", "1.0.0"),
+            (r#", api_version: "1.0.0""#, "1.0.0"),
+            (r#", api_version: "1.0.1""#, "1.0.1"),
+            (r#", api_version: " 2.0.0 ""#, "2.0.0"),
+        ] {
+            let source = format!("/* METADATA {{name: versioned{declaration}, tools: [{{name: run}}]}} */ exports.run = function() {{}};");
+            let package = JsPackageLoader::parse(&source).unwrap();
+            assert_eq!(package.api_version, expected);
+            assert_eq!(package.tools[0].script, source);
+            let restored: crate::package::ToolPackage = serde_json::from_value(serde_json::to_value(&package).unwrap()).unwrap();
+            assert_eq!(restored.api_version, expected);
+        }
+        for declaration in ["null", "2", "true", "{}", r#""""#, r#""v1""#, r#""2.0.1""#, r#""3.0.0""#] {
+            let metadata = format!("{{name: invalid, api_version: {declaration}}}");
+            assert!(JsPackageLoader::parse_metadata(&metadata, "").is_err(), "{declaration}");
+        }
+        let legacy = JsPackageLoader::parse_metadata("{name: legacy}", "").unwrap();
+        let mut stored = serde_json::to_value(legacy).unwrap();
+        stored.as_object_mut().unwrap().remove("api_version");
+        let restored: crate::package::ToolPackage = serde_json::from_value(stored).unwrap();
+        assert_eq!(restored.api_version, "1.0.0");
+        assert_eq!(crate::package::ToolPackage::default().api_version, "1.0.0");
+    }
+
+    /// Checks real bundled scripts with the production JSON/JSON5/HJSON metadata parser.
+    #[test]
+    fn bundled_script_packages_explicitly_use_current_api_version() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(4).unwrap();
+        let mut directories = vec![root.join("plugins/packages")];
+        let mut count = 0;
+        while let Some(directory) = directories.pop() {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if entry.file_type().unwrap().is_dir() {
+                    if !matches!(entry.file_name().to_str(), Some("node_modules" | "dist" | "tests-dist" | ".out" | ".git")) {
+                        directories.push(path);
+                    }
+                    continue;
+                }
+                if !matches!(path.extension().and_then(|ext| ext.to_str()), Some("ts" | "js")) { continue; }
+                let script = std::fs::read_to_string(&path).unwrap();
+                let metadata = JsPackageLoader::extract_metadata(&script);
+                if metadata == "{}" { continue; }
+                let object = JsPackageLoader::parse_metadata_object(&metadata).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+                assert_eq!(object.get("api_version").and_then(serde_json::Value::as_str), Some("2.0.0"), "{}", path.display());
+                let package = JsPackageLoader::parse(&script).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+                assert_eq!(package.api_version, "2.0.0");
+                count += 1;
+            }
+        }
+        assert!(count > 0, "Must check real plugin scripts");
+    }
+
+    /// Keeps a JSON separator on its own line between tool declarations.
+    #[test]
+    fn parses_metadata_with_comma_on_its_own_line() {
+        let metadata = r#"{
+            "name": "demo_package",
+            "tools": [
+                { "name": "first" }
+                ,
+                { "name": "second" }
+            ]
+        }"#;
+
+        let package = JsPackageLoader::parse_metadata(metadata, "").unwrap();
+
+        assert_eq!(package.tools.len(), 2);
+        assert_eq!(package.tools[0].name, "first");
+        assert_eq!(package.tools[1].name, "second");
+    }
+
+    /// Verifies standalone JavaScript package metadata parsing.
+    #[test]
+    fn parses_embedded_package_metadata() {
+        let source = r#"
+            /* METADATA
+            {
+              name: demo_package
+              displayName: Demo Package
+              enabledByDefault: true
+              tools: [
+                {
+                  name: echo
+                  description: Echo text
+                  parameters: [
+                    { name: text, description: Text to echo, required: true }
+                  ]
+                }
+              ]
+            }
+            */
+            async function echo() {}
+        "#;
+
+        let package = JsPackageLoader::parse(source).expect("package metadata should parse");
+
+        assert_eq!(package.name, "demo_package");
+        assert_eq!(package.display_name.resolve(true), "Demo Package");
+        assert!(package.enabled_by_default);
+        assert_eq!(package.tools.len(), 1);
+        assert_eq!(package.tools[0].name, "echo");
+        assert_eq!(package.tools[0].script, source);
+    }
+
+    /// Verifies package metadata still parses when the executable body is minified.
+    #[test]
+    fn parses_metadata_from_minified_package_body() {
+        let source = r#"/* METADATA
+{
+  name: minified_package
+  displayName: Minified Package
+  enabledByDefault: true
+  tools: [
+    {
+      name: echo
+      description: Echo text
+      parameters: [
+        { name: text, description: Text to echo, type: string, required: true }
+      ]
+    }
+  ]
+}
+*/"use strict";Object.defineProperty(exports,"__esModule",{value:!0});exports.echo=function(t){return t.text};"#;
+
+        let package = JsPackageLoader::parse(source).expect("package metadata should parse");
+
+        assert_eq!(package.name, "minified_package");
+        assert_eq!(package.display_name.resolve(true), "Minified Package");
+        assert!(package.enabled_by_default);
+        assert_eq!(package.tools.len(), 1);
+        assert_eq!(package.tools[0].name, "echo");
+        assert_eq!(package.tools[0].parameters.len(), 1);
+        assert_eq!(package.tools[0].parameters[0].name, "text");
+        assert_eq!(package.tools[0].script, source);
+    }
+}

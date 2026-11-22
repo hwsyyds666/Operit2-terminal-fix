@@ -1,0 +1,1478 @@
+use super::*;
+use std::io::Cursor;
+use crate::data::backup::Operit1RoomSchemaMigration::tests::TestSqliteConnection;
+
+/// Retires Android grants while preserving archive-backed documents and propagating invalid archive paths.
+#[test]
+fn memory_attachments_do_not_import_source_app_document_grants() {
+    let plan = SnapshotFileImportPlan::new();
+    assert_eq!(plan.rewriteMemoryAttachmentPath(None).unwrap(), None);
+    assert_eq!(plan.rewriteMemoryAttachmentPath(Some("content://com.android.providers.media.documents/document/document%3A122474")).unwrap(), None);
+    let document = "/data/user/0/com.ai.assistance.operit/files/documents/source.txt";
+    assert_eq!(plan.rewriteMemoryAttachmentPath(Some(document)).unwrap(), Some(plan.rewritePath(document).unwrap()));
+    assert!(plan.rewriteMemoryAttachmentPath(Some("/data/user/0/com.ai.assistance.operit/files/../outside.txt")).is_err());
+}
+
+/// Configures real isolated hosts and the executing CoreNode identity for import acceptance checks.
+fn snapshotImportManager(root: &std::path::Path) -> (Operit1SnapshotImportManager, Arc<operit_host_native_storage::NativeRuntimeStorageHost>) {
+    use operit_host_native_storage::NativeRuntimeStorageHost;
+    operit_host_api::HostManager::setDefaultHostRuntimeTaskSchedulerHost(Arc::new(
+        operit_host_native_scheduler::NativeHostRuntimeTaskSchedulerHost::new(),
+    ));
+    let paths = RuntimeStorePaths::default();
+    let host = Arc::new(NativeRuntimeStorageHost::new(root.join("runtime"), root.join("workspaces")));
+
+    operit_store::RuntimeStorageHost::setDefaultRuntimeStorageHost(host.clone());
+    operit_store::RuntimeStorageHost::setDefaultRuntimeSqliteHost(host.clone());
+    operit_store::RuntimeStorageHost::setDefaultHostSecretStore(Arc::new(
+        operit_host_native_storage::NativeFileSecretStore(root.join("secrets")),
+    ));
+    operit_store::CoreNodeIdentityStore::CoreNodeIdentityStore::new(host.clone()).initialize().unwrap();
+    (Operit1SnapshotImportManager::new(paths, host.clone(), host.clone(), host.clone()), host)
+}
+
+/// Runs a supplied snapshot through the full importer and retains isolated output for plugin diagnostics.
+#[test]
+#[ignore]
+fn diagnose_external_operit1_snapshot() {
+    let source = std::env::var("OPERIT1_IMPORT_SNAPSHOT").unwrap();
+    let root = std::env::temp_dir().join(format!("operit1-diagnostic-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let databasePath = root.join("fixture.db");
+    std::fs::write(&databasePath, []).unwrap();
+    let fixture = Arc::new(SnapshotFixture { bytes: std::fs::read(source).unwrap(), databasePath });
+    let (manager, host) = snapshotImportManager(&root);
+    let expected = ParsedOperit1Snapshot::fromSource(fixture.clone()).unwrap();
+    let themes = crate::data::preferences::ThemeConfigManager::ThemeConfigManager::new(host.clone());
+    let initial = serde_json::from_str(include_str!("../../preferences/theme_snapshot_fixture.json")).unwrap();
+    let saved = themes.create("Existing target theme".to_string(), initial).unwrap();
+    themes.apply(saved.id).unwrap();
+    let preview = manager.inspectSnapshotSource(fixture.clone()).expect("snapshot inspection");
+    let imported = manager.importSnapshotSource(fixture).expect("full snapshot import");
+    assert_eq!(preview.modelConfig.chatModelId.as_deref(), Some(imported.modelConfig.modelId.as_str()));
+    themes.watch().first().expect("imported appearance and saved theme selection must be consistent");
+    let providers = ModelConfigManager::default().getProviderProfiles().unwrap();
+    for config in &expected.configs {
+        let provider = providers.iter().find(|provider| provider.id == operit1ProviderId(&config.id)).expect("every source API configuration must be imported");
+        assert!(provider.apiKey == config.apiKey, "Imported API key differs from source");
+        assert_eq!(provider.name, config.name);
+        assert_eq!(provider.apiKeyPool.len(), config.apiKeyPool.len());
+    }
+    assert_eq!(imported.importedChats, preview.chatCount);
+    assert_eq!(imported.importedMessages, preview.messageCount);
+    let writer = crate::data::backup::CharacterPluginMigration::CharacterPluginWriter::open(host.clone(), host.clone()).unwrap();
+    assert_eq!(writer.get("meta", "state").unwrap().unwrap()["value"]["active"], buildOperit1ActivePrompt(&expected).unwrap());
+    assert!(writer.get("meta", "state").unwrap().unwrap()["value"].get("legacyImportPending").is_none(), "Fresh imports must be ready without a second plugin migration");
+    for owner in writer.list("owners").unwrap() {
+        assert_eq!(owner["key"], owner["value"]["ownerKey"], "memory owner identity mismatch");
+    }
+    for memory in writer.list("memories").unwrap() {
+        assert_eq!(memory["value"]["record"]["chunkIndexFilePath"], Value::Null);
+        if let Some(path) = memory["value"]["record"]["documentPath"].as_str() {
+            assert!(!path.starts_with("content://"), "Source-app document grant survived import");
+        }
+    }
+    assert!(writer.list("chat_drafts").unwrap().is_empty());
+    let node = operit_store::CoreNodeIdentityStore::CoreNodeIdentityStore::new(host.clone()).identity().unwrap().nodeId;
+    for candidate in writer.list("candidates").unwrap() {
+        assert_eq!(candidate["value"]["record"]["producerNodeId"], node, "Imported memory tasks must belong to the importing CoreNode");
+    }
+    eprintln!("Full import chats={} messages={} memories={} links={} usage={} bindings={} models={} chatModel={}", imported.importedChats, imported.importedMessages, imported.importedMemories, imported.importedMemoryLinks, imported.importedTokenUsageRecords, writer.list("chat_bindings").unwrap().len(), imported.modelConfig.importedModelCount, imported.modelConfig.modelId);
+    eprintln!("Diagnostic storage: {}", root.display());
+}
+
+// These fixtures preserve the source schema; Rust tests exercise actual readers and projections when run.
+const ROOM_V10_SQL: &str = r#"
+CREATE TABLE chats (
+    id TEXT PRIMARY KEY, title TEXT NOT NULL, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL,
+    inputTokens INTEGER NOT NULL, outputTokens INTEGER NOT NULL, currentWindowSize INTEGER NOT NULL,
+    "group" TEXT, displayOrder INTEGER NOT NULL, workspace TEXT, parentChatId TEXT,
+    characterCardName TEXT, locked INTEGER NOT NULL
+);
+INSERT INTO chats VALUES ('source-chat', 'Legacy conversation', 1720000000000, 1720000000001,
+    9223372036854775806, 12, 13, 'legacy-folder', 14,
+    '/data/user/0/com.ai.assistance.operit/files/workspace/demo', 'parent-chat', 'legacy-card', 1);
+CREATE TABLE messages (
+    messageId TEXT PRIMARY KEY, chatId TEXT, sender TEXT, content TEXT, timestamp INTEGER,
+    orderIndex INTEGER, roleName TEXT, provider TEXT, modelName TEXT
+);
+INSERT INTO messages VALUES ('message-1', 'source-chat', 'user', 'Preserved user history',
+    1720000000002, 0, 'Historical role text', 'provider', 'model');
+PRAGMA user_version = 10;
+"#;
+
+const ROOM_V20_SQL: &str = r#"
+ALTER TABLE chats ADD COLUMN characterGroupId TEXT;
+ALTER TABLE chats ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
+UPDATE chats SET characterGroupId = 'legacy-group', pinned = 1;
+ALTER TABLE messages ADD COLUMN selectedVariantIndex INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE messages ADD COLUMN inputTokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE messages ADD COLUMN outputTokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE messages ADD COLUMN cachedInputTokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE messages ADD COLUMN sentAt INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE messages ADD COLUMN outputDurationMs INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE messages ADD COLUMN waitDurationMs INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE messages ADD COLUMN completedAt INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE messages ADD COLUMN displayMode TEXT NOT NULL DEFAULT 'NORMAL';
+ALTER TABLE messages ADD COLUMN isFavorite INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE message_variants (
+    chatId TEXT, messageTimestamp INTEGER, variantIndex INTEGER, content TEXT, roleName TEXT,
+    provider TEXT, modelName TEXT, inputTokens INTEGER, outputTokens INTEGER,
+    cachedInputTokens INTEGER, sentAt INTEGER, outputDurationMs INTEGER,
+    waitDurationMs INTEGER, completedAt INTEGER
+);
+PRAGMA user_version = 20;
+"#;
+
+/// Reads immutable ZIP bytes while the fixture retains its actual legacy SQLite source file.
+struct SnapshotFixture {
+    bytes: Vec<u8>,
+    databasePath: PathBuf,
+}
+
+impl ArchiveSource for SnapshotFixture {
+    /// Returns the actual immutable ZIP byte length.
+    fn len(&self) -> Result<u64, String> { Ok(self.bytes.len() as u64) }
+
+    /// Reads a checked requested range without fabricating a missing archive entry.
+    fn readAt(&self, offset: u64, length: usize) -> Result<Vec<u8>, String> {
+        let start = usize::try_from(offset).map_err(|error| error.to_string())?;
+        let end = start.checked_add(length).ok_or_else(|| "Fixture range overflow".to_string())?;
+        if start > self.bytes.len() { return Err("Fixture range is outside the archive".to_string()); }
+        Ok(self.bytes[start..end.min(self.bytes.len())].to_vec())
+    }
+}
+
+impl Drop for SnapshotFixture {
+    /// Removes only this fixture's uniquely allocated SQLite file after all readers are dropped.
+    fn drop(&mut self) {
+        std::fs::remove_file(&self.databasePath).expect("fixture SQLite cleanup must succeed");
+    }
+}
+
+/// Encodes one actual length-delimited AndroidX protobuf field.
+fn protobufField(bytes: &mut Vec<u8>, tag: u8, value: &[u8]) {
+    bytes.push(tag);
+    let mut length = value.len();
+    while length >= 128 {
+        bytes.push((length as u8 & 127) | 128);
+        length >>= 7;
+    }
+    bytes.push(length as u8);
+    bytes.extend_from_slice(value);
+}
+
+/// Encodes only explicitly supplied string and string-set preferences using their real source field numbers.
+fn datastoreFixture(strings: &[(&str, &str)], sets: &[(&str, &[&str])]) -> Vec<u8> {
+    let mut values = Vec::new();
+    for (key, value) in strings {
+        let mut encoded = Vec::new();
+        protobufField(&mut encoded, 0x2a, value.as_bytes());
+        values.push((*key, encoded));
+    }
+    for (key, members) in sets {
+        let mut encodedSet = Vec::new();
+        for value in *members { protobufField(&mut encodedSet, 0x0a, value.as_bytes()); }
+        let mut encoded = Vec::new();
+        protobufField(&mut encoded, 0x32, &encodedSet);
+        values.push((*key, encoded));
+    }
+    let mut bytes = Vec::new();
+    for (key, value) in values {
+        let mut entry = Vec::new();
+        protobufField(&mut entry, 0x0a, key.as_bytes());
+        protobufField(&mut entry, 0x12, &value);
+        protobufField(&mut bytes, 0x0a, &entry);
+    }
+    bytes
+}
+
+/// Builds a real ZIP with a real SQLite database and intact legacy DataStore, memory and user-resource entries.
+fn completeSnapshotFixture(version: i32) -> Arc<SnapshotFixture> {
+    assert!(matches!(version, 10 | 20 | 21));
+    let databasePath = std::env::temp_dir().join(format!("operit1-snapshot-{}.db", Uuid::new_v4()));
+    {
+        let mut connection = TestSqliteConnection::open(&databasePath);
+        connection.executeBatch(ROOM_V10_SQL);
+        if matches!(version, 20 | 21) { connection.executeBatch(ROOM_V20_SQL); }
+        if version == 21 { connection.executeBatch("PRAGMA user_version = 21;"); }
+    }
+    let entries = [
+        (ENTRY_MANIFEST, br#"{"formatVersion":1,"packageName":"test.operit1","createdAt":1720000000000,"sourceOnlyField":{"retained":true}}"#.to_vec()),
+        (ENTRY_MODEL_CONFIGS, datastoreFixture(&[
+            ("config_list", "[\"test-model\"]"),
+            ("config_test-model", "{\"id\":\"test-model\",\"name\":\"Saved model\",\"modelName\":\"model\",\"apiProviderType\":\"OPENAI\",\"apiEndpoint\":\"https://fixture.invalid/v1\",\"sourceOnlyField\":true}")
+        ], &[])),
+        (ENTRY_FUNCTIONAL_CONFIGS, datastoreFixture(&[("function_config_mapping", "{\"CHAT\":{\"configId\":\"test-model\",\"modelIndex\":0}}")], &[])),
+        (ENTRY_CHARACTER_CARDS, datastoreFixture(&[("character_card_card-1_name", "Legacy card"), ("character_card_card-1_unknown_source_field", "preserved")], &[("character_card_list", &["card-1"])])),
+        (ENTRY_CHARACTER_GROUPS, datastoreFixture(&[("character_group_group-1_data", "{\"id\":\"group-1\",\"name\":\"Legacy group\",\"members\":[{\"characterCardId\":\"card-1\",\"orderIndex\":0}],\"sourceOnlyField\":true}")], &[("character_group_list", &["group-1"])])),
+        (ENTRY_PROMPT_TAGS, datastoreFixture(&[("prompt_tag_tag-1_name", "Legacy tag")], &[("prompt_tag_list", &["tag-1"])])),
+        (ENTRY_SPEECH_SERVICES, datastoreFixture(&[("tts_service_type", "SIMPLE_TTS")], &[])),
+        (ENTRY_USER_PREFERENCES, datastoreFixture(&[
+            ("language", "zh-CN"), ("active_memory_space_id", "default"), ("memory_space_list", "[\"default\"]"),
+            ("memory_space_default", "{\"id\":\"default\",\"name\":\"Legacy memories\",\"sourceOnlyField\":true}"),
+            ("character_card_theme_card-1_custom_ai_avatar_uri", "file:///data/user/0/com.ai.assistance.operit/files/avatar.png")
+        ], &[])),
+        ("payload/shared_prefs/memory_search_settings_default.xml", br#"<map><int name="auto_save_interval_minutes" value="17"/><long name="next_auto_save_run_at_ms" value="1720000000001"/><string name="memory_extraction_custom_rules">A &amp; B</string><int name="score_mode" value="2"/><float name="vector_weight" value="3.5"/></map>"#.to_vec()),
+        ("payload/shared_prefs/cloud_embedding_settings_default.xml", br#"<map><boolean name="enabled" value="true"/><string name="endpoint">https://embedding.invalid</string><string name="api_key">actual-source-key</string><string name="model">source-model</string></map>"#.to_vec()),
+        (ENTRY_DATABASE, std::fs::read(&databasePath).expect("real SQLite bytes must be readable")),
+        (ENTRY_OBJECTBOX_DEFAULT_DATA, b"opaque source memory database: not decoded or adopted".to_vec()),
+        ("payload/files/objectbox_profile_1784617683731/data.mdb", b"unlisted database must not be opened".to_vec()),
+        ("payload/files/objectbox_profile_1784617717534/data.mdb", b"another unlisted database must not be opened".to_vec()),
+        ("payload/files/.vector_index/doc_index_default_25_1024.hnsw", b"Retired vector index".to_vec()),
+        ("payload/files/doc_index_default_25_1024.hnsw", b"Retired top-level document index".to_vec()),
+        ("payload/files/memory_hnsw_default_1024.idx", b"Retired top-level memory index".to_vec()),
+        ("payload/files/memory-space-profiles/default/user.md", b"Legacy user document".to_vec()),
+        ("payload/files/workspace/demo/USER.md", b"Workspace-owned USER.md remains a normal file".to_vec()),
+        ("payload/files/attachment.txt", b"Preserved attachment".to_vec()),
+        ("payload/external_files/document.txt", b"Preserved external document".to_vec()),
+    ];
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    for (name, bytes) in entries {
+        writer.start_file(name, options).unwrap();
+        writer.write_all(&bytes).unwrap();
+    }
+    Arc::new(SnapshotFixture { bytes: writer.finish().unwrap().into_inner(), databasePath })
+}
+
+/// Ignores unreferenced databases and adopts an active database whose registry entry was lost.
+#[test]
+fn memory_space_validation_uses_metadata_instead_of_raw_database_directories() {
+    let mut parsed = ParsedOperit1Snapshot::fromSource(completeSnapshotFixture(21)).unwrap();
+    validateOperit1MemorySpaces(&parsed).unwrap();
+    let spaces = buildOperit1MemorySpaces(&parsed).unwrap();
+    assert_eq!(spaces.keys().map(String::as_str).collect::<Vec<_>>(), vec!["default"]);
+    let plan = buildSnapshotFileCopyPlan(&parsed).unwrap();
+    assert!(plan.items.iter().all(|item| !isOperit1LegacyMemoryEntry(&item.sourceEntry)));
+
+    parsed.archive.datastorePreferences.get_mut(ENTRY_USER_PREFERENCES).unwrap().insert(
+        KEY_ACTIVE_MEMORY_SPACE_ID.to_string(),
+        Operit1PreferenceValue::String("profile_1784617683731".to_string()),
+    );
+    validateOperit1MemorySpaces(&parsed).unwrap();
+    assert_eq!(buildOperit1MemorySpaces(&parsed).unwrap().len(), 2);
+    parsed.archive.datastorePreferences.get_mut(ENTRY_USER_PREFERENCES).unwrap().insert(
+        KEY_ACTIVE_MEMORY_SPACE_ID.to_string(), Operit1PreferenceValue::String("default".to_string()),
+    );
+    let cards = parsed.archive.datastorePreferences.get_mut(ENTRY_CHARACTER_CARDS).unwrap();
+    cards.insert("character_card_card-1_memory_profile_binding_mode".to_string(), Operit1PreferenceValue::String("FIXED_PROFILE".to_string()));
+    cards.insert("character_card_card-1_memory_profile_id".to_string(), Operit1PreferenceValue::String("missing-profile".to_string()));
+    assert!(validateOperit1MemorySpaces(&parsed).unwrap_err().starts_with("Operit1 引用的记忆库缺少注册信息和数据库：missing-profile"));
+}
+
+/// Preserves three fixed bindings to one surviving database without requiring its deleted user document.
+#[test]
+fn memory_space_import_preserves_fixed_bindings_without_registry_metadata() {
+    let fixture = completeSnapshotFixture(21);
+    let mut parsed = ParsedOperit1Snapshot::fromSource(fixture.clone()).unwrap();
+    let profile = "profile_1784617683731";
+    let preferences = parsed.archive.datastorePreferences.get_mut(ENTRY_CHARACTER_CARDS).unwrap();
+    preferences.insert("character_card_list".to_string(), Operit1PreferenceValue::StringSet(
+        vec!["card-1".to_string(), "card-2".to_string(), "card-3".to_string()],
+    ));
+    for id in ["card-1", "card-2", "card-3"] {
+        for (field, value) in [("name", id), ("memory_profile_binding_mode", "FIXED_PROFILE"), ("memory_profile_id", profile)] {
+            preferences.insert(format!("character_card_{id}_{field}"), Operit1PreferenceValue::String(value.to_string()));
+        }
+    }
+    validateOperit1MemorySpaces(&parsed).unwrap();
+    let spaces = buildOperit1MemorySpaces(&parsed).unwrap();
+    assert_eq!(spaces.len(), 2, "unreferenced stale databases must remain excluded");
+    let recovered = &spaces[profile];
+    assert_eq!(recovered.id, profile);
+    assert_eq!(recovered.name, profile);
+    assert!(recovered.profileAutoUpdateEnabled);
+    assert!(!recovered.profileAutoUpdateLocked);
+    assert!(readOperit1UserMarkdown(&parsed, recovered).unwrap().is_empty());
+    for card in buildOperit2CharacterCards(&parsed, &SnapshotFileImportPlan::new()).unwrap() {
+        assert_eq!(card.memoryBindingMode, CharacterCardMemoryBindingMode::SHARED.to_string());
+        assert_eq!(card.sharedMemoryId, Some(operit1SharedMemoryStoreId(profile)));
+    }
+    // A surviving filename is not proof that its contents are readable; adoption must still run the LMDB decoder.
+    let root = std::env::temp_dir().join(format!("operit1-orphan-database-{}", Uuid::new_v4()));
+    let (_manager, host) = snapshotImportManager(&root);
+    let entry = operit1ObjectBoxEntryForProfile(profile);
+    writeArchiveEntryToStorage(host.as_ref(), &parsed, &entry, "runtime/orphan.mdb").unwrap();
+    let mut connection = TestSqliteConnection::open(&fixture.databasePath);
+    let bridge = prepareOperit1RoomImport(&mut connection).unwrap();
+    let archive = buildChatArchiveFromOperit1ToOperit2DatabaseBridge(bridge, &mut connection,
+        &SnapshotFileImportPlan::new(), &mut |_| {}).unwrap();
+    assert!(buildOperit1PluginMemoryRecords(host.as_ref(), "runtime/orphan.mdb",
+        parsed.archive.entries[&entry].uncompressedSize, "shared:orphan", &SnapshotFileImportPlan::new(),
+        &archive, "test-node").is_err());
+}
+
+/// Requires registered documents while retaining and validating documents of unregistered live databases.
+#[test]
+fn memory_space_documents_follow_registration_and_source_presence() {
+    let mut parsed = ParsedOperit1Snapshot::fromSource(completeSnapshotFixture(21)).unwrap();
+    let entry = operit1UserMarkdownEntry("default");
+    let metadata = parsed.archive.entries.remove(&entry).unwrap();
+    assert!(validateOperit1MemorySpaces(&parsed).unwrap_err().starts_with("快照缺少记忆库用户文档："));
+    parsed.archive.datastorePreferences.get_mut(ENTRY_USER_PREFERENCES).unwrap().insert(
+        KEY_MEMORY_SPACE_LIST.to_string(), Operit1PreferenceValue::String("[]".to_string()),
+    );
+    validateOperit1MemorySpaces(&parsed).unwrap();
+    parsed.archive.entries.insert(entry.clone(), metadata);
+    let spaces = buildOperit1MemorySpaces(&parsed).unwrap();
+    assert_eq!(readOperit1UserMarkdown(&parsed, &spaces["default"]).unwrap(), b"Legacy user document");
+    parsed.archive.entries.get_mut(&entry).unwrap().uncompressedSize = 48_001;
+    assert!(validateOperit1MemorySpaces(&parsed).unwrap_err().starts_with("Operit1 记忆库用户文档超过大小限制："));
+}
+
+/// Preserves Kotlin's implicit default, whitespace handling and group precedence without rewriting IDs.
+#[test]
+fn active_prompt_import_matches_kotlin_selection_semantics() {
+    let mut parsed = ParsedOperit1Snapshot::fromSource(completeSnapshotFixture(21)).unwrap();
+    for (group, card, expected) in [
+        (None, None, serde_json::json!({"CharacterCard":{"id":OPERIT1_SOURCE_DEFAULT_CHARACTER_CARD_ID}})),
+        (Some(" \t"), Some("\n"), serde_json::json!({"CharacterCard":{"id":OPERIT1_SOURCE_DEFAULT_CHARACTER_CARD_ID}})),
+        (Some(""), Some("card-1"), serde_json::json!({"CharacterCard":{"id":"card-1"}})),
+        (Some("group-1"), None, serde_json::json!({"CharacterGroup":{"id":"group-1"}})),
+        (Some("group-1"), Some("card-1"), serde_json::json!({"CharacterGroup":{"id":"group-1"}})),
+        (None, Some("deleted-card"), serde_json::json!({"CharacterCard":{"id":"deleted-card"}})),
+    ] {
+        for (entry, key, value) in [
+            (ENTRY_CHARACTER_GROUPS, "active_character_group_id", group),
+            (ENTRY_CHARACTER_CARDS, "active_character_card_id", card),
+        ] {
+            let preferences = parsed.archive.datastorePreferences.get_mut(entry).unwrap();
+            preferences.remove(key);
+            if let Some(id) = value {
+                preferences.insert(key.to_string(), Operit1PreferenceValue::String(id.to_string()));
+            }
+        }
+        assert_eq!(buildOperit1ActivePrompt(&parsed).unwrap(), expected);
+    }
+    parsed.archive.datastorePreferences.get_mut(ENTRY_CHARACTER_CARDS).unwrap().insert(
+        "active_character_card_id".to_string(), Operit1PreferenceValue::Boolean(true),
+    );
+    assert!(buildOperit1ActivePrompt(&parsed).is_err());
+}
+
+/// Persists all API credentials, empty draft providers, model indices and fixed character provider bindings.
+#[test]
+fn full_model_import_preserves_all_providers_and_function_bindings() {
+    let root = std::env::temp_dir().join(format!("operit1-model-import-{}", Uuid::new_v4()));
+    let (manager, _) = snapshotImportManager(&root);
+    let mut parsed = ParsedOperit1Snapshot::fromSource(completeSnapshotFixture(21)).unwrap();
+    parsed.configs = serde_json::from_value(serde_json::json!([
+        {"id":"default","name":"Source main","apiEndpoint":"https://main.invalid/v1","apiKey":"main-secret","modelName":"first,second","useMultipleApiKeys":true,"apiKeyPool":[{"id":"key-1","key":"pool-secret"}]},
+        {"id":"vision-provider","name":"Source vision","apiProviderType":"ANTHROPIC_GENERIC","apiEndpoint":"https://vision.invalid/v1","apiKey":"vision-secret","modelName":"vision"},
+        {"id":"empty-provider","name":"Source draft","apiProviderType":"OTHER","apiEndpoint":"https://draft.invalid/v1","apiKey":"draft-secret"}
+    ])).unwrap();
+    let mut mapping = serde_json::Map::new();
+    for function in ["CHAT", "SUMMARY", "TITLE_GENERATION", "MEMORY", "UI_CONTROLLER", "TRANSLATION", "GREP", "ROLE_RESPONSE_PLANNER", "IMAGE_RECOGNITION", "AUDIO_RECOGNITION", "VIDEO_RECOGNITION"] {
+        mapping.insert(function.to_string(), serde_json::json!({"configId":"default","modelIndex":1}));
+    }
+    mapping.insert("IMAGE_RECOGNITION".to_string(), serde_json::json!({"configId":"vision-provider"}));
+    parsed.archive.datastorePreferences.get_mut(ENTRY_FUNCTIONAL_CONFIGS).unwrap().insert(
+        KEY_FUNCTION_CONFIG_MAPPING.to_string(), Operit1PreferenceValue::String(Value::Object(mapping).to_string()),
+    );
+    let result = manager.importAllModelConfigsFromParsed(&parsed).unwrap();
+    assert_eq!(result.importedModelCount, 3);
+    assert_eq!(result.modelId, "second");
+    let providers = ModelConfigManager::default().getProviderProfiles().unwrap();
+    assert_eq!(providers.len(), 3);
+    for config in &parsed.configs {
+        let provider = providers.iter().find(|provider| provider.id == operit1ProviderId(&config.id)).unwrap();
+        assert_eq!(provider.name, config.name);
+        assert!(provider.apiKey == config.apiKey, "Source API credential was not preserved");
+        assert_eq!(provider.apiKeyPool.len(), config.apiKeyPool.len());
+        assert_eq!(provider.models.iter().map(|model| model.id.clone()).collect::<Vec<_>>(), splitModelIds(&config.modelName));
+    }
+    let bindings = FunctionalConfigManager::default().functionModelBindingFlow().unwrap().first().unwrap();
+    assert_eq!(bindings[&FunctionType::CHAT].modelId, "second");
+    assert_eq!(bindings[&FunctionType::IMAGE_RECOGNITION].providerId, "vision-provider");
+    let cards = parsed.archive.datastorePreferences.get_mut(ENTRY_CHARACTER_CARDS).unwrap();
+    cards.insert("character_card_card-1_chat_model_binding_mode".to_string(), Operit1PreferenceValue::String("FIXED_CONFIG".to_string()));
+    cards.insert("character_card_card-1_chat_model_config_id".to_string(), Operit1PreferenceValue::String("vision-provider".to_string()));
+    let card = &buildOperit2CharacterCards(&parsed, &SnapshotFileImportPlan::new()).unwrap()[0];
+    assert_eq!(card.chatProviderId.as_deref(), Some("vision-provider"));
+    assert_eq!(card.chatModelId.as_deref(), Some("vision"));
+}
+
+/// Imports repeated source names and a target collision while retaining exact function and card identities.
+#[test]
+fn full_model_import_renames_duplicate_provider_names_without_changing_bindings() {
+    let root = std::env::temp_dir().join(format!("operit1-duplicate-names-{}", Uuid::new_v4()));
+    let (manager, _) = snapshotImportManager(&root);
+    let configs = ModelConfigManager::default();
+    let retainedId = configs.createProvider(
+        "Same name".to_string(), "OPENAI".to_string(), "https://retained.invalid/v1".to_string(),
+    ).unwrap();
+    let mut parsed = ParsedOperit1Snapshot::fromSource(completeSnapshotFixture(21)).unwrap();
+    parsed.configs = serde_json::from_value(serde_json::json!([
+        {"id":"default","name":"Same name","modelName":"chat-model","apiKey":"chat-secret","apiProviderType":"OPENAI"},
+        {"id":"vision","name":"Same name","modelName":"vision-model","apiKey":"vision-secret","apiProviderType":"OPENAI"}
+    ])).unwrap();
+    parsed.archive.datastorePreferences.get_mut(ENTRY_FUNCTIONAL_CONFIGS).unwrap().insert(
+        KEY_FUNCTION_CONFIG_MAPPING.to_string(), Operit1PreferenceValue::String(serde_json::json!({
+            "CHAT":{}, "IMAGE_RECOGNITION":{"configId":"vision"}
+        }).to_string()),
+    );
+    let cards = parsed.archive.datastorePreferences.get_mut(ENTRY_CHARACTER_CARDS).unwrap();
+    cards.insert("character_card_card-1_chat_model_binding_mode".to_string(), Operit1PreferenceValue::String("FIXED_CONFIG".to_string()));
+    cards.insert("character_card_card-1_chat_model_config_id".to_string(), Operit1PreferenceValue::String("vision".to_string()));
+
+    let result = manager.importAllModelConfigsFromParsed(&parsed).unwrap();
+    assert_eq!(result.providerName, "Same name1");
+    assert_eq!(result.modelId, "chat-model");
+    assert_eq!(result.importedModelCount, 2);
+    assert_eq!(configs.getProviderProfile(&retainedId).unwrap().name, "Same name");
+    for (source, expectedName) in parsed.configs.iter().zip(["Same name1", "Same name2"]) {
+        let provider = configs.getProviderProfile(&operit1ProviderId(&source.id)).unwrap();
+        assert_eq!(provider.name, expectedName);
+        assert_eq!(provider.apiKey, source.apiKey);
+        assert_eq!(provider.models[0].id, source.modelName);
+    }
+    let bindings = FunctionalConfigManager::default().functionModelBindingFlow().unwrap().first().unwrap();
+    assert_eq!(bindings[&FunctionType::CHAT].providerId, ModelConfigDefaults::DEFAULT_PROVIDER_ID);
+    assert_eq!(bindings[&FunctionType::CHAT].modelId, "chat-model");
+    assert_eq!(bindings[&FunctionType::IMAGE_RECOGNITION].providerId, "vision");
+    let card = &buildOperit2CharacterCards(&parsed, &SnapshotFileImportPlan::new()).unwrap()[0];
+    assert_eq!(card.chatProviderId.as_deref(), Some("vision"));
+    assert_eq!(card.chatModelId.as_deref(), Some("vision-model"));
+    assert_eq!(manager.importAllModelConfigsFromParsed(&parsed).unwrap().providerName, "Same name1");
+}
+
+/// Migrates stale source indices with Kotlin's selection semantics across preview, functions and cards.
+#[test]
+fn model_index_migration_matches_kotlin_for_all_binding_paths() {
+    let root = std::env::temp_dir().join(format!("operit1-model-indices-{}", Uuid::new_v4()));
+    let (manager, _) = snapshotImportManager(&root);
+    let mut parsed = ParsedOperit1Snapshot::fromSource(completeSnapshotFixture(21)).unwrap();
+    parsed.configs = serde_json::from_value(serde_json::json!([
+        {"id":"default","name":"Source main","modelName":" gemini-3.8-flash, ,opus5.5, x-deepseek-v4.1-flash, ","apiProviderType":"OPENAI_GENERIC"},
+        {"id":"controller","name":"Source controller","modelName":"controller-model","apiProviderType":"OPENAI_GENERIC"}
+    ])).unwrap();
+    for (requestedIndex, expectedIndex, expectedModel) in [
+        (3, 0, "gemini-3.8-flash"),
+        (-1, 0, "gemini-3.8-flash"),
+        (i32::MIN, 0, "gemini-3.8-flash"),
+        (i32::MAX, 0, "gemini-3.8-flash"),
+        (0, 0, "gemini-3.8-flash"),
+        (1, 1, "opus5.5"),
+        (2, 2, "x-deepseek-v4.1-flash"),
+    ] {
+        let mapping = serde_json::json!({"modelIndex":requestedIndex});
+        parsed.chatMapping = decodeFunctionMapping(mapping.clone()).unwrap();
+        let mut mappings = serde_json::Map::new();
+        for function in ["CHAT", "SUMMARY", "TITLE_GENERATION", "MEMORY", "TRANSLATION", "GREP", "ROLE_RESPONSE_PLANNER", "IMAGE_RECOGNITION", "AUDIO_RECOGNITION", "VIDEO_RECOGNITION"] {
+            mappings.insert(function.to_string(), mapping.clone());
+        }
+        mappings.insert("UI_CONTROLLER".to_string(), serde_json::json!({"configId":"controller"}));
+        parsed.archive.datastorePreferences.get_mut(ENTRY_FUNCTIONAL_CONFIGS).unwrap().insert(
+            KEY_FUNCTION_CONFIG_MAPPING.to_string(), Operit1PreferenceValue::String(Value::Object(mappings).to_string()),
+        );
+        let preview = parsed.modelConfigPreview().unwrap();
+        assert_eq!(preview.chatModelId.as_deref(), Some(expectedModel));
+        assert_eq!(preview.chatModelIndex, Some(expectedIndex));
+        assert_eq!(preview.configs[0].selectedModelId.as_deref(), Some(expectedModel));
+        assert_eq!(preview.configs[0].selectedModelIndex, Some(expectedIndex));
+        assert_eq!(preview.configs[1].selectedModelId, None);
+        assert_eq!(parsed.chatMapping.modelIndex, requestedIndex, "Inspection must not rewrite source metadata");
+
+        let result = manager.importAllModelConfigsFromParsed(&parsed).unwrap();
+        assert_eq!(result.modelId, expectedModel);
+        assert_eq!(result.importedModelCount, 4);
+        let bindings = FunctionalConfigManager::default().functionModelBindingFlow().unwrap().first().unwrap();
+        assert_eq!(bindings.len(), 11);
+        for (function, binding) in &bindings {
+            if *function == FunctionType::UI_CONTROLLER {
+                assert_eq!(binding.providerId, "controller");
+                assert_eq!(binding.modelId, "controller-model");
+            } else {
+                assert_eq!(binding.providerId, ModelConfigDefaults::DEFAULT_PROVIDER_ID);
+                assert_eq!(binding.modelId, expectedModel);
+            }
+        }
+        let cards = parsed.archive.datastorePreferences.get_mut(ENTRY_CHARACTER_CARDS).unwrap();
+        cards.insert("character_card_card-1_chat_model_binding_mode".to_string(), Operit1PreferenceValue::String("FIXED_CONFIG".to_string()));
+        cards.insert("character_card_card-1_chat_model_config_id".to_string(), Operit1PreferenceValue::String("default".to_string()));
+        cards.insert("character_card_card-1_chat_model_index".to_string(), Operit1PreferenceValue::Int(requestedIndex));
+        let card = &buildOperit2CharacterCards(&parsed, &SnapshotFileImportPlan::new()).unwrap()[0];
+        assert_eq!(card.chatProviderId.as_deref(), Some(ModelConfigDefaults::DEFAULT_PROVIDER_ID));
+        assert_eq!(card.chatModelId.as_deref(), Some(expectedModel));
+    }
+}
+
+/// Uses source order for broken function and character bindings without filtering model capabilities.
+#[test]
+fn model_binding_import_uses_first_configured_model_for_missing_and_empty_configs() {
+    let root = std::env::temp_dir().join(format!("operit1-model-rebinding-{}", Uuid::new_v4()));
+    let (manager, _) = snapshotImportManager(&root);
+    let mut parsed = ParsedOperit1Snapshot::fromSource(completeSnapshotFixture(21)).unwrap();
+    parsed.configs = serde_json::from_value(serde_json::json!([
+        {"id":"draft","name":"Empty draft","modelName":" , , "},
+        {"id":"z-first","name":"First configured","modelName":" first-model,second-model "},
+        {"id":"a-later","name":"Later configured","modelName":"later-first,later-second"}
+    ])).unwrap();
+    let missing = "f815b541-8014-48c8-bd4c-0d135f98426a";
+    parsed.chatMapping = decodeFunctionMapping(serde_json::json!({"configId":missing,"modelIndex":1})).unwrap();
+    parsed.archive.datastorePreferences.get_mut(ENTRY_FUNCTIONAL_CONFIGS).unwrap().insert(
+        KEY_FUNCTION_CONFIG_MAPPING.to_string(), Operit1PreferenceValue::String(serde_json::json!({
+            "CHAT":{"configId":missing,"modelIndex":1},
+            "SUMMARY":{"configId":"draft","modelIndex":1},
+            "IMAGE_RECOGNITION":{"configId":missing},
+            "AUDIO_RECOGNITION":{"configId":missing},
+            "VIDEO_RECOGNITION":{"configId":missing},
+            "MEMORY":{"configId":"a-later","modelIndex":1}
+        }).to_string()),
+    );
+    let preview = parsed.modelConfigPreview().unwrap();
+    assert_eq!(preview.chatConfigId.as_deref(), Some("z-first"));
+    assert_eq!(preview.chatModelId.as_deref(), Some("first-model"));
+    assert_eq!(preview.chatModelIndex, Some(0));
+    assert_eq!(preview.configs[1].selectedModelIndex, Some(0));
+    assert_eq!(parsed.selectedChatConfig().unwrap().configId, "z-first");
+    assert_eq!(parsed.chatMapping.configId, missing, "Resolution must not rewrite source metadata");
+    let result = manager.importAllModelConfigsFromParsed(&parsed).unwrap();
+    assert_eq!(result.providerId, "z-first");
+    assert_eq!(result.modelId, "first-model");
+    assert_eq!(result.importedModelCount, 4);
+    let bindings = FunctionalConfigManager::default().functionModelBindingFlow().unwrap().first().unwrap();
+    for function in [FunctionType::CHAT, FunctionType::SUMMARY, FunctionType::IMAGE_RECOGNITION,
+        FunctionType::AUDIO_RECOGNITION, FunctionType::VIDEO_RECOGNITION, FunctionType::MEMORY] {
+        let binding = &bindings[&function];
+        if function == FunctionType::MEMORY {
+            assert_eq!(binding.providerId, "a-later");
+            assert_eq!(binding.modelId, "later-second");
+        } else {
+            assert_eq!(binding.providerId, "z-first");
+            assert_eq!(binding.modelId, "first-model");
+        }
+    }
+    let providers = ModelConfigManager::default().getProviderProfiles().unwrap();
+    for id in ["draft", "z-first", "a-later"] {
+        assert!(providers.iter().any(|provider| provider.id == id));
+    }
+    for configId in [Some(missing), Some("draft"), None] {
+        let cards = parsed.archive.datastorePreferences.get_mut(ENTRY_CHARACTER_CARDS).unwrap();
+        cards.insert("character_card_card-1_chat_model_binding_mode".to_string(), Operit1PreferenceValue::String("FIXED_CONFIG".to_string()));
+        cards.insert("character_card_card-1_chat_model_index".to_string(), Operit1PreferenceValue::Int(1));
+        cards.remove("character_card_card-1_chat_model_config_id");
+        if let Some(id) = configId {
+            cards.insert("character_card_card-1_chat_model_config_id".to_string(), Operit1PreferenceValue::String(id.to_string()));
+        }
+        let card = &buildOperit2CharacterCards(&parsed, &SnapshotFileImportPlan::new()).unwrap()[0];
+        assert_eq!(card.chatProviderId.as_deref(), Some("z-first"));
+        assert_eq!(card.chatModelId.as_deref(), Some("first-model"));
+    }
+}
+
+/// Rejects snapshots that have no actual model to bind, including empty draft-only configurations.
+#[test]
+fn model_binding_import_rejects_snapshots_without_any_models() {
+    let root = std::env::temp_dir().join(format!("operit1-invalid-model-binding-{}", Uuid::new_v4()));
+    let (manager, _) = snapshotImportManager(&root);
+    let mut parsed = ParsedOperit1Snapshot::fromSource(completeSnapshotFixture(21)).unwrap();
+    let cards = parsed.archive.datastorePreferences.get_mut(ENTRY_CHARACTER_CARDS).unwrap();
+    cards.insert("character_card_card-1_chat_model_binding_mode".to_string(), Operit1PreferenceValue::String("FIXED_CONFIG".to_string()));
+    cards.insert("character_card_card-1_chat_model_config_id".to_string(), Operit1PreferenceValue::String("test-model".to_string()));
+    parsed.configs[0].modelName = " , , ".to_string();
+    assert!(manager.importAllModelConfigsFromParsed(&parsed).unwrap_err().starts_with("Operit1 快照中没有配置任何模型"));
+    assert!(buildOperit2CharacterCards(&parsed, &SnapshotFileImportPlan::new()).unwrap_err().starts_with("Operit1 快照中没有配置任何模型"));
+    parsed.configs.clear();
+    assert!(parsed.modelConfigPreview().unwrap_err().starts_with("Operit1 快照中没有配置任何模型"));
+    assert!(manager.importAllModelConfigsFromParsed(&parsed).unwrap_err().starts_with("Operit1 快照中没有配置任何模型"));
+    assert!(buildOperit2CharacterCards(&parsed, &SnapshotFileImportPlan::new()).unwrap_err().starts_with("Operit1 快照中没有配置任何模型"));
+}
+
+/// Executes the production source bridge and target projection using the same database bytes retained in the ZIP.
+fn verifySourceProjection(version: i32, expectedPinned: bool) {
+    let fixture = completeSnapshotFixture(version);
+    let parsed = ParsedOperit1Snapshot::fromSource(fixture.clone()).unwrap();
+    let mut stagedBytes = Vec::new();
+    parsed.copyEntryTo(ENTRY_DATABASE, &mut stagedBytes).unwrap();
+    assert_eq!(stagedBytes, std::fs::read(&fixture.databasePath).unwrap());
+    let mut connection = TestSqliteConnection::open(&fixture.databasePath);
+    let bridge = prepareOperit1RoomImport(&mut connection).unwrap();
+    let mut messageCount = 0;
+    let archive = buildChatArchiveFromOperit1ToOperit2DatabaseBridge(bridge, &mut connection,
+        &SnapshotFileImportPlan::new(), &mut |_| messageCount += 1).unwrap();
+    assert_eq!(operit1ChatDatabaseCounts(&mut connection).unwrap(), (1, 1));
+    assert_eq!(messageCount, 1);
+    assert_eq!(archive.chats.len(), 1);
+    assert_eq!(archive.workspaces.len(), 1);
+    let chat = &archive.chats[0];
+    assert_eq!(chat.id, "source-chat");
+    assert_eq!(chat.inputTokens, i64::MAX - 1);
+    assert_eq!(chat.displayOrder, 14);
+    assert_eq!(chat.parentChatId.as_deref(), Some("parent-chat"));
+    assert!(chat.locked);
+    assert_eq!(chat.pinned, expectedPinned);
+    assert_eq!(chat.pluginExtensions[crate::data::backup::CharacterPluginMigration::LEGACY_BINDING_NAMESPACE], serde_json::json!({"characterCardName":"legacy-card","characterGroupId":if version == 10 { None } else { Some("legacy-group") }}));
+    assert_eq!(chat.messages.len(), 1);
+    assert!(chat.messages[0].baseMessage.pluginExtensions.is_empty());
+    assert_eq!(chat.messages[0].baseMessage.roleName, "Historical role text");
+    assert_eq!(chat.messages[0].baseMessage.parts[0].content, "Preserved user history");
+    let target = serde_json::to_value(chat).unwrap();
+    for key in ["characterCardName", "characterGroupId", "activePrompt"] {
+        assert!(target.get(key).is_none(), "legacy source binding must not enter target: {key}");
+    }
+    assert_eq!(target["group"], "legacy-folder");
+    assert!(target["pluginExtensions"].get(crate::data::backup::CharacterPluginMigration::LEGACY_BINDING_NAMESPACE).is_some());
+    let preview = parsed.preview(operit1ChatDatabaseCounts(&mut connection).unwrap()).unwrap();
+    assert_eq!((preview.chatCount, preview.messageCount), (1, 1));
+    assert_eq!(preview.modelConfig.chatModelId.as_deref(), Some("model"));
+    let speech = buildOperit2TtsConfig(&parsed).unwrap().unwrap();
+    assert_eq!(speech.providerType, TtsProviderType::SYSTEM_TTS.to_string());
+}
+
+/// Preserves non-null v10 source bindings and exact column indexes without adopting those bindings into Core.
+#[test]
+fn room_v10_complete_snapshot_projects_chats_without_legacy_associations() { verifySourceProjection(10, false); }
+
+/// Preserves non-null v20 source group/card columns, locked and pinned while target namespaces remain empty.
+#[test]
+fn room_v20_complete_snapshot_projects_chats_without_legacy_associations() { verifySourceProjection(20, true); }
+
+/// Accepts the original v21 source version against the explicit new target schema without changing the source version.
+#[test]
+fn room_v21_complete_snapshot_projects_chats_without_legacy_associations() { verifySourceProjection(21, true); }
+
+/// Imports real Room rows and messages through the production schema bridge for supplied workspace values.
+fn importChatsWithWorkspacePaths(
+    version: i32,
+    paths: &[Option<&str>],
+) -> Result<OperitChatArchive, String> {
+    let mut connection = TestSqliteConnection::new();
+    connection.executeBatch(ROOM_V10_SQL);
+    if matches!(version, 20 | 21) {
+        connection.executeBatch(ROOM_V20_SQL);
+    }
+    if version == 21 {
+        connection.executeBatch("PRAGMA user_version = 21;");
+    }
+    for (index, path) in paths.iter().enumerate() {
+        let chatId = format!("workspace-chat-{index}");
+        let workspace = match path {
+            Some(path) => SqliteValue::Text((*path).to_string()),
+            None => SqliteValue::Null,
+        };
+        connection
+            .execute(
+                r#"INSERT INTO chats (
+                id, title, createdAt, updatedAt, inputTokens, outputTokens,
+                currentWindowSize, "group", displayOrder, workspace, parentChatId,
+                characterCardName, locked
+            ) SELECT ?1, title, createdAt, updatedAt, inputTokens, outputTokens,
+                currentWindowSize, "group", ?2, ?3, parentChatId, characterCardName, locked
+            FROM chats WHERE id = 'source-chat'"#,
+                vec![
+                    SqliteValue::Text(chatId.clone()),
+                    SqliteValue::Integer(index as i64),
+                    workspace,
+                ],
+            )
+            .unwrap();
+        connection.execute(
+            "INSERT INTO messages (messageId, chatId, sender, content, timestamp, orderIndex, roleName, provider, modelName)
+             SELECT ?1, ?2, sender, content, timestamp, orderIndex, roleName, provider, modelName
+             FROM messages WHERE chatId = 'source-chat'",
+            vec![SqliteValue::Text(format!("workspace-message-{index}")), SqliteValue::Text(chatId)],
+        ).unwrap();
+    }
+    connection.executeBatch("DELETE FROM messages WHERE chatId = 'source-chat'; DELETE FROM chats WHERE id = 'source-chat';");
+    let bridge = prepareOperit1RoomImport(&mut connection)?;
+    let mut parsed = 0;
+    let archive = buildChatArchiveFromOperit1ToOperit2DatabaseBridge(
+        bridge,
+        &mut connection,
+        &SnapshotFileImportPlan::new(),
+        &mut |_| parsed += 1,
+    )?;
+    assert_eq!(parsed, paths.len());
+    Ok(archive)
+}
+
+/// Preserves every chat and message while legacy null, empty, and root values produce no workspace binding.
+#[test]
+fn legacy_root_workspaces_import_as_unbound_chats() {
+    let paths = [
+        None,
+        Some(""),
+        Some(" \t "),
+        Some("/"),
+        Some(" /// "),
+        Some("file:///"),
+        Some("file:////"),
+        Some(r"\"),
+    ];
+    for version in [10, 20, 21] {
+        let archive = importChatsWithWorkspacePaths(version, &paths).unwrap();
+        assert!(archive.workspaces.is_empty());
+        assert_eq!(archive.chats.len(), paths.len());
+        for chat in &archive.chats {
+            assert!(chat.workspaceId.is_none());
+            assert_eq!(chat.messages.len(), 1);
+            assert_eq!(
+                chat.messages[0].baseMessage.parts[0].content,
+                "Preserved user history"
+            );
+        }
+    }
+}
+
+/// Deduplicates equivalent legacy paths into one real workspace and preserves separate folders.
+#[test]
+fn legacy_workspace_aliases_share_real_workspace_ids() {
+    let paths = [
+        Some("/data/user/0/com.ai.assistance.operit/files/workspace/demo"),
+        Some(" file:///data/user/0/com.ai.assistance.operit/files/workspace/demo/ "),
+        Some("/data//user/0/com.ai.assistance.operit/files/workspace/demo///"),
+        Some(r"\data\user\0\com.ai.assistance.operit\files\workspace\demo"),
+        Some("/data/user/0/com.ai.assistance.operit/files/workspace/other"),
+    ];
+    for version in [10, 20, 21] {
+        let archive = importChatsWithWorkspacePaths(version, &paths).unwrap();
+        assert_eq!(archive.workspaces.len(), 2);
+        assert_eq!(archive.chats.len(), paths.len());
+        let workspace = &archive.workspaces[0];
+        assert_eq!(workspace.name, "demo");
+        assert_eq!(workspace.primaryFolder().path, "/operitapp/workspaces/demo");
+        workspace.validate().unwrap();
+        for chat in &archive.chats[..4] {
+            assert_eq!(chat.workspaceId.as_deref(), Some(workspace.id.as_str()));
+            assert_eq!(chat.messages.len(), 1);
+        }
+        assert_ne!(archive.chats[4].workspaceId, archive.chats[0].workspaceId);
+        assert_eq!(
+            archive.workspaces[1].primaryFolder().path,
+            "/operitapp/workspaces/other"
+        );
+    }
+}
+
+/// Rejects malformed non-root bindings with source chat context instead of dropping their errors.
+#[test]
+fn invalid_legacy_workspace_paths_remain_import_errors() {
+    for version in [10, 20, 21] {
+        for path in [
+            ".",
+            "..",
+            "relative/project",
+            "/tmp/../project",
+            "file://server/project",
+        ] {
+            let error = importChatsWithWorkspacePaths(version, &[Some(path)]).unwrap_err();
+            assert!(
+                error.starts_with("Operit1 chat workspace-chat-0 workspace:"),
+                "{error}"
+            );
+        }
+    }
+}
+
+/// Builds a source snapshot with saved speech fields, including Kotlin's empty HTTP URL state.
+fn legacyTtsSnapshot(serviceType: &str, endpoint: &str, voice: &str) -> ParsedOperit1Snapshot {
+    let mut parsed = ParsedOperit1Snapshot::fromSource(completeSnapshotFixture(20)).unwrap();
+    let httpConfig = serde_json::json!({
+        "urlTemplate": endpoint,
+        "apiKey": "saved-api-key",
+        "modelName": "saved-model",
+        "voiceId": voice,
+        "headers": {"X-Saved": "saved-header", "authorization": "stale-http-auth"},
+        "httpMethod": "GET",
+        "requestBody": "{\"saved\":\"{text}\"}",
+        "contentType": "application/saved+json",
+        "responsePipeline": [{"type": "parse_json_string", "path": ""}]
+    });
+    let preferences = parsed
+        .archive
+        .datastorePreferences
+        .get_mut(ENTRY_SPEECH_SERVICES)
+        .unwrap();
+    preferences.insert(
+        "tts_service_type".to_string(),
+        Operit1PreferenceValue::String(serviceType.to_string()),
+    );
+    preferences.insert(
+        "tts_http_config".to_string(),
+        Operit1PreferenceValue::String(httpConfig.to_string()),
+    );
+    preferences.insert(
+        "tts_speech_rate".to_string(),
+        Operit1PreferenceValue::Float(1.25),
+    );
+    parsed
+}
+
+/// Projects a configured legacy speech service into its target provider contract.
+fn legacyTtsConfig(serviceType: &str, endpoint: &str, voice: &str) -> Result<TtsConfig, String> {
+    buildOperit2TtsConfig(&legacyTtsSnapshot(serviceType, endpoint, voice))
+        .map(|config| config.unwrap())
+}
+
+/// Accepts empty legacy URLs for built-in services and restores the complete provider HTTP contract.
+#[test]
+fn builtin_tts_import_accepts_empty_legacy_http_endpoint() {
+    for (serviceType, expectedVoice) in [
+        ("SILICONFLOW_TTS", "saved-model:saved-voice"),
+        ("MINIMAX_TTS", "saved-voice"),
+        ("MIMO_TTS", "saved-voice"),
+        ("DOUBAO_TTS", "saved-voice"),
+    ] {
+        let config = legacyTtsConfig(serviceType, "", "saved-voice").unwrap();
+        let catalog = TtsCatalog::provider(serviceType).unwrap();
+        assert_eq!(config.providerType, serviceType);
+        assert_eq!(config.endpoint, catalog.defaultEndpoint);
+        assert_eq!(config.httpMethod, "POST");
+        assert_eq!(config.requestBody, catalog.defaultRequestBody);
+        assert_eq!(config.contentType, "application/json");
+        assert_eq!(config.responseFormat, catalog.defaultResponseFormat);
+        assert_eq!(config.responsePipeline, catalog.defaultResponsePipeline);
+        assert_eq!(config.apiKey, "saved-api-key");
+        assert_eq!(config.model, "saved-model");
+        assert_eq!(config.voice, expectedVoice);
+        assert_eq!(config.speed, 1.25);
+        assert!(config
+            .headers
+            .iter()
+            .any(|header| header.name == "X-Saved" && header.value == "saved-header"));
+        for expected in catalog.defaultHeaders {
+            let matching: Vec<_> = config
+                .headers
+                .iter()
+                .filter(|header| header.name.eq_ignore_ascii_case(&expected.name))
+                .collect();
+            assert_eq!(matching, vec![&expected]);
+        }
+        assert_eq!(normalizeTtsConfig(config.clone()).unwrap(), config);
+    }
+}
+
+/// Preserves user-configurable service endpoints and maps the Kotlin OpenAI service identity.
+#[test]
+fn builtin_tts_import_preserves_configurable_endpoint() {
+    for (serviceType, providerType) in [
+        ("MINIMAX_TTS", "MINIMAX_TTS"),
+        ("MIMO_TTS", "MIMO_TTS"),
+        ("DOUBAO_TTS", "DOUBAO_TTS"),
+        ("OPENAI_TTS", "OPENAI_COMPATIBLE"),
+    ] {
+        let config =
+            legacyTtsConfig(serviceType, "https://saved.invalid/tts", "saved-voice").unwrap();
+        assert_eq!(config.providerType, providerType);
+        assert_eq!(config.endpoint, "https://saved.invalid/tts");
+        assert_eq!(config.httpMethod, "POST");
+    }
+    let siliconflow = legacyTtsConfig(
+        "SILICONFLOW_TTS",
+        "https://unrelated.invalid/tts",
+        "saved-voice",
+    )
+    .unwrap();
+    assert_eq!(
+        siliconflow.endpoint,
+        "https://api.siliconflow.cn/v1/audio/speech"
+    );
+}
+
+/// Converts preset voice names while preserving already qualified and custom speech identifiers.
+#[test]
+fn tts_import_maps_model_qualified_voice_identifiers() {
+    for (source, expected) in [
+        ("charles", "saved-model:charles"),
+        ("saved-model:charles", "saved-model:charles"),
+        ("speech:custom-voice", "speech:custom-voice"),
+    ] {
+        let config = legacyTtsConfig("SILICONFLOW_TTS", "", source).unwrap();
+        assert_eq!(config.voice, expected);
+    }
+}
+
+/// Preserves actual generic HTTP settings for configured source providers.
+#[test]
+fn custom_http_tts_import_preserves_request_and_validation() {
+    let config = legacyTtsConfig(
+        "HTTP_TTS",
+        "https://saved.invalid/tts?text={text}",
+        "saved-voice",
+    )
+    .unwrap();
+    assert_eq!(config.providerType, TtsProviderType::HTTP_TTS);
+    assert_eq!(config.endpoint, "https://saved.invalid/tts?text={text}");
+    assert_eq!(config.httpMethod, "GET");
+    assert_eq!(config.requestBody, "{\"saved\":\"{text}\"}");
+    assert_eq!(config.contentType, "application/saved+json");
+    assert_eq!(config.responsePipeline[0].stepType, "parse_json_string");
+    assert!(config
+        .headers
+        .iter()
+        .any(|header| header.name == "authorization" && header.value == "stale-http-auth"));
+}
+
+/// Treats absent and blank Kotlin HTTP presets as unconfigured without changing target profiles.
+#[test]
+fn unconfigured_http_tts_import_preserves_target_speech_configuration() {
+    let root = std::env::temp_dir().join(format!("operit1-empty-tts-{}", Uuid::new_v4()));
+    let (manager, _) = snapshotImportManager(&root);
+    let target = TtsConfigManager::new(RuntimeStorePaths::default());
+    let configured = target
+        .createTtsConfig(
+            legacyTtsConfig("HTTP_TTS", "https://target.invalid/tts?text={text}", "target-voice")
+                .unwrap(),
+        )
+        .unwrap();
+    target.setCurrentTtsConfigId(&configured.id).unwrap();
+    let original = target.getAllTtsConfigs().unwrap();
+
+    for endpoint in [None, Some(""), Some(" \t\n")] {
+        let mut parsed = legacyTtsSnapshot("HTTP_TTS", endpoint.unwrap_or(""), "saved-voice");
+        if endpoint.is_none() {
+            parsed.archive.datastorePreferences
+                .get_mut(ENTRY_SPEECH_SERVICES)
+                .unwrap()
+                .remove("tts_http_config");
+        }
+        assert!(buildOperit2TtsConfig(&parsed).unwrap().is_none());
+        manager.importSpeechPreferences(&parsed)
+            .expect("unconfigured TTS must not interrupt snapshot migration");
+        assert_eq!(target.getAllTtsConfigs().unwrap(), original);
+        assert_eq!(target.getCurrentTtsConfigId().unwrap(), configured.id);
+    }
+}
+
+/// Keeps malformed source data and nonempty invalid endpoints visible as migration errors.
+#[test]
+fn custom_http_tts_import_rejects_malformed_configuration() {
+    assert!(legacyTtsConfig("HTTP_TTS", "not-a-url", "saved-voice").is_err());
+    let mut parsed = legacyTtsSnapshot("HTTP_TTS", "", "saved-voice");
+    let preferences = parsed.archive.datastorePreferences
+        .get_mut(ENTRY_SPEECH_SERVICES).unwrap();
+    preferences.insert(
+        "tts_http_config".to_string(),
+        Operit1PreferenceValue::String("{".to_string()),
+    );
+    assert!(buildOperit2TtsConfig(&parsed).unwrap_err()
+        .starts_with("Operit1 TTS HTTP 配置格式不正确："));
+    parsed.archive.datastorePreferences
+        .get_mut(ENTRY_SPEECH_SERVICES).unwrap()
+        .insert("tts_http_config".to_string(), Operit1PreferenceValue::Boolean(false));
+    assert!(buildOperit2TtsConfig(&parsed).is_err());
+}
+
+/// Rejects unsupported source service identities without treating them as generic HTTP providers.
+#[test]
+fn unsupported_tts_import_reports_source_service_type() {
+    assert_eq!(
+        legacyTtsConfig("UNKNOWN_TTS", "https://saved.invalid/tts", "saved-voice").unwrap_err(),
+        "不支持迁移的 Operit1 TTS 服务类型：UNKNOWN_TTS"
+    );
+}
+
+/// Keeps legacy data and unknown source JSON/preferences available to parsing and truthful preview without importing it.
+#[test]
+fn complete_snapshot_keeps_legacy_source_entries_and_preview_domains() {
+    let fixture = completeSnapshotFixture(20);
+    let parsed = ParsedOperit1Snapshot::fromSource(fixture.clone()).unwrap();
+    let mut connection = TestSqliteConnection::open(&fixture.databasePath);
+    let preview = parsed.preview(operit1ChatDatabaseCounts(&mut connection).unwrap()).unwrap();
+    for domain in ["character_cards", "character_groups", "prompt_tags", "memory"] {
+        assert!(preview.detectedDomains.iter().any(|value| value == domain));
+    }
+    assert_eq!(parsed.archive.datastorePreferences[ENTRY_CHARACTER_CARDS]["character_card_card-1_unknown_source_field"], Operit1PreferenceValue::String("preserved".to_string()));
+    assert!(parsed.archive.entries.contains_key(ENTRY_OBJECTBOX_DEFAULT_DATA));
+    assert!(parsed.archive.datastorePreferences[ENTRY_CHARACTER_GROUPS]["character_group_group-1_data"].asString().unwrap().ends_with("\"sourceOnlyField\":true}"));
+    assert_eq!((preview.importedFileCount, preview.importedExternalFileCount), (2, 1));
+}
+
+/// Streams documents and attachments while excluding legacy memory storage and HNSW indexes.
+#[test]
+fn resource_copy_plan_keeps_normal_files_and_does_not_copy_legacy_domain_storage() {
+    let fixture = completeSnapshotFixture(20);
+    let parsed = ParsedOperit1Snapshot::fromSource(fixture).unwrap();
+    let plan = buildSnapshotFileCopyPlan(&parsed).unwrap();
+    assert_eq!((plan.importedFiles, plan.importedExternalFiles, plan.importedWorkspaceFiles), (1, 1, 1));
+    let sources = plan.items.iter().map(|item| item.sourceEntry.clone()).collect::<Vec<_>>();
+    assert_eq!(sources, vec!["payload/files/workspace/demo/USER.md", "payload/files/attachment.txt", "payload/external_files/document.txt"]);
+    let mut copied = Vec::new();
+    parsed.archive.copyEntriesTo(&sources, |_, name, reader| {
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        copied.push((name.to_string(), bytes));
+        Ok(())
+    }).unwrap();
+    assert_eq!(copied.len(), 3);
+    assert_eq!(copied[0].1, b"Workspace-owned USER.md remains a normal file");
+    assert_eq!(copied[1].1, b"Preserved attachment");
+    assert_eq!(copied[2].1, b"Preserved external document");
+}
+
+/// Filters only explicitly declared legacy preference keys, never unrelated keys that happen to mention memory or characters.
+#[test]
+fn mixed_preferences_skip_domain_adoption_without_rejecting_or_guessing_source_keys() {
+    for key in ["active_prompt_id", "active_character_card_id", "character_card_list", "character_group_group-1_data", "prompt_tag_list", "active_memory_space_id", "memory_space_list", "memory_space_default", "enable_memory_auto_update", "memory_settings"] {
+        assert!(isOperit1UnadoptedPreferenceKey(key), "{key}");
+    }
+    for key in ["language", "model_name", "tts_http_config", "workspace_state_demo", "memory_usage_display", "custom_character_count", "new_unknown_source_key"] {
+        assert!(!isOperit1UnadoptedPreferenceKey(key), "{key}");
+    }
+    let paths = RuntimeStorePaths::default();
+    let mappings = datastorePreferenceMappings(&paths);
+    for entry in [ENTRY_CHARACTER_CARDS, ENTRY_CHARACTER_GROUPS, ENTRY_PROMPT_TAGS, "payload/files/datastore/persona_card_chat_history.preferences_pb"] {
+        assert!(!mappings.contains_key(entry));
+    }
+    assert!(mappings.contains_key(ENTRY_USER_PREFERENCES));
+    let fixture = completeSnapshotFixture(20);
+    let parsed = ParsedOperit1Snapshot::fromSource(fixture).unwrap();
+    let source = &parsed.archive.datastorePreferences[ENTRY_USER_PREFERENCES];
+    let before = source.clone();
+    let adopted = adoptedOperit1PreferenceEntries(source, &SnapshotFileImportPlan::new()).unwrap();
+    assert_eq!(adopted, vec![("language".to_string(), "zh-CN".to_string())]);
+    assert_eq!(source, &before);
+    let onlyLegacy = HashMap::from([("active_memory_space_id".to_string(), Operit1PreferenceValue::String("default".to_string()))]);
+    assert!(adoptedOperit1PreferenceEntries(&onlyLegacy, &SnapshotFileImportPlan::new()).unwrap().is_empty());
+}
+
+/// Propagates errors from adopted preference conversion instead of converting a failed restore to an empty-success result.
+#[test]
+fn adopted_preference_projection_propagates_invalid_workspace_path() {
+    let source = HashMap::from([
+        ("open_files_/data/user/0/com.ai.assistance.operit/files/workspace/../escape".to_string(), Operit1PreferenceValue::String("{}".to_string())),
+        ("active_memory_space_id".to_string(), Operit1PreferenceValue::String("default".to_string())),
+    ]);
+    let result = adoptedOperit1PreferenceEntries(&source, &SnapshotFileImportPlan::new());
+    assert!(result.is_err());
+}
+
+/// Restores Kotlin custom parameter records with omitted defaults and preserves text byte for byte.
+#[test]
+fn custom_model_parameters_preserve_text_and_kotlin_defaults() {
+    let mut parsed = ParsedOperit1Snapshot::fromSource(completeSnapshotFixture(20)).unwrap();
+    let config = &mut parsed.configs[0];
+    config.hasCustomParameters = true;
+    for value in ["plain text", "", "123", "true", "null", "{\"key\":1}", "\"quoted\"", "中文\ntext"] {
+        for valueType in ["STRING", "OBJECT"] {
+            config.customParameters = serde_json::json!([{
+                "id": "custom-text", "name": "Text", "apiName": "text",
+                "defaultValue": "", "currentValue": value,
+                "isEnabled": true, "valueType": valueType
+            }]).to_string();
+            let parameters = buildModelParameters(config).unwrap();
+            let parameter = parameters.iter().find(|item| item.id == "custom-text").unwrap();
+            assert_eq!(parameter.currentValue, Value::String(value.to_string()));
+            assert_eq!(parameter.defaultValue, Value::String(String::new()));
+            assert_eq!(parameter.description, "");
+            assert_eq!(parameter.category, ParameterCategory::OTHER);
+            assert_eq!(parameter.valueType, parseParameterValueType(valueType).unwrap());
+            assert_eq!(parameter.minValue, None);
+            assert_eq!(parameter.maxValue, None);
+            assert!(parameter.isEnabled);
+            assert!(parameter.isCustom);
+        }
+    }
+}
+
+/// Restores numeric and boolean parameter values and limits with their declared source types.
+#[test]
+fn custom_model_parameters_restore_declared_scalar_types() {
+    let mut parsed = ParsedOperit1Snapshot::fromSource(completeSnapshotFixture(20)).unwrap();
+    let config = &mut parsed.configs[0];
+    config.hasCustomParameters = true;
+    config.customParameters = serde_json::json!([
+        {
+            "id": "custom-int", "name": "Integer", "apiName": "integer",
+            "description": "Preserved description", "category": "GENERATION",
+            "defaultValue": "0", "currentValue": "2147483647",
+            "minValue": "-2147483648", "maxValue": "2147483647",
+            "isEnabled": true, "valueType": "INT"
+        },
+        {
+            "id": "custom-float", "name": "Float", "apiName": "float",
+            "defaultValue": "0.0", "currentValue": "1.25",
+            "minValue": "-2.5", "maxValue": "3.5",
+            "isEnabled": false, "valueType": "FLOAT"
+        },
+        {
+            "id": "custom-bool", "name": "Boolean", "apiName": "boolean",
+            "defaultValue": "false", "currentValue": "true",
+            "isEnabled": true, "valueType": "BOOLEAN"
+        }
+    ]).to_string();
+    let parameters = buildModelParameters(config).unwrap();
+    let integer = parameters.iter().find(|item| item.id == "custom-int").unwrap();
+    assert_eq!(integer.currentValue, serde_json::json!(i32::MAX));
+    assert_eq!(integer.minValue, Some(serde_json::json!(i32::MIN)));
+    assert_eq!(integer.maxValue, Some(serde_json::json!(i32::MAX)));
+    assert_eq!(integer.description, "Preserved description");
+    assert_eq!(integer.category, ParameterCategory::GENERATION);
+    let float = parameters.iter().find(|item| item.id == "custom-float").unwrap();
+    assert_eq!(float.currentValue, serde_json::json!(1.25));
+    assert_eq!(float.minValue, Some(serde_json::json!(-2.5)));
+    assert_eq!(float.maxValue, Some(serde_json::json!(3.5)));
+    assert!(!float.isEnabled);
+    let boolean = parameters.iter().find(|item| item.id == "custom-bool").unwrap();
+    assert_eq!(boolean.defaultValue, Value::Bool(false));
+    assert_eq!(boolean.currentValue, Value::Bool(true));
+}
+
+/// Rejects values outside the declared source scalar type rather than storing another JSON type.
+#[test]
+fn custom_model_parameters_reject_mismatched_scalar_values() {
+    let mut parsed = ParsedOperit1Snapshot::fromSource(completeSnapshotFixture(20)).unwrap();
+    let config = &mut parsed.configs[0];
+    config.hasCustomParameters = true;
+    for (valueType, defaultValue, currentValue) in [
+        ("INT", "0", "2147483648"),
+        ("INT", "0", "1.5"),
+        ("INT", "0", "\"123\""),
+        ("FLOAT", "0.0", "null"),
+        ("FLOAT", "0.0", "\"1.25\""),
+        ("BOOLEAN", "false", "1"),
+        ("BOOLEAN", "false", "\"true\""),
+    ] {
+        config.customParameters = serde_json::json!([{
+            "id": "invalid", "name": "Invalid", "apiName": "invalid",
+            "defaultValue": defaultValue, "currentValue": currentValue,
+            "isEnabled": true, "valueType": valueType
+        }]).to_string();
+        assert!(buildModelParameters(config).unwrap_err()
+            .starts_with("Operit1 自定义参数值与声明类型"));
+    }
+}
+
+/// Runs the actual preference importer and reads signed ARGB colors through the current theme schema.
+#[test]
+fn user_preference_import_completes_theme_migrations_after_native_values() {
+    use crate::data::preferences::ThemePreferenceSnapshot::readThemePreferenceSnapshot;
+    use crate::data::preferences::UserPreferencesManager::UserPreferencesManager;
+    use operit_host_native_storage::NativeRuntimeStorageHost;
+
+    let root = std::env::temp_dir().join(format!("operit1-theme-import-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    {
+        let paths = RuntimeStorePaths::default();
+        let host = Arc::new(NativeRuntimeStorageHost::new(
+            root.join("runtime"), root.join("workspaces"),
+        ));
+        let manager = Operit1SnapshotImportManager::new(
+            paths, host.clone(), host.clone(), host.clone(),
+        );
+        let themes = crate::data::preferences::ThemeConfigManager::ThemeConfigManager::new(host.clone());
+        let initial = serde_json::from_str(include_str!("../../preferences/theme_snapshot_fixture.json")).unwrap();
+        let saved = themes.create("Existing theme".to_string(), initial).unwrap();
+        themes.apply(saved.id.clone()).unwrap();
+        let mut parsed = ParsedOperit1Snapshot::fromSource(completeSnapshotFixture(20)).unwrap();
+        parsed.archive.datastorePreferences.clear();
+        parsed.archive.datastorePreferences.insert(
+            ENTRY_USER_PREFERENCES.to_string(),
+            HashMap::from([
+                ("custom_primary_color".to_string(), Operit1PreferenceValue::Int(-16711936)),
+                ("custom_secondary_color".to_string(), Operit1PreferenceValue::Int(-1)),
+                ("use_system_theme".to_string(), Operit1PreferenceValue::Boolean(false)),
+                ("theme_mode".to_string(), Operit1PreferenceValue::String("dark".to_string())),
+                ("background_image_opacity".to_string(), Operit1PreferenceValue::Float(0.5)),
+                ("app_language".to_string(), Operit1PreferenceValue::String("zh-CN".to_string())),
+                ("use_custom_colors".to_string(), Operit1PreferenceValue::Boolean(true)),
+            ]),
+        );
+        assert_eq!(manager.importDataStorePreferences(&parsed, &SnapshotFileImportPlan::new()).unwrap(), (1, 7));
+        assert_eq!(themes.watch().first().unwrap().activeThemeConfigId, None);
+        assert_eq!(themes.get(saved.id.clone()).unwrap(), saved);
+        let preferences = UserPreferencesManager::store(host).data().unwrap();
+        let initial = serde_json::from_str(include_str!("../../preferences/theme_snapshot_fixture.json")).unwrap();
+        let snapshot = readThemePreferenceSnapshot(&preferences, &initial).unwrap();
+        assert_eq!(snapshot["customPrimaryColor"], serde_json::json!(0xff00ff00_u32));
+        assert_eq!(snapshot["customSecondaryColor"], serde_json::json!(u32::MAX));
+        assert_eq!(snapshot["themeMode"], "dark");
+        assert_eq!(snapshot["backgroundImageOpacity"], serde_json::json!(0.5));
+        assert_eq!(snapshot["useCustomColors"], true);
+        assert_eq!(preferences.getTyped::<String>(&stringPreferencesKey("app_language")).unwrap().as_deref(), Some("zh-CN"));
+    }
+    assert_eq!(root.parent().unwrap(), std::env::temp_dir());
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// Migrates legacy Long IDs exactly and preserves the complete profile through the target schema.
+#[test]
+fn operit1_github_user_info_migrates_numeric_ids_and_profile_fields() {
+    use crate::data::preferences::GitHubAuthPreferences::{GitHubAuthPreferences, GitHubUser};
+
+    for id in [60804726_i64, i64::MAX, i64::MIN] {
+        let source = serde_json::json!({
+            "id": id,
+            "login": "snapshot-user",
+            "name": "Snapshot User",
+            "email": null,
+            "avatar_url": "https://fixture.invalid/avatar.png",
+            "bio": "Preserved profile",
+            "public_repos": 17,
+            "followers": 23,
+            "following": 5
+        });
+        let mut preferences = operit_store::PreferencesDataStore::emptyPreferences();
+        preferences.set(&stringPreferencesKey("user_info"), source.to_string());
+        preferences.set(&stringPreferencesKey("is_logged_in"), "true");
+        preferences.set(&stringPreferencesKey("auth_version"), "3");
+        preferences.set(&stringPreferencesKey("access_token"), "snapshot-token");
+
+        migrateOperit1GitHubUserInfo(&mut preferences).unwrap();
+        GitHubAuthPreferences::migratePreferences(1, &mut preferences).unwrap();
+
+        let user = preferences
+            .getTyped::<GitHubUser>(&stringPreferencesKey("user_info"))
+            .unwrap()
+            .unwrap();
+        let mut expected = source;
+        expected["id"] = Value::String(id.to_string());
+        assert_eq!(serde_json::to_value(user).unwrap(), expected);
+        assert_eq!(
+            preferences.getTyped::<bool>(&stringPreferencesKey("is_logged_in")).unwrap(),
+            Some(true),
+        );
+        assert_eq!(
+            preferences.getTyped::<i64>(&stringPreferencesKey("auth_version")).unwrap(),
+            Some(3),
+        );
+        assert_eq!(
+            preferences.getTyped::<String>(&stringPreferencesKey("access_token")).unwrap().as_deref(),
+            Some("snapshot-token"),
+        );
+    }
+}
+
+/// Accepts an absent profile and nullable fields omitted by the legacy Kotlin serializer.
+#[test]
+fn operit1_github_user_info_preserves_optional_profile_fields() {
+    use crate::data::preferences::GitHubAuthPreferences::{GitHubAuthPreferences, GitHubUser};
+
+    let mut preferences = operit_store::PreferencesDataStore::emptyPreferences();
+    migrateOperit1GitHubUserInfo(&mut preferences).unwrap();
+    assert!(preferences
+        .getTyped::<String>(&stringPreferencesKey("user_info"))
+        .unwrap()
+        .is_none());
+
+    preferences.set(
+        &stringPreferencesKey("user_info"),
+        r#"{"id":60804726,"login":"snapshot-user","avatar_url":"https://fixture.invalid/avatar.png"}"#,
+    );
+    migrateOperit1GitHubUserInfo(&mut preferences).unwrap();
+    GitHubAuthPreferences::migratePreferences(1, &mut preferences).unwrap();
+    let user = preferences
+        .getTyped::<GitHubUser>(&stringPreferencesKey("user_info"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(user.id, "60804726");
+    assert_eq!(user.name, None);
+    assert_eq!(user.email, None);
+    assert_eq!(user.bio, None);
+    assert_eq!(user.publicRepos, None);
+    assert_eq!(user.followers, None);
+    assert_eq!(user.following, None);
+}
+
+/// Reports malformed legacy profiles without mutating or discarding the source value.
+#[test]
+fn operit1_github_user_info_rejects_invalid_source_types() {
+    for encoded in [
+        r#"{"id":"60804726","login":"snapshot-user","avatar_url":"avatar"}"#,
+        r#"{"id":60804726.5,"login":"snapshot-user","avatar_url":"avatar"}"#,
+        r#"{"id":9223372036854775808,"login":"snapshot-user","avatar_url":"avatar"}"#,
+        r#"{"id":null,"login":"snapshot-user","avatar_url":"avatar"}"#,
+        r#"{"id":60804726,"avatar_url":"avatar"}"#,
+        r#"{"id":60804726,"login":"snapshot-user"}"#,
+        "invalid-json",
+    ] {
+        let mut preferences = operit_store::PreferencesDataStore::emptyPreferences();
+        preferences.set(&stringPreferencesKey("user_info"), encoded);
+        let error = migrateOperit1GitHubUserInfo(&mut preferences).unwrap_err();
+        assert!(error.starts_with("Operit1 GitHub user_info 格式不正确："));
+        assert_eq!(
+            preferences.getTyped::<String>(&stringPreferencesKey("user_info")).unwrap().as_deref(),
+            Some(encoded),
+        );
+    }
+
+    let mut preferences = operit_store::PreferencesDataStore::emptyPreferences();
+    preferences.set(&stringPreferencesKey("user_info"), 60804726);
+    let error = migrateOperit1GitHubUserInfo(&mut preferences).unwrap_err();
+    assert!(error.starts_with("Operit1 GitHub user_info 读取失败："));
+    assert_eq!(
+        preferences.getTyped::<i64>(&stringPreferencesKey("user_info")).unwrap(),
+        Some(60804726),
+    );
+}
+
+/// Uses exact source memory directories rather than deleting normal workspace and externally supplied USER.md files.
+#[test]
+fn memory_copy_exclusion_is_scoped_to_declared_legacy_storage_directories() {
+    for entry in [ENTRY_OBJECTBOX_DEFAULT_DATA, "payload/files/objectbox_profile/data.mdb", "payload/files/memory-space-profiles/default/user.md", "payload/files/.vector_index/doc_index_default_25_1024.hnsw", "payload/files/.vector_index/nested/index.hnsw", "payload/files/doc_index_default_25_1024.hnsw", "payload/files/memory_hnsw_default_1024.idx"] {
+        assert!(isOperit1LegacyMemoryEntry(entry));
+        assert!(!entryMatchesCopyPrefix(entry, ENTRY_FILES_PREFIX));
+    }
+    for entry in ["payload/files/workspace/demo/USER.md", "payload/external_files/USER.md", "payload/files/objectbox_notes.txt", "payload/files/normal/memory-notes.md", "payload/files/workspace/demo/.vector_index/user.hnsw", "payload/files/.vector_index_notes.txt", "payload/files/doc_index_notes.txt", "payload/files/normal/doc_index_default_25_1024.hnsw"] {
+        assert!(!isOperit1LegacyMemoryEntry(entry));
+    }
+}
+
+/// Parses actual source XML rather than resetting custom memory configuration during adoption.
+#[test]
+fn memory_settings_xml_retains_declared_preferences() {
+    let fixture = completeSnapshotFixture(20);
+    let parsed = ParsedOperit1Snapshot::fromSource(fixture).unwrap();
+    let profiles = buildOperit1MemorySpaces(&parsed).unwrap();
+    let (settings, search) = readOperit1MemorySettings(&parsed, &profiles["default"]).unwrap();
+    assert_eq!(settings.autoSaveIntervalMinutes, 17);
+    assert_eq!(settings.nextAutoSaveRunAtMs, 1720000000001);
+    assert_eq!(settings.memoryExtractionCustomRules, "A & B");
+    assert!(settings.cloudEmbeddingEnabled);
+    assert_eq!(settings.cloudEmbeddingEndpoint, "https://embedding.invalid");
+    assert_eq!(settings.cloudEmbeddingApiKey, "actual-source-key");
+    assert_eq!(settings.cloudEmbeddingModel, "source-model");
+    assert_eq!(search.scoreMode, crate::data::backup::CharacterPluginLegacyData::MemoryScoreMode::SEMANTIC_FIRST);
+    assert_eq!(search.vectorWeight, 3.5);
+}
+
+/// Distinguishes real forward relations from link indexes and preserves every native ID width.
+#[test]
+fn objectbox_keys_decode_relations_without_adopting_indexes() {
+    for (key, kind, model, ids) in [
+        (vec![0x18,0,0,0x10,0,0,0,85], 6, 4, vec![85]),
+        (vec![0x18,0,0,0x11,0,0x20,0,0,0,0,0,1], 6, 4, vec![9007199254740993]),
+        (vec![8,0,0,0x1c,0,0,0,1,0,0,0,85], 2, 7, vec![1,85]),
+        (vec![8,0,0,0x20,0,0,0,1,0,0,0,85], 2, 8, vec![1,85]),
+        (vec![8,0,0,0x20,0,0,0,1,0,0x20,0,0,0,0,0,1], 2, 8, vec![1,9007199254740993]),
+        (vec![8,0,0,0x21,0,0x20,0,0,0,0,0,1,0,0,0,85], 2, 8, vec![9007199254740993,85]),
+        (vec![8,0,0,0x21,0,0x20,0,0,0,0,0,1,0x7f,0xff,0xff,0xff,0xff,0xff,0xff,0xff], 2, 8, vec![9007199254740993,i64::MAX]),
+    ] {
+        assert_eq!(decodeOperit1ObjectBoxKey(&key).unwrap(), Some((kind,model,ids)));
+        assert!(decodeOperit1ObjectBoxKey(&key[..key.len()-1]).is_err());
+    }
+    // These exact index keys previously attached link ID 85 as a tag/property ID.
+    for key in [
+        vec![0x20,0,0,0x20,0,0,0,0,0,0,0,1,0,0,0,85],
+        vec![0x20,0,0,0x24,0,0,0,0,0,0,0,1,0,0,0,85],
+        vec![8,0,0,0x22,0,0,0,85,0,0,0,1],
+        vec![8,0,0,0x23,0,0,0,0,0,0,0,85,0,0,0,1],
+        vec![], vec![1,2,3],
+    ] {
+        assert_eq!(decodeOperit1ObjectBoxKey(&key).unwrap(), None);
+    }
+    for key in [
+        vec![8,0,0,0x20,0,0,0,0,0,0,0,85],
+        vec![8,0,0,0x20,0,0,0,1,0,0,0,0],
+        vec![0x18,0,0,0x11,0x80,0,0,0,0,0,0,0],
+    ] {
+        assert!(decodeOperit1ObjectBoxKey(&key).is_err());
+    }
+}
+
+/// Tests the real binary table reader's int64 fields, encoded scalar zeros and corrupt offsets.
+#[test]
+fn objectbox_table_preserves_long_ids_and_explicit_scalar_defaults() {
+    let mut bytes = vec![0u8; 32];
+    bytes[0..4].copy_from_slice(&16u32.to_le_bytes());
+    bytes[4..6].copy_from_slice(&6u16.to_le_bytes());
+    bytes[6..8].copy_from_slice(&16u16.to_le_bytes());
+    bytes[8..10].copy_from_slice(&8u16.to_le_bytes());
+    bytes[16..20].copy_from_slice(&12i32.to_le_bytes());
+    bytes[24..32].copy_from_slice(&9007199254740993i64.to_le_bytes());
+    let table = FlatObjectBoxTable::new(&bytes).unwrap();
+    assert_eq!(table.requiredI64(0, "id").unwrap(), 9007199254740993);
+    assert_eq!(table.scalarI32(2, "chunkIndex").unwrap(), 0);
+    assert!(!table.scalarBool(13).unwrap());
+    bytes[8..10].copy_from_slice(&40u16.to_le_bytes());
+    let broken = FlatObjectBoxTable::new(&bytes).unwrap();
+    assert!(broken.scalarI32(0, "chunkIndex").is_err());
+}
+
+/// Resolves archive bindings and publishes them through the import's own completion path.
+#[test]
+fn archive_binding_migration_cleans_unresolved_references_without_replacing_them() {
+    use crate::data::backup::CharacterPluginMigration::{
+        CharacterPluginWriter, LEGACY_BINDING_NAMESPACE, PLUGIN_ID,
+    };
+    use operit_host_native_storage::NativeRuntimeStorageHost;
+    for (legacy, expected_binding) in [
+        (
+            serde_json::json!({"characterCardName":"Operit","characterGroupId":null}),
+            None,
+        ),
+        (
+            serde_json::json!({"characterCardName":"Operit","characterGroupId":"deleted-group"}),
+            None,
+        ),
+        (
+            serde_json::json!({"characterCardName":null,"characterGroupId":null}),
+            Some(serde_json::json!({"version":1,"selection":"model:chat"})),
+        ),
+    ] {
+        let root =
+            std::env::temp_dir().join(format!("operit1-unresolved-binding-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        {
+            let host = Arc::new(NativeRuntimeStorageHost::new(
+                root.join("runtime"),
+                root.join("workspaces"),
+            ));
+            let fixture = completeSnapshotFixture(10);
+            let mut connection = TestSqliteConnection::open(&fixture.databasePath);
+            let bridge = prepareOperit1RoomImport(&mut connection).unwrap();
+            let mut archive = buildChatArchiveFromOperit1ToOperit2DatabaseBridge(
+                bridge,
+                &mut connection,
+                &SnapshotFileImportPlan::new(),
+                &mut |_| {},
+            )
+            .unwrap();
+            archive.chats[0]
+                .pluginExtensions
+                .insert(LEGACY_BINDING_NAMESPACE.to_string(), legacy);
+            archive.chats[0]
+                .pluginExtensions
+                .insert("other.plugin".to_string(), serde_json::json!({"keep":true}));
+            let mut expected = archive.clone();
+            expected.chats[0]
+                .pluginExtensions
+                .remove(LEGACY_BINDING_NAMESPACE);
+            if expected_binding.is_some() {
+                let id = expected.chats[0].id.clone();
+                expected.chats[0].pluginExtensions.insert(
+                    PLUGIN_ID.to_string(),
+                    serde_json::json!({"recordId":id,"schemaVersion":1}),
+                );
+            }
+            resolveOperit1ArchiveBindings(&mut archive, host.clone(), host.clone()).unwrap();
+            assert_eq!(archive, expected);
+            let writer = CharacterPluginWriter::open(host.clone(), host.clone()).unwrap();
+            let drafts = writer.list("chat_drafts").unwrap();
+            match &expected_binding {
+                Some(binding) => {
+                    assert_eq!(drafts.len(), 1);
+                    assert_eq!(&drafts[0]["value"], binding);
+                }
+                None => assert!(drafts.is_empty()),
+            }
+            assert!(writer.list("chat_bindings").unwrap().is_empty());
+            publishOperit1ArchiveBindings(&[archive.chats[0].id.clone()], host.clone(), host.clone()).unwrap();
+            assert!(writer.list("chat_drafts").unwrap().is_empty());
+            assert_eq!(writer.get("chat_bindings", &archive.chats[0].id).unwrap().map(|entry| entry["value"].clone()), expected_binding);
+            assert!(!host.exists(operit_util::RuntimeStorageLayout::CHARACTER_CARDS_PREFERENCES_PATH).unwrap());
+            assert!(writer.list("cards").unwrap().is_empty());
+            assert!(writer.list("groups").unwrap().is_empty());
+        }
+        assert_eq!(root.parent().unwrap(), std::env::temp_dir());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+/// Preserves unrelated extensions while capturing only an unambiguous historical role.
+#[test]
+fn operit1_message_authors_are_adopted_without_scanning_existing_core_history() {
+    let cards = vec![serde_json::json!({"id":"author-1","name":"Historical role","avatarUri":"/operitapp/data/avatar.png"})];
+    let mut extensions = BTreeMap::from([("other.plugin".into(), serde_json::json!({"keep":true}))]);
+    adoptOperit1MessageIdentity(&mut extensions, "Historical role", &cards).unwrap();
+    assert_eq!(extensions["com.operit.character_cards"], serde_json::json!({"participantId":"author-1"}));
+    assert_eq!(extensions["host.chat.identity"], serde_json::json!({"title":"Historical role","avatarUri":"/operitapp/data/avatar.png"}));
+    assert_eq!(extensions["other.plugin"], serde_json::json!({"keep":true}));
+    for (name, available) in [("Deleted role", cards.clone()), ("Historical role", vec![cards[0].clone(), cards[0].clone()])] {
+        let mut extensions = BTreeMap::new();
+        adoptOperit1MessageIdentity(&mut extensions, name, &available).unwrap();
+        assert!(extensions.is_empty());
+    }
+}

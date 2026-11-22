@@ -1,0 +1,397 @@
+use std::future::Future;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use crate::chat::enhance::MultiServiceManager::MultiServiceManager;
+use crate::chat::llmprovider::AIService::{ensure_response_completed, AIService, SendMessageRequest};
+use crate::chat::llmprovider::ThinkingDialect::RequestThinking;
+use crate::runtime_support::ProviderRuntimeContext;
+use operit_model::ModelConfigData::{ApiProviderType, ModelCapabilities, ResolvedModelConfig};
+use operit_model::ModelParameter::{ModelParameter, ParameterCategory, ParameterValueType};
+use operit_model::PromptTurn::{toPromptTurns, PromptTurn, PromptTurnKind};
+use operit_model::ToolPrompt::{ToolParameterSchema, ToolPrompt};
+use operit_util::stream::RevisableTextStream::RevisableTextStreamLike;
+use operit_util::stream::Stream::Stream;
+use operit_util::ChatMarkupRegex::ChatMarkupRegex;
+use operit_util::ImagePoolManager::ImagePoolManager;
+use operit_util::MediaLinkBuilder::MediaLinkBuilder;
+use operit_util::MediaPoolManager::MediaPoolManager;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModelConnectionTestType {
+    CHAT,
+    TOOL_CALL,
+    IMAGE,
+    AUDIO,
+    VIDEO,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelConnectionTestItem {
+    pub r#type: ModelConnectionTestType,
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(non_snake_case)]
+pub struct ModelConnectionTestReport {
+    pub providerId: String,
+    pub modelId: String,
+    pub providerName: String,
+    pub providerType: String,
+    pub success: bool,
+    pub items: Vec<ModelConnectionTestItem>,
+}
+
+pub struct ModelConfigConnectionTester;
+
+impl ModelConfigConnectionTester {
+    const TEST_OUTPUT_TOKEN_LIMIT: i64 = 1024;
+
+    /// Connection probes have their own output budget. Keep the configured
+    /// sampling parameters, but send exactly one protocol-appropriate token limit.
+    fn testParameters(
+        providerType: &ApiProviderType,
+        parameters: Vec<ModelParameter<Value>>,
+    ) -> Vec<ModelParameter<Value>> {
+        let apiName = match providerType {
+            ApiProviderType::OPENAI => "max_completion_tokens",
+            ApiProviderType::OPENAI_RESPONSES
+            | ApiProviderType::OPENAI_RESPONSES_GENERIC
+            | ApiProviderType::OPENAI_CODEX => "max_output_tokens",
+            _ => "max_tokens",
+        };
+        let mut parameters = parameters
+            .into_iter()
+            .filter(|parameter| {
+                !matches!(
+                    parameter.apiName.as_str(),
+                    "max_tokens" | "max_completion_tokens" | "max_output_tokens" | "maxOutputTokens"
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut limit = ModelParameter::new(
+            "connection_test_output_limit".to_string(),
+            "Connection test output limit".to_string(),
+            apiName.to_string(),
+            json!(Self::TEST_OUTPUT_TOKEN_LIMIT),
+            json!(Self::TEST_OUTPUT_TOKEN_LIMIT),
+            true,
+            ParameterValueType::INT,
+        );
+        limit.category = ParameterCategory::GENERATION;
+        parameters.push(limit);
+        parameters
+    }
+
+    /// Runs model connection checks with the response mode selected by the application.
+    pub async fn run(
+        providerId: &str,
+        modelId: &str,
+        runtimeContext: ProviderRuntimeContext,
+        stream: bool,
+    ) -> Result<ModelConnectionTestReport, String> {
+        let config =
+            runtimeContext
+                .support()
+                .resolvedModelConfig(providerId, modelId)?;
+        let mut items = Vec::new();
+
+        let mut serviceManager = MultiServiceManager::new(runtimeContext);
+        let bundleResult = serviceManager
+            .createTransientServiceBundleForModel(providerId.to_string(), modelId.to_string());
+        let (configForTest, parameters, serviceHandle) = match bundleResult {
+            Ok(bundle) => bundle,
+            Err(error) => {
+                items.push(ModelConnectionTestItem {
+                    r#type: ModelConnectionTestType::CHAT,
+                    success: false,
+                    error: Some(error.to_string()),
+                });
+                return Ok(Self::report(config, items));
+            }
+        };
+        let parameters = Self::testParameters(&configForTest.apiProviderType, parameters);
+        let items =
+            Self::testService(serviceHandle, &configForTest.capabilities, parameters, stream).await;
+
+        Ok(Self::report(configForTest, items))
+    }
+
+    /// Tests one explicit credential using the provider's actual chat request implementation.
+    pub async fn testApiKey(config: ResolvedModelConfig, context: ProviderRuntimeContext) -> Result<(), String> {
+        let parameters = Self::testParameters(&config.apiProviderType, config.parameters.clone());
+        let mut service = MultiServiceManager::new(context).createServiceForConfig(config).map_err(|error| error.to_string())?;
+        let result = Self::executeTestRequest(&mut service, SendMessageRequest {
+            chat_history: vec![PromptTurn::new(PromptTurnKind::USER, "Hi")],
+            model_parameters: parameters, thinking: RequestThinking::default(), stream: false,
+            available_tools: Vec::new(), preserve_think_in_history: false, enable_retry: false,
+            on_non_fatal_error: None, on_tool_invocation: None,
+        }).await;
+        service.release();
+        result
+    }
+
+    /// Runs every supported probe with the same user-selected response mode.
+    async fn testService(
+        mut service: Box<dyn AIService>,
+        capabilities: &ModelCapabilities,
+        parameters: Vec<ModelParameter<Value>>,
+        stream: bool,
+    ) -> Vec<ModelConnectionTestItem> {
+        let mut items = Vec::new();
+        {
+            Self::runCase(&mut items, ModelConnectionTestType::CHAT, || async {
+                Self::executeTestRequest(
+                    &mut service,
+                    SendMessageRequest {
+                        chat_history: vec![PromptTurn::new(PromptTurnKind::USER, "Hi")],
+                        model_parameters: parameters.clone(),
+                        thinking: RequestThinking::default(),
+                        stream,
+                        available_tools: Vec::new(),
+                        preserve_think_in_history: false,
+                        enable_retry: false,
+                        on_non_fatal_error: None,
+                        on_tool_invocation: None,
+                    },
+                )
+                .await
+            })
+            .await;
+
+            if capabilities.toolCall {
+                Self::runCase(&mut items, ModelConnectionTestType::TOOL_CALL, || async {
+                    let toolTagName = ChatMarkupRegex::generate_random_tool_tag_name();
+                    let toolResultTagName = ChatMarkupRegex::generate_random_tool_result_tag_name();
+                    let history = vec![
+                        ("system".to_string(), "You are a helpful assistant.".to_string()),
+                        ("user".to_string(), "Call the echo tool with the text \"ping\".".to_string()),
+                        (
+                            "assistant".to_string(),
+                            format!(
+                                "<{toolTagName} name=\"echo\"><param name=\"text\">ping</param></{toolTagName}>"
+                            ),
+                        ),
+                        (
+                            "tool_result".to_string(),
+                            format!(
+                                "<{toolResultTagName} name=\"echo\" status=\"success\"><content>pong</content></{toolResultTagName}>"
+                            ),
+                        ),
+                    ];
+                    Self::executeTestRequest(
+                        &mut service,
+                        SendMessageRequest {
+                            chat_history: toPromptTurns(&history),
+                            model_parameters: parameters.clone(),
+                            thinking: RequestThinking::default(),
+                            stream,
+                            available_tools: vec![Self::echoToolPrompt()],
+                            preserve_think_in_history: false,
+                            enable_retry: false,
+                            on_non_fatal_error: None,
+                            on_tool_invocation: None,
+                        },
+                    )
+                    .await
+                })
+                .await;
+            }
+
+            if capabilities.directImage {
+                Self::runCase(&mut items, ModelConnectionTestType::IMAGE, || async {
+                    let imageId = ImagePoolManager::add_image_bytes(
+                        include_bytes!("../../../assets/test/1.jpg"),
+                        Some("image/jpeg"),
+                        None,
+                    );
+                    if imageId == "error" {
+                        return Err("Failed to create test image".to_string());
+                    }
+                    let prompt = format!(
+                        "{}\n\nPlease analyze this image briefly.",
+                        MediaLinkBuilder::image(&imageId)
+                    );
+                    let result = Self::executeTestRequest(
+                        &mut service,
+                        SendMessageRequest {
+                            chat_history: vec![PromptTurn::new(PromptTurnKind::USER, prompt)],
+                            model_parameters: parameters.clone(),
+                            thinking: RequestThinking::default(),
+                            stream,
+                            available_tools: Vec::new(),
+                            preserve_think_in_history: false,
+                            enable_retry: false,
+                            on_non_fatal_error: None,
+                            on_tool_invocation: None,
+                        },
+                    )
+                    .await;
+                    ImagePoolManager::remove_image(&imageId);
+                    result
+                })
+                .await;
+            }
+
+            if capabilities.directAudio {
+                Self::runCase(&mut items, ModelConnectionTestType::AUDIO, || async {
+                    let audioId = MediaPoolManager::add_media_bytes(
+                        include_bytes!("../../../assets/test/1.mp3"),
+                        "audio/mpeg",
+                    );
+                    if audioId == "error" {
+                        return Err("Failed to create test audio".to_string());
+                    }
+                    let prompt = format!(
+                        "{}\n\nPlease analyze this audio briefly.",
+                        MediaLinkBuilder::audio(&audioId)
+                    );
+                    let result = Self::executeTestRequest(
+                        &mut service,
+                        SendMessageRequest {
+                            chat_history: vec![PromptTurn::new(PromptTurnKind::USER, prompt)],
+                            model_parameters: parameters.clone(),
+                            thinking: RequestThinking::default(),
+                            stream,
+                            available_tools: Vec::new(),
+                            preserve_think_in_history: false,
+                            enable_retry: false,
+                            on_non_fatal_error: None,
+                            on_tool_invocation: None,
+                        },
+                    )
+                    .await;
+                    MediaPoolManager::remove_media(&audioId);
+                    result
+                })
+                .await;
+            }
+
+            if capabilities.directVideo {
+                Self::runCase(&mut items, ModelConnectionTestType::VIDEO, || async {
+                    let videoId = MediaPoolManager::add_media_bytes(
+                        include_bytes!("../../../assets/test/1.mp4"),
+                        "video/mp4",
+                    );
+                    if videoId == "error" {
+                        return Err("Failed to create test video".to_string());
+                    }
+                    let prompt = format!(
+                        "{}\n\nPlease analyze this video briefly.",
+                        MediaLinkBuilder::video(&videoId)
+                    );
+                    let result = Self::executeTestRequest(
+                        &mut service,
+                        SendMessageRequest {
+                            chat_history: vec![PromptTurn::new(PromptTurnKind::USER, prompt)],
+                            model_parameters: parameters.clone(),
+                            thinking: RequestThinking::default(),
+                            stream,
+                            available_tools: Vec::new(),
+                            preserve_think_in_history: false,
+                            enable_retry: false,
+                            on_non_fatal_error: None,
+                            on_tool_invocation: None,
+                        },
+                    )
+                    .await;
+                    MediaPoolManager::remove_media(&videoId);
+                    result
+                })
+                .await;
+            }
+
+            service.cancel_streaming();
+            service.release();
+        }
+
+        items
+    }
+
+    /// Executes a connection probe and rejects both request and stream completion failures.
+    async fn executeTestRequest(
+        service: &mut Box<dyn AIService>,
+        mut request: SendMessageRequest,
+    ) -> Result<(), String> {
+        let stream_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let error_sink = stream_error.clone();
+        request.on_non_fatal_error = Some(Arc::new(move |error| {
+            let mut guard = error_sink.lock().unwrap();
+            if guard.is_none() {
+                *guard = Some(error);
+            }
+        }));
+        let stream = service
+            .send_message(request)
+            .await
+            .map_err(|error| error.to_string())?;
+        Self::verifyTestResponse(stream).await?;
+        if let Some(error) = stream_error.lock().unwrap().take() {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Consumes the complete response before accepting its authoritative terminal state.
+    async fn verifyTestResponse(mut stream: Box<dyn RevisableTextStreamLike>) -> Result<(), String> {
+        stream.collect(&mut |_| {}).await;
+        ensure_response_completed(stream.as_ref()).map_err(|error| error.to_string())
+    }
+
+    async fn runCase<F, Fut>(
+        items: &mut Vec<ModelConnectionTestItem>,
+        r#type: ModelConnectionTestType,
+        block: F,
+    ) where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<(), String>>,
+    {
+        match block().await {
+            Ok(()) => items.push(ModelConnectionTestItem {
+                r#type,
+                success: true,
+                error: None,
+            }),
+            Err(error) => items.push(ModelConnectionTestItem {
+                r#type,
+                success: false,
+                error: Some(error),
+            }),
+        }
+    }
+
+    fn report(
+        config: ResolvedModelConfig,
+        items: Vec<ModelConnectionTestItem>,
+    ) -> ModelConnectionTestReport {
+        ModelConnectionTestReport {
+            providerId: config.providerId,
+            modelId: config.modelId,
+            providerName: config.providerName,
+            providerType: config.apiProviderTypeId,
+            success: items.iter().all(|item| item.success),
+            items,
+        }
+    }
+
+    fn echoToolPrompt() -> ToolPrompt {
+        let mut tool = ToolPrompt::new("echo".to_string(), "Echoes the provided text.".to_string());
+        tool.parametersStructured = Some(vec![ToolParameterSchema {
+            name: "text".to_string(),
+            r#type: "string".to_string(),
+            description: "Text to echo.".to_string(),
+            required: true,
+            default: None,
+        }]);
+        tool
+    }
+}
+
+#[cfg(test)]
+#[path = "../../../../tests/ModelConfigConnectionTesterTests.rs"]
+mod tests;

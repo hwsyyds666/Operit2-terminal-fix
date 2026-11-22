@@ -1,0 +1,47 @@
+# operit-util
+
+`operit-util` owns shared utility code used by the split core crates. It holds
+pure helpers plus small cross-target utilities that do not belong to runtime
+or store ownership.
+
+## Responsibilities
+
+- Provide logging, stream, serialization, parsing, markdown, media, archive,
+  document, network, QR, OCR, and TTS helper utilities.
+- Define canonical runtime path constants and root path helpers.
+- Keep common utilities reusable by model, store, tools, providers, JS bridge,
+  and runtime.
+- Avoid owning repositories, provider services, tool execution, host
+  lifecycle, or runtime orchestration.
+
+## Main Modules
+
+- `RuntimeStorageLayout`: reexport of canonical storage definitions owned by `operit-host-contract`.
+- `src/RuntimeStoreRoot.rs`: configured runtime data root.
+- `src/OperitPaths.rs`: runtime path helpers built from the configured root.
+- `src/stream/`: shared stream abstractions and operators.
+- `src/streamnative/`: native stream splitting helpers.
+- `src/AppLogger.rs` and `src/ChainLogger.rs`: logging utilities.
+- `src/ImagePoolManager.rs` and `src/ImageBitmapLimiter.rs`: a single image-input
+  boundary for chat, tools, and providers. Registration decodes PNG, JPEG, GIF,
+  WebP, BMP, ICO, and HEIC/HEIF bytes, applies orientation and scaling, and stores
+  only the final PNG (alpha) or JPEG (opaque, quality 85). The default longest
+  edge is 2048 pixels; explicit registration options control these transforms.
+  Input is limited to 32 MiB and 64 megapixels, with a 256 MiB image decode limit.
+  Corrupt or unsupported inputs fail registration; their original bytes are not
+  inserted into the image pool. GIF/WebP inputs contribute one still image.
+- `src/*Util.rs`: focused helpers for files, archives, media, network, and
+  document processing.
+- `src/ChatMarkupRegex.rs`: shared XML-like protocol helpers. Opening-tag
+  attributes accept single quotes, double quotes, and bare values terminated by
+  whitespace or a tag delimiter. Attribute reads skip other attribute values
+  and stop before the tag body. Tools, parameters, results, provider metadata,
+  and live message snapshots therefore share the same attribute syntax.
+
+## Boundary
+
+This crate may depend on host API types for cross-target helper behavior. It
+must not depend on runtime services, store repositories, provider code, tool
+registries, or JS engine implementations.
+
+See `core/CRATE_BOUNDARIES.md` for the full dependency direction.

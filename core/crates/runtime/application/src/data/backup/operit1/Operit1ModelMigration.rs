@@ -1,0 +1,784 @@
+struct ParsedOperit1Snapshot {
+    archive: Operit1SnapshotArchive,
+    configs: Vec<Operit1ModelConfig>,
+    chatMapping: Operit1FunctionConfigMapping,
+}
+
+impl Operit1SnapshotImportManager {
+    /// Adopts every source configuration and function binding using the existing provider import transaction.
+    fn importAllModelConfigsFromParsed(
+        &self,
+        parsed: &ParsedOperit1Snapshot,
+    ) -> Result<Operit1ModelConfigImportResult, String> {
+        use crate::data::preferences::FunctionalConfigManager::FunctionModelBinding;
+        let providers = parsed.configs.iter()
+            .map(|config| buildOperit1ProviderProfile(config, operit1ProviderId(&config.id)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let raw = requiredPreferenceString(
+            &parsed.archive.datastorePreferences[ENTRY_FUNCTIONAL_CONFIGS],
+            KEY_FUNCTION_CONFIG_MAPPING,
+            "Operit1 snapshot is missing function model mappings",
+        )?;
+        let mappings: HashMap<FunctionType, Value> = serde_json::from_str(raw)
+            .map_err(|error| format!("Operit1 function model mappings are invalid: {error}"))?;
+        let mut bindings = HashMap::new();
+        for (function, value) in mappings {
+            let mapping = decodeFunctionMapping(value)?;
+            let (config, modelIndex) = parsed.resolveModelBinding(&mapping.configId, mapping.modelIndex)?;
+            let modelIds = splitModelIds(&config.modelName);
+            let modelId = modelIds.get(modelIndex)
+                .cloned().ok_or_else(|| {
+                    format!("Operit1 功能绑定的配置没有模型：{function:?}/{}", config.id)
+                })?;
+            bindings.insert(
+                function,
+                FunctionModelBinding::new(operit1ProviderId(&config.id), modelId),
+            );
+        }
+        let chat = bindings.get(&FunctionType::CHAT)
+            .ok_or("Operit1 function model mappings are missing CHAT")?;
+        let provider = providers.iter().find(|provider| provider.id == chat.providerId)
+            .ok_or("Operit1 chat provider is missing")?;
+        let content = serde_json::to_string(&providers).map_err(|error| error.to_string())?;
+        let manager = ModelConfigManager::default();
+        manager.importAllProvidersFromBackupContent(&content)?;
+        let importedProvider = manager.getProviderProfile(&provider.id)
+            .map_err(|error| error.to_string())?;
+        let result = operit1ModelImportResult(
+            &importedProvider,
+            chat.modelId.clone(),
+            providers.iter().map(|provider| provider.models.len() as i32).sum(),
+        );
+        FunctionalConfigManager::default()
+            .saveFunctionModelBinding(bindings).map_err(|error| error.to_string())?;
+        Ok(result)
+    }
+}
+
+/// Maps the source default provider to the runtime default while retaining other configuration identities.
+fn operit1ProviderId(configId: &str) -> String {
+    match configId {
+        "default" => ModelConfigDefaults::DEFAULT_PROVIDER_ID.to_string(),
+        id => id.to_string(),
+    }
+}
+
+/// Projects the complete source provider, credentials and model settings for both import entry points.
+fn buildOperit1ProviderProfile(
+    config: &Operit1ModelConfig,
+    providerId: String,
+) -> Result<ProviderProfile, String> {
+    let binding = config.providerBinding()?;
+    let mut provider = ProviderProfile::new(
+        providerId,
+        config.name.clone(),
+        binding.providerType,
+        config.apiEndpoint.trim().to_string(),
+    );
+    provider.providerTypeId = binding.providerTypeId;
+    provider.apiKey = config.apiKey.clone();
+    provider.useMultipleApiKeys = config.useMultipleApiKeys;
+    provider.apiKeyPool = config.apiKeyPool.iter().map(Operit1ApiKeyInfo::toApiKeyInfo).collect();
+    provider.currentKeyIndex = config.currentKeyIndex;
+    provider.keyRotationMode = config.keyRotationMode.clone();
+    provider.customHeaders = config.customHeaders.clone();
+    provider.requestLimitPerMinute = config.requestLimitPerMinute;
+    provider.maxConcurrentRequests = config.maxConcurrentRequests;
+    provider.models = splitModelIds(&config.modelName).iter()
+        .map(|model| buildModelProfile(model, config)).collect::<Result<_, _>>()?;
+    Ok(provider)
+}
+
+/// Reports the selected chat provider together with the number of models actually adopted.
+fn operit1ModelImportResult(
+    provider: &ProviderProfile,
+    modelId: String,
+    importedModelCount: i32,
+) -> Operit1ModelConfigImportResult {
+    Operit1ModelConfigImportResult {
+        providerId: provider.id.clone(),
+        providerTypeId: provider.providerTypeId.clone(),
+        providerName: provider.name.clone(),
+        modelId,
+        importedModelCount,
+        chatBindingUpdated: true,
+        skippedFields: vec![
+            "contextLength".to_string(),
+            "summaryCustomRules".to_string(),
+            "enableGoogleSearch".to_string(),
+        ],
+    }
+}
+
+impl ParsedOperit1Snapshot {
+    /// Parses importer metadata from an immutable range-readable snapshot source.
+    fn fromSource(source: Arc<dyn ArchiveSource>) -> Result<Self, String> {
+        let archive = Operit1SnapshotArchive::fromSource(source)?;
+        let configs = archive
+            .modelConfigJsons
+            .iter()
+            .map(|config| {
+                serde_json::from_value(config.value.clone())
+                    .map_err(|error| format!("模型配置「{}」格式不正确：{error}", config.id))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let chatMapping = decodeFunctionMapping(archive.chatMappingJson.clone())?;
+
+        Ok(Self {
+            archive,
+            configs,
+            chatMapping,
+        })
+    }
+
+    /// Copies one archive entry to a caller-owned output stream.
+    fn copyEntryTo<W: Write>(&self, name: &str, writer: &mut W) -> Result<(), String> {
+        self.archive.copyEntryTo(name, writer)
+    }
+
+    /// Builds snapshot preview metadata using host-derived database counts.
+    fn preview(&self, databaseCounts: (i32, i32)) -> Result<Operit1SnapshotPreview, String> {
+        let modelConfig = self.modelConfigPreview()?;
+        let datastoreFiles = self
+            .archive
+            .datastorePreferences
+            .iter()
+            .map(|(entryName, values)| Operit1DataStoreFilePreview {
+                fileName: entryName
+                    .strip_prefix(ENTRY_DATASTORE_PREFIX)
+                    .unwrap_or(entryName)
+                    .to_string(),
+                keyCount: values.len() as i32,
+            })
+            .collect::<Vec<_>>();
+        let (chatCount, messageCount) = databaseCounts;
+        let importedFileCount = self.countImportableFiles(ENTRY_FILES_PREFIX);
+        let importedExternalFileCount = self.countImportableFiles(ENTRY_EXTERNAL_FILES_PREFIX);
+        let mut detectedDomains = Vec::new();
+        if !self.configs.is_empty() {
+            detectedDomains.push("model_configs".to_string());
+        }
+        if chatCount > 0 || messageCount > 0 {
+            detectedDomains.push("chat_history".to_string());
+        }
+        for entry in self.archive.datastorePreferences.keys() {
+            let name = entry
+                .strip_prefix(ENTRY_DATASTORE_PREFIX)
+                .unwrap_or(entry)
+                .trim_end_matches(".preferences_pb")
+                .to_string();
+            if !detectedDomains.contains(&name) {
+                detectedDomains.push(name);
+            }
+        }
+        if self
+            .archive
+            .entries
+            .keys()
+            .any(|entry| isOperit1LegacyMemoryEntry(entry))
+            || self
+                .archive
+                .datastorePreferences
+                .get(ENTRY_USER_PREFERENCES)
+                .is_some_and(|preferences| {
+                    preferences.keys().any(|key| {
+                        key == KEY_ACTIVE_MEMORY_SPACE_ID
+                            || key == KEY_MEMORY_SPACE_LIST
+                            || key.starts_with(KEY_MEMORY_SPACE_PREFIX)
+                    })
+                })
+        {
+            detectedDomains.push("memory".to_string());
+        }
+        if importedFileCount > 0 || importedExternalFileCount > 0 {
+            detectedDomains.push("user_files".to_string());
+        }
+        Ok(Operit1SnapshotPreview {
+            formatVersion: self.archive.manifest.formatVersion,
+            packageName: self.archive.manifest.packageName.clone(),
+            createdAt: self.archive.manifest.createdAt,
+            modelConfig,
+            datastoreFiles,
+            chatCount,
+            messageCount,
+            importedFileCount,
+            importedExternalFileCount,
+            detectedDomains,
+        })
+    }
+
+    /// Previews the effective chat binding using the same resolution as full snapshot import.
+    #[allow(non_snake_case)]
+    fn modelConfigPreview(&self) -> Result<Operit1ModelConfigSnapshotPreview, String> {
+        let (chatConfig, chatModelIndex) = self.resolveModelBinding(
+            &self.chatMapping.configId, self.chatMapping.modelIndex,
+        )?;
+        let configs = self
+            .configs
+            .iter()
+            .map(|config| {
+                let providerBinding = config.providerBinding()?;
+                let modelIds = splitModelIds(&config.modelName);
+                let selectedModelIndex = (chatConfig.id == config.id)
+                    .then_some(chatModelIndex as i32);
+                let selectedModelId =
+                    selectedModelIndex.and_then(|index| modelIds.get(index as usize).cloned());
+                Ok(Operit1ModelConfigPreview {
+                    configId: config.id.clone(),
+                    name: config.name.clone(),
+                    providerTypeId: providerBinding.providerTypeId,
+                    providerDisplayName: providerBinding.displayName,
+                    endpoint: config.apiEndpoint.clone(),
+                    modelIds,
+                    selectedModelId,
+                    selectedModelIndex,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        let chatConfigId = Some(chatConfig.id.clone());
+        let chatConfig = configs
+            .iter()
+            .find(|config| Some(&config.configId) == chatConfigId.as_ref());
+        let chatModelIndex = chatConfig.and_then(|config| config.selectedModelIndex);
+        let chatModelId = chatConfig.and_then(|config| config.selectedModelId.clone());
+
+        Ok(Operit1ModelConfigSnapshotPreview {
+            formatVersion: self.archive.manifest.formatVersion,
+            packageName: self.archive.manifest.packageName.clone(),
+            createdAt: self.archive.manifest.createdAt,
+            configs,
+            chatConfigId,
+            chatModelId,
+            chatModelIndex,
+        })
+    }
+
+    #[allow(non_snake_case)]
+    fn selectedChatConfig(&self) -> Result<Operit1ModelConfigPreview, String> {
+        self.modelConfigPreview()?
+            .configs
+            .into_iter()
+            .find(|config| config.selectedModelId.is_some())
+            .ok_or_else(|| format!("快照里没有聊天模型配置：{}", self.chatMapping.configId))
+    }
+
+    /// Preserves valid bindings and replaces missing or empty bindings with the first configured model.
+    fn resolveModelBinding(&self, configId: &str, requestedIndex: i32) -> Result<(&Operit1ModelConfig, usize), String> {
+        if let Some(config) = self.configs.iter().find(|config| config.id == configId) {
+            let models = splitModelIds(&config.modelName);
+            if !models.is_empty() {
+                return Ok((config, operit1EffectiveModelIndex(&models, requestedIndex)));
+            }
+        }
+        let config = self.configs.iter()
+            .find(|config| !splitModelIds(&config.modelName).is_empty())
+            .ok_or("Operit1 快照中没有配置任何模型，无法迁移模型绑定")?;
+        AppLogger::i("Operit1SnapshotImport", &format!(
+            "Replacing unresolved model binding {configId} with the first configured model from {}", config.id,
+        ));
+        Ok((config, 0))
+    }
+
+    #[allow(non_snake_case)]
+    fn configById(&self, configId: &str) -> Result<Operit1ModelConfig, String> {
+        self.configs
+            .iter()
+            .find(|config| config.id == configId)
+            .cloned()
+            .ok_or_else(|| format!("快照里没有模型配置：{configId}"))
+    }
+
+    #[allow(non_snake_case)]
+    fn countImportableFiles(&self, prefix: &str) -> i32 {
+        self.archive
+            .entries
+            .keys()
+            .filter(|entry| entry.starts_with(prefix))
+            .filter(|entry| !entry.starts_with(ENTRY_DATASTORE_PREFIX))
+            .filter(|entry| !isOperit1LegacyMemoryEntry(entry))
+            .count() as i32
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[allow(non_snake_case)]
+struct Operit1FunctionConfigMapping {
+    #[serde(default = "defaultOperit1ConfigId")]
+    configId: String,
+    #[serde(default)]
+    modelIndex: i32,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[allow(non_snake_case)]
+struct Operit1ModelConfig {
+    id: String,
+    name: String,
+    #[serde(default)]
+    apiKey: String,
+    #[serde(default)]
+    apiEndpoint: String,
+    #[serde(default)]
+    modelName: String,
+    #[serde(default)]
+    apiProviderType: String,
+    #[serde(default)]
+    apiProviderTypeId: String,
+    #[serde(default)]
+    useMultipleApiKeys: bool,
+    #[serde(default)]
+    apiKeyPool: Vec<Operit1ApiKeyInfo>,
+    #[serde(default)]
+    currentKeyIndex: i32,
+    #[serde(default = "defaultKeyRotationMode")]
+    keyRotationMode: String,
+    #[serde(default)]
+    hasCustomParameters: bool,
+    #[serde(default)]
+    maxTokensEnabled: bool,
+    #[serde(default)]
+    temperatureEnabled: bool,
+    #[serde(default)]
+    topPEnabled: bool,
+    #[serde(default)]
+    topKEnabled: bool,
+    #[serde(default)]
+    presencePenaltyEnabled: bool,
+    #[serde(default)]
+    frequencyPenaltyEnabled: bool,
+    #[serde(default)]
+    repetitionPenaltyEnabled: bool,
+    #[serde(default = "defaultMaxTokens")]
+    maxTokens: i32,
+    #[serde(default = "defaultTemperature")]
+    temperature: f32,
+    #[serde(default = "defaultTopP")]
+    topP: f32,
+    #[serde(default)]
+    topK: i32,
+    #[serde(default)]
+    presencePenalty: f32,
+    #[serde(default)]
+    frequencyPenalty: f32,
+    #[serde(default = "defaultRepetitionPenalty")]
+    repetitionPenalty: f32,
+    #[serde(default = "defaultCustomParameters")]
+    customParameters: String,
+    #[serde(default = "defaultCustomHeaders")]
+    customHeaders: String,
+    #[serde(default = "defaultMaxContextLength")]
+    maxContextLength: f32,
+    #[serde(default = "defaultSummaryTokenThreshold")]
+    summaryTokenThreshold: f32,
+    #[serde(default = "defaultEnableSummary")]
+    enableSummary: bool,
+    #[serde(default)]
+    mnnForwardType: i32,
+    #[serde(default = "defaultThreadCount")]
+    mnnThreadCount: i32,
+    #[serde(default = "defaultThreadCount")]
+    llamaThreadCount: i32,
+    #[serde(default = "defaultLlamaContextSize")]
+    llamaContextSize: i32,
+    #[serde(default = "defaultLlamaBatchSize")]
+    llamaBatchSize: i32,
+    #[serde(default = "defaultLlamaBatchSize")]
+    llamaUBatchSize: i32,
+    #[serde(default)]
+    llamaGpuLayers: i32,
+    #[serde(default)]
+    llamaUseMmap: bool,
+    #[serde(default)]
+    llamaFlashAttention: bool,
+    #[serde(default = "defaultLlamaKvUnified")]
+    llamaKvUnified: bool,
+    #[serde(default)]
+    llamaOffloadKqv: bool,
+    #[serde(default)]
+    enableDirectImageProcessing: bool,
+    #[serde(default)]
+    enableDirectAudioProcessing: bool,
+    #[serde(default)]
+    enableDirectVideoProcessing: bool,
+    #[serde(default)]
+    enableToolCall: bool,
+    #[serde(default)]
+    enableClaude1hPromptCache: bool,
+    #[serde(default)]
+    requestLimitPerMinute: i32,
+    #[serde(default)]
+    maxConcurrentRequests: i32,
+}
+
+/// Matches custom parameter records emitted by Operit1's Kotlin serializer.
+#[derive(Deserialize)]
+struct Operit1CustomParameterData {
+    id: String,
+    name: String,
+    apiName: String,
+    #[serde(default)]
+    description: String,
+    defaultValue: String,
+    currentValue: String,
+    isEnabled: bool,
+    valueType: String,
+    minValue: Option<String>,
+    maxValue: Option<String>,
+    #[serde(default = "defaultOperit1ParameterCategory")]
+    category: String,
+}
+
+/// Reproduces the category omitted by Operit1 when it has its declared default.
+fn defaultOperit1ParameterCategory() -> String {
+    "OTHER".to_string()
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[allow(non_snake_case)]
+struct Operit1ApiKeyInfo {
+    id: String,
+    key: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default = "defaultTrue")]
+    isEnabled: bool,
+    #[serde(default = "defaultApiKeyAvailabilityStatus")]
+    availabilityStatus: ApiKeyAvailabilityStatus,
+    #[serde(default)]
+    usageCount: i64,
+    #[serde(default)]
+    lastUsed: i64,
+    #[serde(default)]
+    errorCount: i64,
+}
+
+#[derive(Clone, Debug)]
+#[allow(non_snake_case)]
+struct Operit1ProviderBinding {
+    providerType: ApiProviderType,
+    providerTypeId: String,
+    displayName: String,
+}
+
+impl Operit1ApiKeyInfo {
+    #[allow(non_snake_case)]
+    /// Converts the legacy API key record into the current key record.
+    fn toApiKeyInfo(&self) -> ApiKeyInfo {
+        ApiKeyInfo {
+            id: self.id.clone(),
+            key: self.key.clone(),
+            name: self.name.clone(),
+            isEnabled: self.isEnabled,
+            availabilityStatus: self.availabilityStatus.clone(),
+            usageCount: self.usageCount,
+            lastUsed: self.lastUsed,
+            errorCount: self.errorCount,
+        }
+    }
+}
+
+impl Operit1ModelConfig {
+    #[allow(non_snake_case)]
+    /// Resolves the provider protocol and persisted type id from one legacy model config.
+    fn providerBinding(&self) -> Result<Operit1ProviderBinding, String> {
+        let providerType = self.providerType()?;
+        let providerTypeId = self.providerTypeIdForImport(&providerType);
+        let displayName = if providerTypeId.eq_ignore_ascii_case(providerType.name()) {
+            ModelCatalog::provider(providerType.name())?.displayName
+        } else {
+            self.name.clone()
+        };
+        Ok(Operit1ProviderBinding {
+            providerType,
+            providerTypeId,
+            displayName,
+        })
+    }
+
+    #[allow(non_snake_case)]
+    /// Resolves the built-in protocol enum used by the imported provider.
+    fn providerType(&self) -> Result<ApiProviderType, String> {
+        let providerTypeId = self.apiProviderTypeId.trim();
+        if let Some(providerType) = self.knownProviderType(providerTypeId) {
+            return Ok(providerType);
+        }
+
+        let providerType = self.apiProviderType.trim();
+        if !providerType.is_empty() {
+            return self
+                .knownProviderType(providerType)
+                .ok_or_else(|| format!("无法识别 Operit1 供应商类型：{}", providerType));
+        }
+
+        if providerTypeId.is_empty() {
+            return Ok(ApiProviderType::DEEPSEEK);
+        }
+
+        Err(format!("无法识别 Operit1 供应商类型：{}", providerTypeId))
+    }
+
+    #[allow(non_snake_case)]
+    /// Converts a known legacy provider id into its current provider protocol enum.
+    fn knownProviderType(&self, providerTypeId: &str) -> Option<ApiProviderType> {
+        if providerTypeId.trim().is_empty() {
+            return None;
+        }
+        match providerTypeId.to_ascii_uppercase().as_str() {
+            "MNN" | "LLAMA_CPP" => {
+                AppLogger::trace_detail(
+                    "Operit1SnapshotImport",
+                    &format!(
+                        "legacy local provider mapped to LOCAL_MODEL configId={} providerType={providerTypeId}",
+                        self.id
+                    ),
+                );
+                Some(ApiProviderType::LOCAL_MODEL)
+            }
+            _ => ApiProviderType::fromProviderTypeId(providerTypeId),
+        }
+    }
+
+    #[allow(non_snake_case)]
+    /// Computes the provider type id that should be written to the current profile.
+    fn providerTypeIdForImport(&self, providerType: &ApiProviderType) -> String {
+        let providerTypeId = self.apiProviderTypeId.trim();
+        if providerTypeId.is_empty() {
+            return providerType.name().to_string();
+        }
+        if self.knownProviderType(providerTypeId).is_some() {
+            return providerType.name().to_string();
+        }
+        providerTypeId.to_string()
+    }
+}
+
+#[allow(non_snake_case)]
+fn buildModelProfile(modelId: &str, config: &Operit1ModelConfig) -> Result<ModelProfile, String> {
+    let mut model = ModelProfile::new(modelId.to_string());
+    model.contextOverride = Some(ModelContextSpec {
+        maxContextLength: config.maxContextLength,
+    });
+    // Operit1 stored these as the user's settings, so they stay the user's here.
+    model.capabilitiesOverride = ModelCapabilityOverrides {
+        directImage: Some(config.enableDirectImageProcessing),
+        directAudio: Some(config.enableDirectAudioProcessing),
+        directVideo: Some(config.enableDirectVideoProcessing),
+        toolCall: Some(config.enableToolCall),
+    };
+    model.requestOverride = ModelRequestOverrides {
+        supportsStructuredTools: Some(config.enableToolCall),
+        enableClaude1hPromptCache: Some(config.enableClaude1hPromptCache),
+    };
+    model.summary = ModelSummarySettings {
+        enableSummary: config.enableSummary,
+        summaryTokenThreshold: config.summaryTokenThreshold,
+    };
+    model.localRuntime.mnnForwardType = config.mnnForwardType;
+    model.localRuntime.mnnThreadCount = config.mnnThreadCount;
+    model.localRuntime.llamaThreadCount = config.llamaThreadCount;
+    model.localRuntime.llamaContextSize = config.llamaContextSize;
+    model.localRuntime.llamaBatchSize = config.llamaBatchSize;
+    model.localRuntime.llamaUBatchSize = config.llamaUBatchSize;
+    model.localRuntime.llamaGpuLayers = config.llamaGpuLayers;
+    model.localRuntime.llamaUseMmap = config.llamaUseMmap;
+    model.localRuntime.llamaFlashAttention = config.llamaFlashAttention;
+    model.localRuntime.llamaKvUnified = config.llamaKvUnified;
+    model.localRuntime.llamaOffloadKqv = config.llamaOffloadKqv;
+    model.parameters = buildModelParameters(config)?;
+    Ok(model)
+}
+
+/// Projects legacy standard and custom parameters using each parameter's declared value type.
+#[allow(non_snake_case)]
+fn buildModelParameters(config: &Operit1ModelConfig) -> Result<Vec<ModelParameter<Value>>, String> {
+    let mut parameters = Vec::new();
+    pushStandardParameter(
+        &mut parameters,
+        "max_tokens",
+        config.maxTokensEnabled,
+        serde_json::json!(config.maxTokens),
+    )?;
+    pushStandardParameter(
+        &mut parameters,
+        "temperature",
+        config.temperatureEnabled,
+        serde_json::json!(config.temperature),
+    )?;
+    pushStandardParameter(
+        &mut parameters,
+        "top_p",
+        config.topPEnabled,
+        serde_json::json!(config.topP),
+    )?;
+    pushStandardParameter(
+        &mut parameters,
+        "top_k",
+        config.topKEnabled,
+        serde_json::json!(config.topK),
+    )?;
+    pushStandardParameter(
+        &mut parameters,
+        "presence_penalty",
+        config.presencePenaltyEnabled,
+        serde_json::json!(config.presencePenalty),
+    )?;
+    pushStandardParameter(
+        &mut parameters,
+        "frequency_penalty",
+        config.frequencyPenaltyEnabled,
+        serde_json::json!(config.frequencyPenalty),
+    )?;
+    pushStandardParameter(
+        &mut parameters,
+        "repetition_penalty",
+        config.repetitionPenaltyEnabled,
+        serde_json::json!(config.repetitionPenalty),
+    )?;
+    if config.hasCustomParameters && config.customParameters.trim() != "[]" {
+        let customParameters: Vec<Operit1CustomParameterData> =
+            serde_json::from_str(&config.customParameters)
+                .map_err(|error| format!("Operit1 自定义模型参数格式不正确：{error}"))?;
+        for parameter in customParameters {
+            let valueType = parseParameterValueType(&parameter.valueType)?;
+            parameters.push(ModelParameter {
+                id: parameter.id,
+                name: parameter.name,
+                apiName: parameter.apiName,
+                description: parameter.description,
+                defaultValue: parseCustomParameterValue(&parameter.defaultValue, &valueType)?,
+                currentValue: parseCustomParameterValue(&parameter.currentValue, &valueType)?,
+                isEnabled: parameter.isEnabled,
+                minValue: parameter
+                    .minValue
+                    .map(|value| parseCustomParameterValue(&value, &valueType))
+                    .transpose()?,
+                maxValue: parameter
+                    .maxValue
+                    .map(|value| parseCustomParameterValue(&value, &valueType))
+                    .transpose()?,
+                valueType,
+                category: parseParameterCategory(&parameter.category)?,
+                isCustom: true,
+            });
+        }
+    }
+    Ok(parameters)
+}
+
+#[allow(non_snake_case)]
+fn pushStandardParameter(
+    parameters: &mut Vec<ModelParameter<Value>>,
+    id: &str,
+    enabled: bool,
+    value: Value,
+) -> Result<(), String> {
+    let definition = StandardModelParameters::DEFINITIONS()
+        .into_iter()
+        .find(|definition| definition.id == id)
+        .ok_or_else(|| format!("标准模型参数不存在：{id}"))?;
+    parameters.push(ModelParameter {
+        id: definition.id.to_string(),
+        name: definition.name.to_string(),
+        apiName: definition.apiName.to_string(),
+        description: definition.description.to_string(),
+        defaultValue: definition.defaultValue,
+        currentValue: value,
+        isEnabled: enabled,
+        valueType: definition.valueType,
+        minValue: definition.minValue,
+        maxValue: definition.maxValue,
+        category: definition.category,
+        isCustom: false,
+    });
+    Ok(())
+}
+
+/// Decodes released function bindings, including Kotlin's omitted default fields.
+#[allow(non_snake_case)]
+fn decodeFunctionMapping(value: Value) -> Result<Operit1FunctionConfigMapping, String> {
+    if let Some(configId) = value.as_str() {
+        return Ok(Operit1FunctionConfigMapping {
+            configId: configId.to_string(),
+            modelIndex: 0,
+        });
+    }
+    serde_json::from_value(value).map_err(|error| format!("功能模型映射格式不正确：{error}"))
+}
+
+/// Splits the source model list exactly like Kotlin's getModelList, preserving its index order.
+#[allow(non_snake_case)]
+fn splitModelIds(modelName: &str) -> Vec<String> {
+    modelName
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// Reproduces Kotlin's getValidModelIndex/getModelByIndex semantics for persisted Operit1 indices.
+#[allow(non_snake_case)]
+fn operit1EffectiveModelIndex(modelIds: &[String], requestedIndex: i32) -> usize {
+    match usize::try_from(requestedIndex) {
+        Ok(index) if index < modelIds.len() => index,
+        _ => 0,
+    }
+}
+
+impl Operit1PreferenceValue {
+    /// Preserves the released DataStore primitive type while rewriting its declared resource paths.
+    fn toTargetNativePreferenceEntry(
+        &self,
+        key: &str,
+        fileImportPlan: &SnapshotFileImportPlan,
+    ) -> Result<(String, Value), String> {
+        let targetKey = fileImportPlan.rewritePreferenceKey(key)?;
+        let value = match self {
+            Self::Boolean(value) => serde_json::to_value(value),
+            Self::Float(value) => serde_json::to_value(value),
+            Self::Double(value) => serde_json::to_value(value),
+            Self::Int(value) => serde_json::to_value(value),
+            Self::Long(value) => serde_json::to_value(value),
+            Self::StringSet(value) => serde_json::to_value(value),
+            Self::String(value) => {
+                return Ok((
+                    targetKey,
+                    Value::String(fileImportPlan.rewritePreferenceValue(key, value)?),
+                ))
+            }
+        }
+        .map_err(|error| error.to_string())?;
+        Ok((targetKey, value))
+    }
+
+    /// Converts one legacy preference value into its target text representation.
+    fn toTargetPreferenceStringForKey(
+        &self,
+        key: &str,
+        fileImportPlan: &SnapshotFileImportPlan,
+    ) -> Result<String, String> {
+        match self {
+            Self::Boolean(value) => Ok(value.to_string()),
+            Self::Float(value) => Ok(value.to_string()),
+            Self::Double(value) => Ok(value.to_string()),
+            Self::Int(value) => Ok(value.to_string()),
+            Self::String(value) => fileImportPlan.rewritePreferenceValue(key, value),
+            Self::StringSet(value) => {
+                serde_json::to_string(value).map_err(|error| error.to_string())
+            }
+            Self::Long(value) => Ok(value.to_string()),
+        }
+    }
+
+    /// Rewrites one legacy preference key and its text representation for the target runtime.
+    fn toTargetPreferenceEntry(
+        &self,
+        key: &str,
+        fileImportPlan: &SnapshotFileImportPlan,
+    ) -> Result<(String, String), String> {
+        let targetKey = fileImportPlan.rewritePreferenceKey(key)?;
+        let targetValue = self.toTargetPreferenceStringForKey(key, fileImportPlan)?;
+        Ok((targetKey, targetValue))
+    }
+}

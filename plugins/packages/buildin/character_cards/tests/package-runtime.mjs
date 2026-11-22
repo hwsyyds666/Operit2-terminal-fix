@@ -1,0 +1,57 @@
+import { readSdkScript } from "../../../../../tools/runtime/compose_scripts.mjs";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import vm from "node:vm";
+import { installTestJavaScriptCompiler } from "../../../../../tools/tests/fixtures/production_bootstrap.mjs";
+import { runtimeConsole } from "./runtime.mjs";
+
+/** Reads an actual Rust-owned SDK script; the Node harness does not execute Rust or native hosts. */
+export function sdkScript(file) { return readSdkScript(file); }
+
+/** Uses the engine's actual path matching, registration placeholders and root export-tagging behavior. */
+function engineModuleHelpers() {
+  const source = readFileSync(new URL("../../../../../core/crates/plugin/javascript-bridge/src/javascript/JsLibraries.rs", import.meta.url), "utf8");
+  const sections = [
+    ["__operitNormalizePath", "__operitDirname"],
+    ["__operitIsLocalUiModulePath", "__operitRegisterScriptSource"],
+  ];
+  return sections.map(([first, next]) => {
+    const start = source.indexOf("        function " + first + "("), end = source.indexOf("        function " + next + "(", start);
+    assert.ok(start >= 0 && end > start, "Missing actual engine helper: " + first);
+    return source.slice(start, end).replaceAll("{{", "{").replaceAll("}}", "}");
+  }).join("\n");
+}
+
+/** Loads package JS through the SDK source compiler with real engine metadata tagging. */
+export function packageRuntime(modules, globals = {}, registrationOnly = false) {
+  const context = vm.createContext({ console: runtimeConsole, TextEncoder, TextDecoder, setTimeout, clearTimeout, ...globals });
+  vm.runInContext(engineModuleHelpers(), context);
+  // Built screen functions close over their defining realm, just like the real
+  // engine. Supply the production runtime in that realm, not a second VM.
+  vm.runInContext(sdkScript("ToolPkgComposeDslBridge.rs"), context);
+  installTestJavaScriptCompiler(context);
+  const cache = new Map();
+  /** Prepares UI source modules with the production compiler before evaluating their exports. */
+  function load(modulePath) {
+    const normalized = path.posix.normalize(modulePath);
+    if (registrationOnly && context.__operitIsLocalUiModulePath(normalized)) return context.OperitToolPkgExports.placeholder(normalized);
+    if (cache.has(normalized)) return cache.get(normalized).exports;
+    assert.ok(Object.hasOwn(modules, normalized), "Package omitted registered module: " + normalized);
+    const module = { exports: {} };
+    cache.set(normalized, module);
+    const source = Buffer.from(modules[normalized]).toString("utf8");
+    const prepared = context.__operitIsLocalUiModulePath(normalized)
+      ? context.OperitComposeCompiler.prepare(source, "com.operit.character_cards:" + normalized)
+      : source;
+    const factory = context.__operitNativeCompileModuleFactory(context.__operitNativePrepareJavaScript(prepared));
+    factory(module, module.exports, request => {
+      assert.ok(request.startsWith("."), "Only declared relative modules may be loaded: " + request);
+      return load(path.posix.join(path.posix.dirname(normalized), request));
+    });
+    context.OperitToolPkgExports.tag(normalized, module.exports);
+    return module.exports;
+  }
+  return { context, load };
+}
+

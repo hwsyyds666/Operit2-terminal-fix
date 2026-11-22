@@ -1,0 +1,823 @@
+// ignore_for_file: file_names
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+
+import '../../../../core/host/AppToastController.dart';
+import '../../../../core/proxy/generated/CoreProxyModels.g.dart' as core_proxy;
+import 'ChatToolPermissionPanel.dart';
+import '../../../../data/preferences/UserPreferencesManager.dart';
+import '../../../../l10n/generated/app_localizations.dart';
+import '../../../common/components/M3LoadingIndicator.dart';
+import '../../../theme/OperitThemeAssets.dart';
+import '../../../common/interactions/DrawerGestureExclusion.dart';
+import '../../../theme/OperitTheme.dart';
+import '../viewmodel/ChatViewModel.dart';
+import '../tts/TtsPlaybackController.dart';
+import 'ChatArea.dart';
+import 'NewChatIntro.dart';
+import 'ChatLayoutMetrics.dart';
+import 'ChatMultiSelectBar.dart';
+import 'ChatScrollNavigator.dart';
+import 'MessageContextMenu.dart';
+import 'share/ChatShareImageGenerator.dart';
+import 'share/ChatShareImagePreviewDialog.dart';
+import 'style/input/agent/AgentChatInputSection.dart';
+import 'style/input/classic/ClassicChatInputSection.dart';
+import 'style/input/common/InputProcessingStatusLane.dart';
+import 'style/input/common/ChatAttachmentMenuPopup.dart';
+import 'style/input/common/ChatRouteStatusHint.dart';
+import 'style/input/common/PendingQueueMessageItem.dart';
+
+class ChatScreenContent extends StatelessWidget {
+  /// Creates the native chat layout with plugin-provided display context.
+  const ChatScreenContent({
+    super.key,
+    required this.messages,
+    required this.loading,
+    required this.errorMessage,
+    required this.messageController,
+    required this.inputFocusNode,
+    required this.scrollController,
+    required this.inputProcessingState,
+    this.mentionSuggestionPanel,
+    required this.viewModel,
+    required this.currentChatId,
+    this.fileDirectory,
+    required this.chatIdentity,
+    required this.backgroundUri,
+    required this.onIdentityTap,
+    required this.autoScrollToBottomListenable,
+    required this.hasOlderDisplayHistory,
+    required this.hasNewerDisplayHistory,
+    required this.isLoadingDisplayWindow,
+    this.messageNavigation,
+    required this.loadLocatorEntries,
+    required this.onRevealMessageForLocator,
+    required this.onAutoScrollToBottomChanged,
+    required this.onLoadOlderDisplayWindow,
+    required this.onLoadNewerDisplayWindow,
+    required this.onShowLatestDisplayWindow,
+    required this.onToggleFavoriteMessage,
+    required this.onDeleteMessage,
+    required this.onDeleteMessagesFrom,
+    required this.onDeleteMessageVariant,
+    required this.onSelectMessageVariant,
+    required this.onRollbackToMessage,
+    required this.onSelectMessageToEdit,
+    required this.onRegenerateMessage,
+    required this.onInsertSummary,
+    required this.onCreateBranch,
+    required this.onReplyToMessage,
+    required this.onToggleMultiSelectMode,
+    required this.onToggleMessageSelection,
+    required this.onExitMultiSelectMode,
+    required this.onSelectAllMessages,
+    required this.onClearMessageSelection,
+    required this.onDeleteSelectedMessages,
+    required this.onRefreshRequested,
+    required this.onSendMessage,
+    required this.onQueueMessage,
+    this.onGuideMessage,
+    this.onInterruptAndSendMessage,
+    required this.onCancelMessage,
+    required this.pendingQueueMessages,
+    required this.isPendingQueueExpanded,
+    required this.toolPermissionRequests,
+    required this.onToolPermissionDecision,
+    required this.onPendingQueueExpandedChange,
+    required this.onDeletePendingQueueMessage,
+    required this.onEditPendingQueueMessage,
+    required this.onSendPendingQueueMessage,
+    this.onGuidePendingQueueMessage,
+    required this.attachments,
+    required this.onAttachImage,
+    required this.onTakePhoto,
+    required this.onPluginAttachment,
+    required this.onAttachFile,
+    required this.onAttachFiles,
+    required this.onPasteImages,
+    required this.onAttachScreenContent,
+    required this.onAttachNotifications,
+    required this.onAttachLocation,
+    required this.onAttachPackage,
+    required this.onRemoveAttachment,
+    required this.onPreviewAttachment,
+    required this.toastMessageListenable,
+    required this.onDismissToast,
+    required this.isMultiSelectMode,
+    required this.isPreparingChatSwitch,
+    required this.isSpeechRecording,
+    required this.isSpeechTranscribing,
+    required this.onSpeechInput,
+    this.selectedMessageTimestamps = const <int>{},
+    this.showInput = true,
+  });
+
+  /// Keeps the shared transcript available when another workflow owns submission.
+  final bool showInput;
+  final List<ChatUiMessage> messages;
+  final bool loading;
+  final String? errorMessage;
+  final TextEditingController messageController;
+  final FocusNode inputFocusNode;
+  final ScrollController scrollController;
+  final core_proxy.InputProcessingState inputProcessingState;
+  final Widget? mentionSuggestionPanel;
+  final ChatViewModel viewModel;
+  final String? currentChatId;
+  final String? fileDirectory;
+  final core_proxy.ChatDisplayIdentity? chatIdentity;
+  final String? backgroundUri;
+  final VoidCallback? onIdentityTap;
+  final ValueListenable<bool> autoScrollToBottomListenable;
+  final bool hasOlderDisplayHistory;
+  final bool hasNewerDisplayHistory;
+  final bool isLoadingDisplayWindow;
+  final ChatMessageNavigationController? messageNavigation;
+  final LoadMessageLocatorEntries loadLocatorEntries;
+  final RevealMessageForLocator onRevealMessageForLocator;
+  final ValueChanged<bool> onAutoScrollToBottomChanged;
+  final Future<void> Function() onLoadOlderDisplayWindow;
+  final Future<void> Function() onLoadNewerDisplayWindow;
+  final Future<void> Function() onShowLatestDisplayWindow;
+  final ToggleFavoriteMessage onToggleFavoriteMessage;
+  final MessageTimestampAction onDeleteMessage;
+  final MessageTimestampBoolAction onDeleteMessagesFrom;
+  final MessageVariantAction onDeleteMessageVariant;
+  final MessageVariantAction onSelectMessageVariant;
+  final MessageTimestampSelectionAction onRollbackToMessage;
+  final MessageSelectionAction onSelectMessageToEdit;
+  final MessageTimestampAction onRegenerateMessage;
+  final ValueChanged<ChatUiMessage> onInsertSummary;
+  final MessageTimestampAction onCreateBranch;
+  final ValueChanged<ChatUiMessage> onReplyToMessage;
+  final MessageTimestampSelectionAction onToggleMultiSelectMode;
+  final MessageTimestampSelectionAction onToggleMessageSelection;
+  final VoidCallback onExitMultiSelectMode;
+  final VoidCallback onSelectAllMessages;
+  final VoidCallback onClearMessageSelection;
+  final Future<void> Function() onDeleteSelectedMessages;
+  final Future<void> Function() onRefreshRequested;
+  final VoidCallback onSendMessage;
+  final VoidCallback onQueueMessage;
+  final VoidCallback? onGuideMessage;
+  final VoidCallback? onInterruptAndSendMessage;
+  final VoidCallback onCancelMessage;
+  final List<PendingQueueMessageItem> pendingQueueMessages;
+  final bool isPendingQueueExpanded;
+  final List<core_proxy.RuntimeHostInteractionToolPermissionRequest>
+  toolPermissionRequests;
+  final Future<void> Function(
+    String chatId,
+    String requestId,
+    ChatToolPermissionResult result,
+  )
+  onToolPermissionDecision;
+  final ValueChanged<bool> onPendingQueueExpandedChange;
+  final ValueChanged<int> onDeletePendingQueueMessage;
+  final ValueChanged<int> onEditPendingQueueMessage;
+  final ValueChanged<int> onSendPendingQueueMessage;
+  final ValueChanged<int>? onGuidePendingQueueMessage;
+  final List<AttachmentInfo> attachments;
+  final VoidCallback onAttachImage;
+  final VoidCallback? onTakePhoto;
+  final ChatAttachmentCompletion onPluginAttachment;
+  final VoidCallback onAttachFile;
+  final ValueChanged<List<String>> onAttachFiles;
+  final ValueChanged<List<PastedImageAttachmentPayload>> onPasteImages;
+  final VoidCallback? onAttachScreenContent;
+  final VoidCallback? onAttachNotifications;
+  final VoidCallback? onAttachLocation;
+  final ValueChanged<String> onAttachPackage;
+  final ValueChanged<String> onRemoveAttachment;
+  final ValueChanged<AttachmentInfo> onPreviewAttachment;
+  final ValueListenable<String?> toastMessageListenable;
+  final VoidCallback onDismissToast;
+  final bool isMultiSelectMode;
+  final bool isPreparingChatSwitch;
+  final bool isSpeechRecording;
+  final bool isSpeechTranscribing;
+  final VoidCallback onSpeechInput;
+  final Set<int> selectedMessageTimestamps;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final themePreferenceSnapshot = OperitTheme.of(
+      context,
+    ).themePreferenceSnapshot;
+    final inputStyle = themePreferenceSnapshot.inputStyle;
+    final isExcludedBottomStatus =
+        inputProcessingState.tag == 'ExecutingTool' ||
+        inputProcessingState.tag == 'ProcessingToolResult' ||
+        inputProcessingState.tag == 'ToolProgress' ||
+        inputProcessingState.tag == 'Receiving' ||
+        inputProcessingState.tag == 'Processing' ||
+        inputProcessingState.tag == 'Connecting' ||
+        inputProcessingState.message == 'enhanced_receiving_tool_result' ||
+        inputProcessingState.message == 'enhanced_receiving_response' ||
+        inputProcessingState.message == 'enhanced_processing_message' ||
+        inputProcessingState.message == 'enhanced_processing_input' ||
+        inputProcessingState.message == 'message_processing';
+    final processingStatus = inputProcessingStatusText(
+      AppLocalizations.of(context)!,
+      inputProcessingState,
+    );
+    final hasVisibleStatus =
+        inputProcessingState.isProcessing &&
+        !isExcludedBottomStatus &&
+        processingStatus.isNotEmpty;
+    final statusLaneInset = _inputProcessingStatusLaneInset(
+      themePreferenceSnapshot,
+      hasVisibleStatus: hasVisibleStatus,
+    );
+    final showProcessingStatus = statusLaneInset > 0 && hasVisibleStatus;
+    return CallbackShortcuts(
+      bindings: {
+        if (messageNavigation != null) ...{
+          const SingleActivator(LogicalKeyboardKey.keyF, control: true):
+              messageNavigation!.open,
+          const SingleActivator(LogicalKeyboardKey.keyF, meta: true):
+              messageNavigation!.open,
+        },
+      },
+      child: Stack(
+        alignment: Alignment.topCenter,
+        children: <Widget>[
+          if (backgroundUri != null)
+            Positioned.fill(
+              child: IgnorePointer(
+                child: ThemeAssetImage(
+                  storagePath: backgroundUri!,
+                  fit: BoxFit.cover,
+                ),
+              ),
+            ),
+          Positioned.fill(
+            child: Column(
+              children: <Widget>[
+                Expanded(
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: <Widget>[
+                      IgnorePointer(
+                        ignoring: isPreparingChatSwitch,
+                        child: Opacity(
+                          opacity: isPreparingChatSwitch ? 0 : 1,
+                          child: _buildChatArea(
+                            context,
+                            bottomContentInset: statusLaneInset,
+                          ),
+                        ),
+                      ),
+                      Positioned.fill(
+                        child: IgnorePointer(
+                          child: NewChatIntroOverlay(
+                            currentChatId: currentChatId,
+                            isChatEmpty:
+                                !loading &&
+                                messages.isEmpty &&
+                                errorMessage == null,
+                            isSwitching: loading || isPreparingChatSwitch,
+                          ),
+                        ),
+                      ),
+                      if (!isPreparingChatSwitch && statusLaneInset > 0)
+                        Positioned(
+                          left: 0,
+                          right: 0,
+                          bottom: 0,
+                          child: _buildInputProcessingStatusLane(
+                            themePreferenceSnapshot,
+                            visible: showProcessingStatus,
+                            status: processingStatus,
+                            textStyle: theme.textTheme.bodySmall?.copyWith(
+                              color: theme.colorScheme.onSurface.withValues(
+                                alpha: 0.8,
+                              ),
+                            ),
+                          ),
+                        ),
+                      if (isPreparingChatSwitch) const M3LoadingPane(size: 42),
+                    ],
+                  ),
+                ),
+                if (!isPreparingChatSwitch && toolPermissionRequests.isNotEmpty)
+                  Align(
+                    alignment: Alignment.bottomCenter,
+                    child: ConstrainedBox(
+                      constraints: BoxConstraints(
+                        maxWidth:
+                            themePreferenceSnapshot.bubbleWideLayoutEnabled
+                            ? chatWideContentMaxWidth
+                            : chatContentMaxWidth,
+                      ),
+                      child: Padding(
+                        padding: EdgeInsets.symmetric(
+                          horizontal: themePreferenceSnapshot.chatInputFloating
+                              ? 8
+                              : 0,
+                        ),
+                        child: ChatToolPermissionPanel(
+                          request: toolPermissionRequests.first,
+                          onRespond: onToolPermissionDecision,
+                        ),
+                      ),
+                    ),
+                  ),
+                // Keep the input subtree mounted during chat switches: tearing
+                // it down deactivates tooltip states whose global pointer
+                // routes then crash on ancestor lookups ("deactivated
+                // widget's ancestor"), matching the chat area treatment.
+                if (showInput || isMultiSelectMode)
+                  IgnorePointer(
+                    ignoring: isPreparingChatSwitch,
+                    child: Opacity(
+                      opacity: isPreparingChatSwitch ? 0 : 1,
+                      child: isMultiSelectMode
+                          ? ChatMultiSelectBar(
+                              selectedCount: selectedMessageTimestamps.length,
+                              allSelected:
+                                  _selectableMessageTimestamps.isNotEmpty &&
+                                  _selectableMessageTimestamps.length ==
+                                      selectedMessageTimestamps.length,
+                              onClose: onExitMultiSelectMode,
+                              onToggleSelectAll:
+                                  _selectableMessageTimestamps.isNotEmpty &&
+                                      _selectableMessageTimestamps.length ==
+                                          selectedMessageTimestamps.length
+                                  ? onClearMessageSelection
+                                  : onSelectAllMessages,
+                              onCopy: selectedMessageTimestamps.isEmpty
+                                  ? null
+                                  : () => _copySelectedMessages(context),
+                              onShareImage: selectedMessageTimestamps.isEmpty
+                                  ? null
+                                  : () => _generateShareImage(context),
+                              onDelete: selectedMessageTimestamps.isEmpty
+                                  ? null
+                                  : () => _confirmDeleteSelected(context),
+                            )
+                          : DrawerGestureExclusion(
+                              child: _buildChatInputSection(inputStyle),
+                            ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          Positioned(
+            left: 0,
+            top: 0,
+            child: _ChatNoticeBridge(
+              messageListenable: toastMessageListenable,
+              onDismiss: onDismissToast,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Builds the chat input section selected by the saved input style.
+  Widget _buildChatInputSection(String inputStyle) {
+    return ChatRouteStatusHint(
+      chatId: currentChatId,
+      viewModel: viewModel,
+      builder: (hint) => _buildChatInputWithRouteHint(inputStyle, hint),
+    );
+  }
+
+  /// Passes the same Core-provided route label to both composer styles.
+  Widget _buildChatInputWithRouteHint(
+    String inputStyle,
+    ChatRouteComposerHint hint,
+  ) {
+    final sendMessage = hint.hostMissing ? hint.onClaimHost : onSendMessage;
+    return switch (inputStyle) {
+      UserPreferencesManager.INPUT_STYLE_AGENT => AgentChatInputSection(
+        hintSuffix: hint.suffix,
+        hostMissing: hint.hostMissing,
+        controller: messageController,
+        focusNode: inputFocusNode,
+        isLoading: loading,
+        inputState: inputProcessingState,
+        mentionSuggestionPanel: mentionSuggestionPanel,
+        viewModel: viewModel,
+        currentChatId: currentChatId,
+        onSendMessage: sendMessage,
+        onQueueMessage: onQueueMessage,
+        onGuideMessage: onGuideMessage,
+        onInterruptAndSendMessage: onInterruptAndSendMessage,
+        onCancelMessage: onCancelMessage,
+        pendingQueueMessages: pendingQueueMessages,
+        isPendingQueueExpanded: isPendingQueueExpanded,
+        onPendingQueueExpandedChange: onPendingQueueExpandedChange,
+        onDeletePendingQueueMessage: onDeletePendingQueueMessage,
+        onEditPendingQueueMessage: onEditPendingQueueMessage,
+        onSendPendingQueueMessage: onSendPendingQueueMessage,
+        onGuidePendingQueueMessage: onGuidePendingQueueMessage,
+        attachments: attachments,
+        onAttachImage: onAttachImage,
+        onTakePhoto: onTakePhoto,
+        onPluginAttachment: onPluginAttachment,
+        onAttachFile: onAttachFile,
+        onAttachFiles: onAttachFiles,
+        onPasteImages: onPasteImages,
+        onAttachScreenContent: onAttachScreenContent,
+        onAttachNotifications: onAttachNotifications,
+        onAttachLocation: onAttachLocation,
+        onAttachPackage: onAttachPackage,
+        onRemoveAttachment: onRemoveAttachment,
+        onPreviewAttachment: onPreviewAttachment,
+        isSpeechRecording: isSpeechRecording,
+        isSpeechTranscribing: isSpeechTranscribing,
+        onSpeechInput: onSpeechInput,
+      ),
+      UserPreferencesManager.INPUT_STYLE_CLASSIC => ClassicChatInputSection(
+        hintSuffix: hint.suffix,
+        hostMissing: hint.hostMissing,
+        controller: messageController,
+        focusNode: inputFocusNode,
+        isLoading: loading,
+        inputState: inputProcessingState,
+        mentionSuggestionPanel: mentionSuggestionPanel,
+        viewModel: viewModel,
+        currentChatId: currentChatId,
+        onSendMessage: sendMessage,
+        onQueueMessage: onQueueMessage,
+        onGuideMessage: onGuideMessage,
+        onInterruptAndSendMessage: onInterruptAndSendMessage,
+        onCancelMessage: onCancelMessage,
+        pendingQueueMessages: pendingQueueMessages,
+        isPendingQueueExpanded: isPendingQueueExpanded,
+        onPendingQueueExpandedChange: onPendingQueueExpandedChange,
+        onDeletePendingQueueMessage: onDeletePendingQueueMessage,
+        onEditPendingQueueMessage: onEditPendingQueueMessage,
+        onSendPendingQueueMessage: onSendPendingQueueMessage,
+        onGuidePendingQueueMessage: onGuidePendingQueueMessage,
+        attachments: attachments,
+        onAttachImage: onAttachImage,
+        onTakePhoto: onTakePhoto,
+        onPluginAttachment: onPluginAttachment,
+        onAttachFile: onAttachFile,
+        onAttachFiles: onAttachFiles,
+        onPasteImages: onPasteImages,
+        onAttachScreenContent: onAttachScreenContent,
+        onAttachNotifications: onAttachNotifications,
+        onAttachLocation: onAttachLocation,
+        onAttachPackage: onAttachPackage,
+        onRemoveAttachment: onRemoveAttachment,
+        onPreviewAttachment: onPreviewAttachment,
+        isSpeechRecording: isSpeechRecording,
+        isSpeechTranscribing: isSpeechTranscribing,
+        onSpeechInput: onSpeechInput,
+      ),
+      _ => throw FormatException('Unknown chat input style: $inputStyle'),
+    };
+  }
+
+  /// Builds the scrollable chat area with message-level actions.
+  Widget _buildChatArea(
+    BuildContext context, {
+    required double bottomContentInset,
+  }) {
+    return ChatArea(
+      messages: messages,
+      isLoading: loading,
+      errorMessage: errorMessage,
+      scrollController: scrollController,
+      currentChatId: currentChatId,
+      fileDirectory: fileDirectory,
+      identityAvatarUri: chatIdentity?.avatarUri,
+      onIdentityTap: onIdentityTap,
+      clients: viewModel.clients,
+      packageManager: viewModel.clients.application.packageManager(),
+      autoScrollToBottomListenable: autoScrollToBottomListenable,
+      hasOlderDisplayHistory: hasOlderDisplayHistory,
+      hasNewerDisplayHistory: hasNewerDisplayHistory,
+      isLoadingDisplayWindow: isLoadingDisplayWindow,
+      messageNavigation: messageNavigation,
+      loadLocatorEntries: loadLocatorEntries,
+      onRevealMessageForLocator: onRevealMessageForLocator,
+      onAutoScrollToBottomChanged: onAutoScrollToBottomChanged,
+      onLoadOlderDisplayWindow: onLoadOlderDisplayWindow,
+      onLoadNewerDisplayWindow: onLoadNewerDisplayWindow,
+      onShowLatestDisplayWindow: onShowLatestDisplayWindow,
+      onToggleFavoriteMessage: onToggleFavoriteMessage,
+      onDeleteMessage: onDeleteMessage,
+      onDeleteMessagesFrom: onDeleteMessagesFrom,
+      onDeleteMessageVariant: onDeleteMessageVariant,
+      onSelectMessageVariant: onSelectMessageVariant,
+      onRollbackToMessage: onRollbackToMessage,
+      onSelectMessageToEdit: onSelectMessageToEdit,
+      onRegenerateMessage: onRegenerateMessage,
+      onInsertSummary: onInsertSummary,
+      onCreateBranch: onCreateBranch,
+      onReplyToMessage: onReplyToMessage,
+      onPlayVoice: (message) => _playVoice(context, message),
+      splitMarkdownContent: viewModel.splitMarkdownContent,
+      onToggleMultiSelectMode: onToggleMultiSelectMode,
+      onToggleMessageSelection: onToggleMessageSelection,
+      onRefreshRequested: onRefreshRequested,
+      isMultiSelectMode: isMultiSelectMode,
+      selectedMessageTimestamps: selectedMessageTimestamps,
+      bottomContentInset: bottomContentInset,
+    );
+  }
+
+  /// Resolves the transcript space reserved for the status overlay.
+  double _inputProcessingStatusLaneInset(
+    ThemePreferenceSnapshot snapshot, {
+    bool hasVisibleStatus = true,
+  }) {
+    if (isPreparingChatSwitch ||
+        isMultiSelectMode ||
+        !snapshot.showInputProcessingStatus ||
+        !hasVisibleStatus) {
+      return 0;
+    }
+    return inputProcessingStatusLaneHeight;
+  }
+
+  /// Builds the status lane floating over the bottom of the transcript.
+  Widget _buildInputProcessingStatusLane(
+    ThemePreferenceSnapshot snapshot, {
+    required bool visible,
+    required String status,
+    required TextStyle? textStyle,
+  }) {
+    return Align(
+      alignment: Alignment.bottomCenter,
+      child: ConstrainedBox(
+        constraints: BoxConstraints(
+          maxWidth: snapshot.bubbleWideLayoutEnabled
+              ? chatWideContentMaxWidth
+              : chatContentMaxWidth,
+        ),
+        child: InputProcessingStatusLane(
+          visible: visible,
+          isSummarizing: inputProcessingState.tag == 'Summarizing',
+          status: status,
+          textStyle: textStyle,
+        ),
+      ),
+    );
+  }
+
+  /// Captures the displayed transcript and message variant before any asynchronous voice work.
+  Future<void> _playVoice(BuildContext context, ChatUiMessage message) async {
+    try {
+      final chatId = currentChatId;
+      if (chatId == null || chatId.trim().isEmpty) {
+        throw StateError('The displayed message has no conversation ID.');
+      }
+      final text = cleanMessageContent(message.displayText);
+      if (text.trim().isEmpty) {
+        throw StateError('The selected message has no speech content.');
+      }
+      await TtsPlaybackController.instance.speakForMessage(
+        bridge: viewModel.bridge,
+        chatId: chatId,
+        messageTimestamp: message.timestamp,
+        variantIndex: message.selectedVariantIndex,
+        text: text,
+      );
+    } catch (error) {
+      if (!context.mounted) {
+        return;
+      }
+      _showTtsSnack(context, '生成/播放语音失败：$error');
+    }
+  }
+
+  /// Shows a snackbar for TTS status and errors.
+  void _showTtsSnack(BuildContext context, String message) {
+    if (!context.mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  /// Resolves the message timestamps eligible for multi-select actions.
+  Set<int> get _selectableMessageTimestamps {
+    return messages
+        .where((message) {
+          final sender = message.sender;
+          return sender == 'user' || sender == 'ai';
+        })
+        .map((message) => message.timestamp)
+        .toSet();
+  }
+
+  /// Resolves selected visible messages in display order.
+  List<ChatUiMessage> get _selectedVisibleMessages {
+    return messages
+        .where(
+          (message) => selectedMessageTimestamps.contains(message.timestamp),
+        )
+        .toList(growable: false);
+  }
+
+  /// Copies the selected messages into the system clipboard.
+  Future<void> _copySelectedMessages(BuildContext context) async {
+    final text = buildMessagesCopyText(_selectedVisibleMessages);
+    try {
+      await Clipboard.setData(ClipboardData(text: text));
+    } on PlatformException catch (error) {
+      if (!context.mounted) {
+        return;
+      }
+      ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+        SnackBar(content: Text('复制失败：${error.message ?? error.code}')),
+      );
+    }
+  }
+
+  /// Confirms deletion of the selected messages.
+  Future<void> _confirmDeleteSelected(BuildContext context) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('确认删除'),
+          content: Text('确定删除已选的 ${selectedMessageTimestamps.length} 条消息？'),
+          actions: <Widget>[
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('删除'),
+            ),
+          ],
+        );
+      },
+    );
+    if (confirmed == true) {
+      await onDeleteSelectedMessages();
+    }
+  }
+
+  /// Generates and previews a share image for the selected messages.
+  Future<void> _generateShareImage(BuildContext context) async {
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) {
+        return const AlertDialog(
+          content: Row(
+            children: <Widget>[
+              SizedBox(
+                width: 22,
+                height: 22,
+                child: CircularProgressIndicator(strokeWidth: 2.5),
+              ),
+              SizedBox(width: 14),
+              Text('正在生成长图...'),
+            ],
+          ),
+        );
+      },
+    );
+
+    try {
+      final image = await ChatShareImageGenerator.generate(
+        context: context,
+        messages: _selectedVisibleMessages,
+        splitMarkdownContent: viewModel.splitMarkdownContent,
+      );
+      if (!context.mounted) {
+        return;
+      }
+      Navigator.of(context).pop();
+      showDialog<void>(
+        context: context,
+        builder: (context) {
+          return ChatShareImagePreviewDialog(
+            image: image,
+            onDismiss: () => Navigator.of(context).pop(),
+          );
+        },
+      );
+    } catch (error, stackTrace) {
+      debugPrint('Failed to generate share image: $error\n$stackTrace');
+      if (!context.mounted) {
+        return;
+      }
+      Navigator.of(context).pop();
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('生成长图失败：$error')));
+    }
+  }
+}
+
+/// Forwards chat toast events into the window-level corner notice stack.
+class _ChatNoticeBridge extends StatefulWidget {
+  /// Creates a bridge from the chat toast listenable to the notice controller.
+  const _ChatNoticeBridge({
+    required this.messageListenable,
+    required this.onDismiss,
+  });
+
+  final ValueListenable<String?> messageListenable;
+  final VoidCallback onDismiss;
+
+  /// Creates the state that keeps one chat notice in the corner stack.
+  @override
+  State<_ChatNoticeBridge> createState() => _ChatNoticeBridgeState();
+}
+
+class _ChatNoticeBridgeState extends State<_ChatNoticeBridge> {
+  int? _noticeId;
+  String? _shownText;
+
+  /// Subscribes to chat toast changes.
+  @override
+  void initState() {
+    super.initState();
+    widget.messageListenable.addListener(_sync);
+    _scheduleSync();
+  }
+
+  /// Follows a replaced toast listenable.
+  @override
+  void didUpdateWidget(_ChatNoticeBridge oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.messageListenable == widget.messageListenable) {
+      return;
+    }
+    oldWidget.messageListenable.removeListener(_sync);
+    widget.messageListenable.addListener(_sync);
+    _scheduleSync();
+  }
+
+  /// Releases the subscription and the active chat notice.
+  @override
+  void dispose() {
+    widget.messageListenable.removeListener(_sync);
+    _dismissActive();
+    super.dispose();
+  }
+
+  /// Publishes the current chat toast after the surrounding build finishes.
+  void _scheduleSync() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        _sync();
+      }
+    });
+  }
+
+  /// Shows, replaces, or clears the chat notice to match the listenable.
+  void _sync() {
+    final message = widget.messageListenable.value?.trim() ?? '';
+    if (message.isEmpty) {
+      _dismissActive();
+      return;
+    }
+    if (_noticeId != null && _shownText == message) {
+      return;
+    }
+    _dismissActive();
+    late final int id;
+    id = AppToastController.instance.show(
+      message,
+      onDismissed: () => _handleNoticeDismissed(id),
+    );
+    _noticeId = id;
+    _shownText = message;
+  }
+
+  /// Removes the chat notice without treating that removal as a user dismiss.
+  void _dismissActive() {
+    final id = _noticeId;
+    _noticeId = null;
+    _shownText = null;
+    if (id != null) {
+      AppToastController.instance.dismiss(id);
+    }
+  }
+
+  /// Clears the chat toast after the user or the timer dismisses its notice.
+  void _handleNoticeDismissed(int id) {
+    if (!mounted || _noticeId != id) {
+      return;
+    }
+    _noticeId = null;
+    _shownText = null;
+    widget.onDismiss();
+  }
+
+  /// Occupies no space; the notice is drawn by the window overlay.
+  @override
+  Widget build(BuildContext context) {
+    return const SizedBox.shrink();
+  }
+}

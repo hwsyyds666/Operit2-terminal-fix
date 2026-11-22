@@ -1,0 +1,82 @@
+#[path = "AIService.rs"]
+pub mod AIService;
+#[path = "AIServiceFactory.rs"]
+pub mod AIServiceFactory;
+#[path = "ApiKeyPoolAvailabilityTester.rs"]
+pub mod ApiKeyPoolAvailabilityTester;
+#[path = "ApiKeyProvider.rs"]
+pub mod ApiKeyProvider;
+#[path = "ClaudeProvider.rs"]
+pub mod ClaudeProvider;
+#[path = "CodexOAuth.rs"]
+pub mod CodexOAuth;
+#[path = "DeepseekProvider.rs"]
+pub mod DeepseekProvider;
+#[path = "DoubaoAIProvider.rs"]
+pub mod DoubaoAIProvider;
+#[path = "EndpointCompleter.rs"]
+pub mod EndpointCompleter;
+#[path = "FirstOutputDeadline.rs"]
+mod FirstOutputDeadline;
+#[path = "FourRouterProvider.rs"]
+pub mod FourRouterProvider;
+#[path = "GeminiProvider.rs"]
+pub mod GeminiProvider;
+#[path = "KimiProvider.rs"]
+pub mod KimiProvider;
+#[path = "LlmRetryPolicy.rs"]
+pub mod LlmRetryPolicy;
+#[path = "MediaLinkParser.rs"]
+pub mod MediaLinkParser;
+
+/// Re-exports the canonical media-link builders now shared with the tool layer.
+pub use operit_util::MediaLinkBuilder;
+#[path = "MimoProvider.rs"]
+pub mod MimoProvider;
+#[path = "MistralProvider.rs"]
+pub mod MistralProvider;
+#[path = "ModelConfigConnectionTester.rs"]
+pub mod ModelConfigConnectionTester;
+#[path = "ModelListFetcher.rs"]
+pub mod ModelListFetcher;
+#[path = "NousPortalProvider.rs"]
+pub mod NousPortalProvider;
+#[path = "NvidiaAIProvider.rs"]
+pub mod NvidiaAIProvider;
+#[path = "OllamaProvider.rs"]
+pub mod OllamaProvider;
+#[path = "OpenAIProvider.rs"]
+pub mod OpenAIProvider;
+#[path = "OpenAIResponsesProvider.rs"]
+pub mod OpenAIResponsesProvider;
+#[path = "OpenCodeProvider.rs"]
+pub mod OpenCodeProvider;
+#[path = "OpenRouterProvider.rs"]
+pub mod OpenRouterProvider;
+#[path = "QwenAIProvider.rs"]
+pub mod QwenAIProvider;
+#[path = "RateLimitedAIService.rs"]
+pub mod RateLimitedAIService;
+#[path = "RateLimiterRegistry.rs"]
+pub mod RateLimiterRegistry;
+#[path = "RequestConcurrencyRegistry.rs"]
+pub mod RequestConcurrencyRegistry;
+#[path = "SlidingWindowRateLimiter.rs"]
+pub mod SlidingWindowRateLimiter;
+#[path = "StreamingResponseLines.rs"]
+mod StreamingResponseLines;
+#[path = "ProviderHttp.rs"]
+mod ProviderHttp;
+#[path = "StructuredToolCallBridge.rs"]
+pub mod StructuredToolCallBridge;
+#[path = "ThinkingDialect.rs"]
+pub mod ThinkingDialect;
+#[path = "ToolPkgJsAiProviderService.rs"]
+pub mod ToolPkgJsAiProviderService;
+
+#[cfg(test)]
+#[path = "../../../../tests/ProviderMediaTestSupport.rs"]
+mod ProviderMediaTestSupport;
+
+#[path = "LocalModelProvider.rs"]
+pub mod LocalModelProvider;

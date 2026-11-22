@@ -1,0 +1,315 @@
+use super::*;
+
+/// Negotiation rejections appear even when the cached profile still advertises compatibility.
+#[tokio::test]
+async fn protocol_rejection_projects_an_unavailable_connection_without_mutating_profiles() {
+    let _guard = routeTestGlobalLock().lock().await;
+    installTestRuntimeScheduler();
+    let (a, access) = approvalService("protocol-projection-a");
+    let (b, _) = approvalService("protocol-projection-b");
+    mergedChainFixture(&[&a, &b]);
+    let peer = ApprovalMeshPeer::new(a.localNodeId());
+    peer.link(&b);
+    peer.disconnectPeer(&b.localNodeId()).await.unwrap();
+    let failure = CoreLinkError::new("PEER_PROTOCOL_MISMATCH", "Negotiated peer is incompatible");
+    peer.protocolFailures.lock().unwrap().insert(b.localNodeId(), failure.clone());
+    peer.protocolFailures.lock().unwrap().insert("foreign-peer".into(), failure.clone());
+    a.installNodeServices(NodeServices::new(peer.clone())).unwrap();
+    let profiles = a.spaceStore.deviceProfiles().unwrap();
+
+    let topology = access.deviceSpaceTopology().unwrap();
+    assert_eq!(topology.connections.len(), 1);
+    assert_eq!(topology.connections[0].status,
+        crate::RuntimeRemoteLinkService::RuntimeDeviceSpaceConnectionStatus::VersionMismatch);
+    assert!(topology.connections[0].reason.contains(&failure.message));
+    assert!(!topology.devices.iter().find(|device| device.deviceId == b.localNodeId()).unwrap().online);
+    assert_eq!(a.spaceStore.deviceProfiles().unwrap(), profiles);
+
+    crate::NodeSpaceService::space_topology::publishLocalTopology(
+        &a.spaceStore, &a.networkControlStore, &a.localNodeId(), &BTreeSet::from([b.localNodeId()]),
+    ).unwrap();
+    assert_eq!(access.deviceSpaceTopology().unwrap().connections, topology.connections);
+
+    peer.link(&b);
+    let topology = access.deviceSpaceTopology().unwrap();
+    assert_eq!(topology.connections.len(), 1);
+    assert!(topology.devices.iter().find(|device| device.deviceId == b.localNodeId()).unwrap().online);
+    assert!(topology.connections.iter().all(|connection|
+        connection.status != crate::RuntimeRemoteLinkService::RuntimeDeviceSpaceConnectionStatus::VersionMismatch));
+}
+
+/// Publishes every device's adjacency through the production helper, then carries the
+/// records the way the Space snapshot exchange does.
+fn publishTree(routers: &[CoreNodeRouter], peers: &[Arc<ApprovalMeshPeer>]) {
+    for (router, peer) in routers.iter().zip(peers) {
+        let activePeers = peer.activePeerNodeIds().unwrap();
+        crate::NodeSpaceService::space_topology::publishLocalTopology(
+            &router.spaceStore,
+            &router.networkControlStore,
+            &router.localNodeId(),
+            &activePeers,
+        )
+        .expect("production adjacency publication must succeed");
+    }
+    propagateTopology(routers);
+}
+
+/// Carries every published record to every other device, exactly as snapshots do.
+fn propagateTopology(routers: &[CoreNodeRouter]) {
+    let topology = routers
+        .iter()
+        .map(|router| {
+            router
+                .spaceStore
+                .topologyRecords()
+                .unwrap()
+                .remove(&router.localNodeId())
+                .expect("every device publishes its own adjacency")
+        })
+        .collect::<Vec<_>>();
+    for router in routers {
+        router
+            .spaceStore
+            .importTopologyRecords(topology.clone())
+            .unwrap();
+    }
+}
+
+/// Verifies a tree resolves member-to-member routing from published adjacency alone.
+#[tokio::test]
+async fn tree_topology_publication_routes_between_leaves() {
+    let _guard = routeTestGlobalLock().lock().await;
+    installTestRuntimeScheduler();
+    let services = (0..3)
+        .map(|index| approvalService(&format!("tree-{index}")))
+        .collect::<Vec<_>>();
+    let routers = services
+        .iter()
+        .map(|(router, _)| router.clone())
+        .collect::<Vec<_>>();
+    let access = services
+        .iter()
+        .map(|(_, service)| service.clone())
+        .collect::<Vec<_>>();
+    mergedChainFixture(&routers.iter().collect::<Vec<_>>());
+    let peers = routers
+        .iter()
+        .map(|router| ApprovalMeshPeer::new(router.localNodeId()))
+        .collect::<Vec<_>>();
+    // A tree: leaf A - core C - leaf B.
+    for (a, b) in [(0, 1), (1, 2)] {
+        peers[a].link(&routers[b]);
+        peers[b].link(&routers[a]);
+    }
+    for (router, peer) in routers.iter().zip(&peers) {
+        router
+            .installNodeServices(NodeServices::new(peer.clone()))
+            .unwrap();
+    }
+
+    publishTree(&routers, &peers);
+
+    for (router, service) in routers.iter().zip(&access) {
+        assert_eq!(
+            router.spaceStore.deviceConnections().unwrap().len(),
+            4,
+            "routing must retain both endpoints' directed announcements"
+        );
+        let projection = service.deviceSpaceTopology().unwrap();
+        assert_eq!(
+            projection.connections.len(),
+            2,
+            "each physical link must appear once from every device's perspective"
+        );
+        assert!(
+            projection
+                .connections
+                .iter()
+                .all(|connection| connection.firstDeviceId < connection.secondDeviceId),
+            "connection endpoint order must be stable across devices"
+        );
+    }
+
+    let middleRecord = serde_json::to_value(
+        routers[1]
+            .spaceStore
+            .topologyRecords()
+            .unwrap()
+            .remove(&routers[1].localNodeId())
+            .expect("the core publishes its own adjacency"),
+    )
+    .unwrap();
+    assert_eq!(middleRecord["peers"].as_array().unwrap().len(), 2);
+    assert_eq!(middleRecord["links"].as_array().unwrap().len(), 2);
+
+    let leafToLeaf = routers[0]
+        .nodeRoutePlan(&routers[2].localNodeId())
+        .expect("route plan lookup must succeed")
+        .expect("one leaf must reach its sibling through the core");
+    assert_eq!(
+        leafToLeaf.path,
+        vec![routers[1].localNodeId(), routers[2].localNodeId()]
+    );
+    assert_eq!(leafToLeaf.hops(), 2);
+    assert!(routers[0]
+        .nodeIsReachable(&routers[2].localNodeId())
+        .unwrap());
+    let reverse = routers[2]
+        .nodeRoutePlan(&routers[0].localNodeId())
+        .unwrap()
+        .expect("the reverse tree path must resolve");
+    assert_eq!(
+        reverse.path,
+        vec![routers[1].localNodeId(), routers[0].localNodeId()]
+    );
+    let direct = routers[0]
+        .nodeRoutePlan(&routers[1].localNodeId())
+        .unwrap()
+        .expect("the direct peer must stay reachable");
+    assert_eq!(direct.hops(), 1);
+
+    let topology = access[0]
+        .deviceSpaceTopology()
+        .expect("the device-space projection must read");
+    let sibling = topology
+        .devices
+        .iter()
+        .find(|device| device.deviceId == routers[2].localNodeId())
+        .expect("the sibling leaf must appear in the projection");
+    assert!(sibling.online, "a relayed member must report online");
+    assert_eq!(sibling.relayHops, Some(2));
+    assert_eq!(
+        sibling.relayPath,
+        Some(vec![routers[1].localNodeId(), routers[2].localNodeId()])
+    );
+    let core = topology
+        .devices
+        .iter()
+        .find(|device| device.deviceId == routers[1].localNodeId())
+        .expect("the core must appear in the projection");
+    assert!(core.online);
+    assert_eq!(core.relayHops, None, "a direct peer is not relayed");
+    let crossEdge = topology
+        .connections
+        .iter()
+        .find(|connection| {
+            (connection.firstDeviceId == routers[1].localNodeId()
+                && connection.secondDeviceId == routers[2].localNodeId())
+                || (connection.firstDeviceId == routers[2].localNodeId()
+                    && connection.secondDeviceId == routers[1].localNodeId())
+        })
+        .expect("the core announces its sibling link");
+    assert_eq!(
+        crossEdge.status,
+        crate::RuntimeRemoteLinkService::RuntimeDeviceSpaceConnectionStatus::Announced
+    );
+    let localEdge = topology
+        .connections
+        .iter()
+        .find(|connection| {
+            (connection.firstDeviceId == routers[0].localNodeId()
+                && connection.secondDeviceId == routers[1].localNodeId())
+                || (connection.firstDeviceId == routers[1].localNodeId()
+                    && connection.secondDeviceId == routers[0].localNodeId())
+        })
+        .expect("the local device announces its direct link");
+    assert_eq!(
+        localEdge.status,
+        crate::RuntimeRemoteLinkService::RuntimeDeviceSpaceConnectionStatus::Online
+    );
+
+    // Snapshot exchange can deliver the owners' announcements at different times.
+    // Either endpoint alone must still project the same device pair. Reachability
+    // may change because routing continues to use the directed announcements.
+    let endpointPairs = |service: &RuntimeRemoteLinkService| {
+        service
+            .deviceSpaceTopology()
+            .unwrap()
+            .connections
+            .into_iter()
+            .map(|connection| (connection.firstDeviceId, connection.secondDeviceId))
+            .collect::<Vec<_>>()
+    };
+    let before = access
+        .iter()
+        .map(|service| endpointPairs(service))
+        .collect::<Vec<_>>();
+    routers[1].spaceStore.setDirectPeers(Vec::new()).unwrap();
+    propagateTopology(&routers);
+    for ((router, service), expected) in routers.iter().zip(&access).zip(before) {
+        assert_eq!(router.spaceStore.deviceConnections().unwrap().len(), 2);
+        assert_eq!(endpointPairs(service), expected);
+    }
+}
+
+/// Verifies a dropped direct link is pruned from the announcement and stops routing.
+#[tokio::test]
+async fn tree_topology_prunes_a_dropped_direct_link() {
+    let _guard = routeTestGlobalLock().lock().await;
+    installTestRuntimeScheduler();
+    let routers = (0..3)
+        .map(|index| approvalService(&format!("prune-{index}")).0)
+        .collect::<Vec<_>>();
+    mergedChainFixture(&routers.iter().collect::<Vec<_>>());
+    let peers = routers
+        .iter()
+        .map(|router| ApprovalMeshPeer::new(router.localNodeId()))
+        .collect::<Vec<_>>();
+    for (a, b) in [(0, 1), (1, 2)] {
+        peers[a].link(&routers[b]);
+        peers[b].link(&routers[a]);
+    }
+    for (router, peer) in routers.iter().zip(&peers) {
+        router
+            .installNodeServices(NodeServices::new(peer.clone()))
+            .unwrap();
+    }
+
+    publishTree(&routers, &peers);
+    assert!(routers[0]
+        .nodeIsReachable(&routers[2].localNodeId())
+        .unwrap());
+
+    // The leaf drops its only link; the live peer set stops proving its sibling reachable.
+    peers[0]
+        .disconnectPeer(&routers[1].localNodeId())
+        .await
+        .unwrap();
+    assert!(!routers[0]
+        .nodeIsReachable(&routers[2].localNodeId())
+        .unwrap());
+
+    // The next publication removes the peer and its link from the announcement.
+    let wrote = crate::NodeSpaceService::space_topology::publishLocalTopology(
+        &routers[0].spaceStore,
+        &routers[0].networkControlStore,
+        &routers[0].localNodeId(),
+        &peers[0].activePeerNodeIds().unwrap(),
+    )
+    .unwrap();
+    assert!(
+        wrote,
+        "dropping the only peer must rewrite the local announcement"
+    );
+    let record = serde_json::to_value(
+        routers[0]
+            .spaceStore
+            .topologyRecords()
+            .unwrap()
+            .remove(&routers[0].localNodeId())
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(record["peers"].as_array().unwrap().is_empty());
+    assert!(record["links"].as_array().unwrap().is_empty());
+
+    // An unchanged topology does not rewrite the record again.
+    let wroteAgain = crate::NodeSpaceService::space_topology::publishLocalTopology(
+        &routers[0].spaceStore,
+        &routers[0].networkControlStore,
+        &routers[0].localNodeId(),
+        &peers[0].activePeerNodeIds().unwrap(),
+    )
+    .unwrap();
+    assert!(!wroteAgain, "an unchanged adjacency must not rewrite the record");
+}

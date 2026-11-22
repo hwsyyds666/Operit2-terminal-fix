@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "toolpkg_id": "com.operit.worldbook",
+  "version": "1.3.1",
+  "api_version": "2.0.0",
+  "main": "dist/main.js",
+  "author": [
+    "黒羽 燕",
+    "冰蓝天影"
+  ],
+  "display_name": {
+    "zh": "世界书",
+    "en": "World Book",
+    "default": "World Book"
+  },
+  "description": {
+    "zh": "世界书/知识库插件，支持关键词匹配、条目注入和变量模板。",
+    "en": "World Book / Lorebook with keyword matching, prompt injection, and variable templates.",
+    "default": "World Book / Lorebook plugin for prompt injection"
+  },
+  "enabled_by_default": false,
+  "subpackages": [
+    {
+      "id": "worldbook_tools",
+      "entry": "dist/packages/worldbook_tools.js",
+      "enabled_by_default": false,
+      "display_name": {
+        "zh": "世界书工具",
+        "en": "World Book Tools"
+      },
+      "description": {
+        "zh": "世界书条目的增删改查工具",
+        "en": "CRUD tools for world book entries"
+      }
+    }
+  ],
+  "requires": [
+    {
+      "id": "com.operit.character_cards",
+      "min_version": "0.1.0"
+    }
+  ]
+}

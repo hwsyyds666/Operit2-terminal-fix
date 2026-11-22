@@ -1,0 +1,52 @@
+package app.operit
+
+object OperitRuntimeNative {
+    /** Runs PTY primitives inside the Shizuku user service's security context. */
+    @JvmStatic external fun privilegedPtyOperation(request: String): String
+    /** Submits synchronous Java work to the native Host blocking scheduler. */
+    @JvmStatic external fun scheduleRuntimeTask(task: Runnable)
+    /** Reserves all native service workers required by one blocking pipeline. */
+    @JvmStatic external fun scheduleRuntimeServices(tasks: Array<Runnable>)
+    /** Accepts borrowed pipe handles from the Plugin SDK Binder endpoint. */
+    @JvmStatic external fun acceptPluginSdkPipes(reader: Int, writer: Int)
+    init {
+        System.loadLibrary("operit_flutter_bridge")
+    }
+
+    /** Creates the runtime with private archive storage independent of user-selected data roots. */
+    @JvmStatic external fun create(
+        runtimeRoot: String,
+        workspaceRoot: String,
+        archiveRuntimeRoot: String,
+        deviceModel: String,
+        host: AndroidRuntimeHost,
+    ): Long
+    @JvmStatic external fun createError(): String
+    /** Executes offline data rescue using only storage and secret-store Host adapters. */
+    @JvmStatic external fun dataRescue(defaultRuntimeRoot: String, request: String, host: AndroidRuntimeHost): String
+    /** Reads the client bootstrap record before the native Runtime is created. */
+    @JvmStatic external fun runtimeBootstrapRead(defaultRuntimeRoot: String): String
+    /** Writes the client bootstrap record before the native Runtime is created. */
+    @JvmStatic
+    external fun runtimeBootstrapWrite(defaultRuntimeRoot: String, content: String): String
+    /** Stops one exact work generation directly in the process-owned Core. */
+    @JvmStatic external fun stopBackgroundWork(handle: Long, workId: String): String
+    @JvmStatic external fun destroy(handle: Long)
+    /** Creates a retained direct FFI connection to the host runtime. */
+    @JvmStatic external fun connectCoreFfi(handle: Long): String
+    /** Connects to the module without creating a Core in this Android process. */
+    @JvmStatic external fun connectModuleCoreFfi(endpoint: String): String
+    /** Persists module client metadata over its authenticated loopback session. */
+    @JvmStatic external fun writeModuleBootstrap(endpoint: String, content: String)
+
+
+    @JvmStatic external fun emitRuntimeEvent(handle: Long, eventJson: String): String
+
+    @JvmStatic
+    external fun emitHostRuntimeEventSchedule(
+        handle: Long,
+        scheduleId: String,
+        scheduledAtMillis: Long,
+        firedAtMillis: Long,
+    ): String
+}

@@ -1,0 +1,97 @@
+use std::sync::Arc;
+
+use async_trait::async_trait;
+
+use crate::chat::llmprovider::AIService::{AIService, AiServiceError, SendMessageRequest};
+use crate::chat::llmprovider::RequestConcurrencyRegistry::RequestSemaphore;
+use crate::chat::llmprovider::SlidingWindowRateLimiter::SlidingWindowRateLimiter;
+use operit_model::OpenAIModels::ModelOption;
+use operit_model::PromptTurn::PromptTurn;
+use operit_model::ToolPrompt::ToolPrompt;
+use operit_util::stream::RevisableTextStream::RevisableTextStreamLike;
+
+pub struct RateLimitedAIService {
+    delegate: Box<dyn AIService>,
+    rateLimiter: Option<Arc<SlidingWindowRateLimiter>>,
+    concurrencySemaphore: Option<Arc<RequestSemaphore>>,
+}
+
+impl RateLimitedAIService {
+    /// Wraps a provider with shared request limits.
+    pub fn new(
+        delegate: Box<dyn AIService>,
+        rateLimiter: Option<Arc<SlidingWindowRateLimiter>>,
+        concurrencySemaphore: Option<Arc<RequestSemaphore>>,
+    ) -> Self {
+        Self {
+            delegate,
+            rateLimiter,
+            concurrencySemaphore,
+        }
+    }
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+impl AIService for RateLimitedAIService {
+    fn input_token_count(&self) -> i64 {
+        self.delegate.input_token_count()
+    }
+
+    fn cached_input_token_count(&self) -> i64 {
+        self.delegate.cached_input_token_count()
+    }
+
+    fn output_token_count(&self) -> i64 {
+        self.delegate.output_token_count()
+    }
+
+    fn provider_model(&self) -> String {
+        self.delegate.provider_model()
+    }
+
+    fn reset_token_counts(&mut self) {
+        self.delegate.reset_token_counts();
+    }
+
+    fn cancel_streaming(&mut self) {
+        self.delegate.cancel_streaming();
+    }
+
+    async fn get_models_list(&self) -> Result<Vec<ModelOption>, AiServiceError> {
+        self.delegate.get_models_list().await
+    }
+
+    /// Keeps admission asynchronous and returns its concurrency permit on every exit.
+    async fn send_message(
+        &mut self,
+        request: SendMessageRequest,
+    ) -> Result<Box<dyn RevisableTextStreamLike>, AiServiceError> {
+        if let Some(rateLimiter) = &self.rateLimiter {
+            rateLimiter.acquire().await;
+        }
+        let _permit = match &self.concurrencySemaphore {
+            Some(semaphore) => Some(semaphore.acquire().await),
+            None => None,
+        };
+        self.delegate.send_message(request).await
+    }
+
+    async fn test_connection(&self) -> Result<String, AiServiceError> {
+        self.delegate.test_connection().await
+    }
+
+    async fn calculate_input_tokens(
+        &self,
+        chat_history: &[PromptTurn],
+        available_tools: &[ToolPrompt],
+    ) -> Result<i64, AiServiceError> {
+        self.delegate
+            .calculate_input_tokens(chat_history, available_tools)
+            .await
+    }
+
+    fn release(&mut self) {
+        self.delegate.release();
+    }
+}

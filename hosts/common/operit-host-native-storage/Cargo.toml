@@ -1,0 +1,16 @@
+[package]
+name = "operit-host-native-storage"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "MIT"
+publish = false
+
+[dependencies]
+fs2 = "0.4"
+operit-host-contract = { path = "../../../core/crates/foundation/host-contract" }
+rusqlite = { version = "0.31", features = ["bundled", "blob", "limits"] }
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }

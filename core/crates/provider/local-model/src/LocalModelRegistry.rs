@@ -1,0 +1,453 @@
+use serde::{Deserialize, Serialize};
+
+use crate::LocalEngineCatalog::LocalEngineCatalog;
+use crate::LocalEngineManifest::{
+    LocalEngineArtifact, LocalEngineDelivery, LocalEngineManifest, LocalPlatformTarget,
+};
+use crate::LocalModelManifest::{LocalModelInstallSource, LocalModelKind, LocalModelManifest, LocalModelSourceKind};
+use crate::LocalModelStorage::{buildLocalEngineStoragePath, LocalModelStorageError};
+
+const LEGACY_LLAMA_CPP_VERSION: &str = "b11829";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(non_snake_case)]
+pub struct InstalledLocalModel {
+    pub manifest: LocalModelManifest,
+    pub storagePath: String,
+    pub installedAtMs: i64,
+    pub verifiedAtMs: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(non_snake_case)]
+pub struct InstalledLocalEngine {
+    pub manifest: LocalEngineManifest,
+    pub artifact: LocalEngineArtifact,
+    pub storagePath: String,
+    pub installedAtMs: i64,
+    pub verifiedAtMs: Option<i64>,
+}
+
+impl InstalledLocalEngine {
+    /// Returns the stable registry key for this installed engine target.
+    pub fn registryKey(&self) -> String {
+        format!(
+            "{}@{}#{}",
+            self.manifest.id,
+            self.manifest.version,
+            self.artifact.target.storageSegment()
+        )
+    }
+}
+
+impl InstalledLocalModel {
+    /// Returns the stable registry key for this installed model.
+    pub fn registryKey(&self) -> String {
+        self.manifest.registryKey()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(non_snake_case)]
+pub struct LocalModelRegistrySnapshot {
+    pub installedModels: Vec<InstalledLocalModel>,
+    #[serde(default)]
+    pub installedEngines: Vec<InstalledLocalEngine>,
+    #[serde(default)]
+    pub preferredSourceKind: Option<LocalModelSourceKind>,
+    #[serde(default)]
+    pub customModels: Vec<LocalModelManifest>,
+}
+
+impl LocalModelRegistrySnapshot {
+    /// Moves legacy GGUF models and embedded engine records to the bundled llama.cpp version.
+    pub(crate) fn migrateEmbeddedLlamaCpp(&mut self) -> Result<(), LocalModelStorageError> {
+        let current = LocalEngineCatalog::llamaCppRequirement();
+        for model in self
+            .installedModels
+            .iter_mut()
+            .map(|installed| &mut installed.manifest)
+            .chain(self.customModels.iter_mut())
+        {
+            if let Some(requirement) = model.engineRequirement.as_mut() {
+                if requirement.engineId == current.engineId
+                    && requirement.version == LEGACY_LLAMA_CPP_VERSION
+                {
+                    requirement.version.clone_from(&current.version);
+                }
+            }
+        }
+
+        let legacyEngines: Vec<_> = self
+            .installedEngines
+            .iter()
+            .filter(|engine| {
+                engine.manifest.id == current.engineId
+                    && engine.manifest.version == LEGACY_LLAMA_CPP_VERSION
+                    && engine.artifact.delivery == LocalEngineDelivery::Embedded
+            })
+            .map(|engine| {
+                (
+                    engine.artifact.target.clone(),
+                    engine.installedAtMs,
+                    engine.verifiedAtMs,
+                )
+            })
+            .collect();
+        if legacyEngines.is_empty() {
+            return Ok(());
+        }
+        let manifest = LocalEngineCatalog::llamaCpp();
+        for (target, installedAtMs, verifiedAtMs) in legacyEngines {
+            let Some(artifact) = manifest.artifactForTarget(&target).cloned() else {
+                continue;
+            };
+            if self
+                .getInstalledEngine(&current.engineId, &current.version, &target)
+                .is_none()
+            {
+                let storagePath =
+                    buildLocalEngineStoragePath(&current.engineId, &current.version, &target)?;
+                self.upsertEngine(InstalledLocalEngine {
+                    manifest: manifest.clone(),
+                    artifact,
+                    storagePath,
+                    installedAtMs,
+                    verifiedAtMs,
+                });
+            }
+            self.removeEngine(&current.engineId, LEGACY_LLAMA_CPP_VERSION, &target);
+        }
+        Ok(())
+    }
+
+    /// Corrects the legacy AISHELL-3 speaker count for the exact pinned model files.
+    pub(crate) fn migrateAishell3SpeakerCount(&mut self) {
+        let manifest = crate::LocalModelCatalog::LocalModelCatalog::sherpaOnnxVitsTts();
+        let mut legacyDriver = manifest.driver.clone();
+        if let Some(crate::LocalModelManifest::LocalModelDriver::SherpaOnnxVits {
+            speakerCount, ..
+        }) = &mut legacyDriver
+        {
+            *speakerCount = 175;
+        }
+        for installed in self
+            .installedModels
+            .iter_mut()
+            .map(|model| &mut model.manifest)
+            .chain(self.customModels.iter_mut())
+        {
+            if installed.id == manifest.id
+                && installed.version == manifest.version
+                && installed.files == manifest.files
+                && installed.driver == legacyDriver
+            {
+                installed.driver = manifest.driver.clone();
+            }
+        }
+    }
+
+    /// Creates an empty local model registry snapshot.
+    pub fn empty() -> Self {
+        Self {
+            installedModels: Vec::new(),
+            installedEngines: Vec::new(),
+            preferredSourceKind: None,
+            customModels: Vec::new(),
+        }
+    }
+
+    /// Returns one custom imported model manifest matching id and version.
+    pub fn getCustomModel(&self, modelId: &str, version: &str) -> Option<&LocalModelManifest> {
+        let modelId = modelId.trim();
+        let version = version.trim();
+        self.customModels
+            .iter()
+            .find(|manifest| manifest.id == modelId && manifest.version == version)
+    }
+
+    /// Adds or replaces one custom imported model manifest by id and version.
+    pub fn upsertCustomModel(&mut self, manifest: LocalModelManifest) {
+        self.customModels
+            .retain(|existing| existing.id != manifest.id || existing.version != manifest.version);
+        self.customModels.push(manifest);
+    }
+
+    /// Removes one custom imported model manifest by id and version.
+    pub fn removeCustomModel(&mut self, modelId: &str, version: &str) -> bool {
+        let before = self.customModels.len();
+        let modelId = modelId.trim();
+        let version = version.trim();
+        self.customModels
+            .retain(|manifest| manifest.id != modelId || manifest.version != version);
+        self.customModels.len() != before
+    }
+
+    /// Returns the active preferred model download source kind.
+    pub fn preferredSource(&self) -> LocalModelSourceKind {
+        self.preferredSourceKind
+            .unwrap_or(LocalModelSourceKind::HuggingFace)
+    }
+
+    /// Sets the active preferred model download source kind.
+    pub fn setPreferredSource(&mut self, sourceKind: LocalModelSourceKind) {
+        self.preferredSourceKind = Some(sourceKind);
+    }
+
+    /// Returns the installed model matching the supplied model id and version.
+    pub fn getInstalledModel(&self, modelId: &str, version: &str) -> Option<&InstalledLocalModel> {
+        let modelId = modelId.trim();
+        let version = version.trim();
+        self.installedModels
+            .iter()
+            .find(|model| model.manifest.id == modelId && model.manifest.version == version)
+    }
+
+    /// Returns installed models matching the supplied local model kind.
+    pub fn modelsByKind(&self, kind: LocalModelKind) -> Vec<&InstalledLocalModel> {
+        self.installedModels
+            .iter()
+            .filter(|model| model.manifest.kind == kind)
+            .collect()
+    }
+
+    /// Returns the installed engine matching an exact id, version, and target.
+    pub fn getInstalledEngine(
+        &self,
+        engineId: &str,
+        version: &str,
+        target: &LocalPlatformTarget,
+    ) -> Option<&InstalledLocalEngine> {
+        let engineId = engineId.trim();
+        let version = version.trim();
+        self.installedEngines.iter().find(|engine| {
+            engine.manifest.id == engineId
+                && engine.manifest.version == version
+                && engine.artifact.target == *target
+        })
+    }
+
+    /// Adds or replaces one installed local model by model id and version.
+    pub fn upsert(&mut self, installedModel: InstalledLocalModel) {
+        self.installedModels.retain(|existing| {
+            existing.manifest.id != installedModel.manifest.id
+                || existing.manifest.version != installedModel.manifest.version
+        });
+        self.installedModels.push(installedModel);
+    }
+
+    /// Adds or replaces one installed local engine by id, version, and target.
+    pub fn upsertEngine(&mut self, installedEngine: InstalledLocalEngine) {
+        self.installedEngines.retain(|existing| {
+            existing.manifest.id != installedEngine.manifest.id
+                || existing.manifest.version != installedEngine.manifest.version
+                || existing.artifact.target != installedEngine.artifact.target
+        });
+        self.installedEngines.push(installedEngine);
+    }
+
+    /// Removes one installed local model by model id and version.
+    pub fn remove(&mut self, modelId: &str, version: &str) -> bool {
+        let before = self.installedModels.len();
+        let modelId = modelId.trim();
+        let version = version.trim();
+        self.installedModels
+            .retain(|model| model.manifest.id != modelId || model.manifest.version != version);
+        self.installedModels.len() != before
+    }
+
+    /// Removes one installed local engine by id, version, and target.
+    pub fn removeEngine(
+        &mut self,
+        engineId: &str,
+        version: &str,
+        target: &LocalPlatformTarget,
+    ) -> bool {
+        let before = self.installedEngines.len();
+        let engineId = engineId.trim();
+        let version = version.trim();
+        self.installedEngines.retain(|engine| {
+            engine.manifest.id != engineId
+                || engine.manifest.version != version
+                || engine.artifact.target != *target
+        });
+        self.installedEngines.len() != before
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::LocalEngineManifest::{LocalArchitecture, LocalPlatform};
+    use crate::LocalModelCatalog::LocalModelCatalog;
+    use crate::LocalModelManifest::{
+        LocalEngineKind, LocalModelDriver, LocalModelFile, LocalModelKind, LocalModelManifest,
+        LocalModelSource, LocalModelSourceKind,
+    };
+    use operit_util::RuntimeStorageLayout::RUNTIME_LOCAL_MODELS_DIR_PATH;
+
+    /// Keeps installed GGUF files and custom model requirements usable after an engine upgrade.
+    #[test]
+    fn llamaCppMigrationPreservesModelInstallations() {
+        let manifest = LocalEngineCatalog::llamaCpp();
+        let target = LocalPlatformTarget {
+            platform: LocalPlatform::Windows,
+            architecture: LocalArchitecture::X86_64,
+        };
+        let mut legacyManifest = manifest.clone();
+        legacyManifest.version = LEGACY_LLAMA_CPP_VERSION.to_string();
+        let mut registry = LocalModelRegistrySnapshot::empty();
+        registry.upsertEngine(InstalledLocalEngine {
+            artifact: legacyManifest.artifactForTarget(&target).unwrap().clone(),
+            storagePath: buildLocalEngineStoragePath(&manifest.id, LEGACY_LLAMA_CPP_VERSION, &target)
+                .unwrap(),
+            manifest: legacyManifest,
+            installedAtMs: 100,
+            verifiedAtMs: Some(200),
+        });
+        let mut installed = installedModel("gguf", "legacy", 100);
+        installed.manifest = LocalModelCatalog::qwen3LlamaCpp();
+        installed.manifest.engineRequirement.as_mut().unwrap().version =
+            LEGACY_LLAMA_CPP_VERSION.to_string();
+        registry.upsert(installed.clone());
+        registry.upsertCustomModel(installed.manifest.clone());
+
+        registry.migrateEmbeddedLlamaCpp().unwrap();
+
+        installed.manifest = LocalModelCatalog::qwen3LlamaCpp();
+        assert_eq!(registry.installedModels, vec![installed.clone()]);
+        assert_eq!(registry.customModels, vec![installed.manifest]);
+        assert_eq!(registry.installedEngines.len(), 1);
+        let engine = registry
+            .getInstalledEngine(&manifest.id, &manifest.version, &target)
+            .unwrap();
+        assert_eq!(engine.manifest, manifest);
+        assert_eq!(
+            engine.storagePath,
+            buildLocalEngineStoragePath(&manifest.id, &manifest.version, &target).unwrap(),
+        );
+        assert_eq!(engine.installedAtMs, 100);
+        assert_eq!(engine.verifiedAtMs, Some(200));
+        let migrated = registry.clone();
+        registry.migrateEmbeddedLlamaCpp().unwrap();
+        assert_eq!(registry, migrated);
+    }
+
+    /// Reproduces installed and imported manifests saved before the AISHELL-3 correction.
+    fn legacyAishell3Manifest() -> LocalModelManifest {
+        let mut manifest = LocalModelCatalog::sherpaOnnxVitsTts();
+        let Some(LocalModelDriver::SherpaOnnxVits { speakerCount, .. }) = &mut manifest.driver
+        else {
+            panic!("AISHELL-3 must use the VITS driver");
+        };
+        *speakerCount = 175;
+        manifest
+    }
+
+    /// Migrates legacy metadata without reinstalling files or changing installation state.
+    #[test]
+    fn aishell3MigrationCorrectsInstalledAndCustomManifests() {
+        let mut registry = LocalModelRegistrySnapshot::empty();
+        let mut installed = installedModel("aishell3", "legacy", 100);
+        installed.manifest = legacyAishell3Manifest();
+        installed.verifiedAtMs = Some(200);
+        registry.upsert(installed.clone());
+        registry.upsertCustomModel(installed.manifest.clone());
+
+        registry.migrateAishell3SpeakerCount();
+        installed.manifest = LocalModelCatalog::sherpaOnnxVitsTts();
+        assert!(matches!(
+            installed.manifest.driver,
+            Some(LocalModelDriver::SherpaOnnxVits { speakerCount: 174, .. })
+        ));
+        assert_eq!(registry.installedModels, vec![installed.clone()]);
+        assert_eq!(registry.customModels, vec![installed.manifest]);
+        let migrated = registry.clone();
+        registry.migrateAishell3SpeakerCount();
+        assert_eq!(registry, migrated);
+    }
+
+    /// Leaves different model identities, files, and explicit speaker metadata untouched.
+    #[test]
+    fn aishell3MigrationOnlyChangesTheKnownLegacyManifest() {
+        let legacy = legacyAishell3Manifest();
+        let mut manifests = vec![legacy; 5];
+        manifests[0].id.push_str("-custom");
+        manifests[1].version.push_str("-custom");
+        manifests[2].files[0].sha256 = "0".repeat(64);
+        manifests[3].driver = LocalModelCatalog::sherpaOnnxVitsTts().driver;
+        manifests[4].driver = None;
+        let mut registry = LocalModelRegistrySnapshot::empty();
+        registry.customModels = manifests.clone();
+        registry.migrateAishell3SpeakerCount();
+        assert_eq!(registry.customModels, manifests);
+    }
+
+    /// Verifies registry records are replaced by model id and version.
+    #[test]
+    fn upsertReplacesMatchingInstalledModel() {
+        let mut registry = LocalModelRegistrySnapshot::empty();
+        registry.upsert(installedModel("model-a", "v1", 100));
+        registry.upsert(installedModel("model-a", "v1", 200));
+
+        assert_eq!(registry.installedModels.len(), 1);
+        assert_eq!(registry.installedModels[0].installedAtMs, 200);
+    }
+
+    /// Verifies registry removal targets the exact model id and version.
+    #[test]
+    fn removeDeletesExactInstalledModel() {
+        let mut registry = LocalModelRegistrySnapshot::empty();
+        registry.upsert(installedModel("model-a", "v1", 100));
+        registry.upsert(installedModel("model-a", "v2", 200));
+
+        assert!(registry.remove("model-a", "v1"));
+        assert_eq!(registry.installedModels.len(), 1);
+        assert_eq!(registry.installedModels[0].manifest.version, "v2");
+    }
+
+    /// Builds an installed model fixture for registry tests.
+    fn installedModel(modelId: &str, version: &str, installedAtMs: i64) -> InstalledLocalModel {
+        InstalledLocalModel {
+            manifest: manifest(modelId, version),
+            storagePath: format!(
+                "{RUNTIME_LOCAL_MODELS_DIR_PATH}/stt/sherpa_ncnn/{modelId}/{version}"
+            ),
+            installedAtMs,
+            verifiedAtMs: None,
+        }
+    }
+
+    /// Builds a manifest fixture for registry tests.
+    fn manifest(modelId: &str, version: &str) -> LocalModelManifest {
+        LocalModelManifest {
+            id: modelId.to_string(),
+            version: version.to_string(),
+            displayName: modelId.to_string(),
+            description: "test model".to_string(),
+            kind: LocalModelKind::SpeechToText,
+            engine: LocalEngineKind::SherpaNcnn,
+            license: "test".to_string(),
+            homepage: "https://example.test/model".to_string(),
+            languages: vec!["en".to_string()],
+            tags: Vec::new(),
+            engineRequirement: None,
+            driver: None,
+            sources: vec![LocalModelSource {
+                id: "main".to_string(),
+                kind: LocalModelSourceKind::DirectHttp,
+                repository: "test".to_string(),
+                revision: version.to_string(),
+                baseUrl: "https://example.test/model".to_string(),
+            }],
+            installSource: LocalModelInstallSource::Files,
+            files: vec![LocalModelFile {
+                relativePath: "model.bin".to_string(),
+                sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+                    .to_string(),
+                byteSize: 5,
+                sourceId: "main".to_string(),
+            }],
+        }
+    }
+}

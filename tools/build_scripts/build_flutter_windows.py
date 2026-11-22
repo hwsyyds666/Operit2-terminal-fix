@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+import argparse
+import sys
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from build_windows_msi import build_windows_msi
+
+from common import (
+    DIST_DIR,
+    release_asset_name,
+    FLUTTER_APP_DIR,
+    RELEASE_DIR,
+    flutter_command,
+    flutter_pub_get,
+    require_command,
+    run,
+)
+
+
+# Installs only the current CMake payload into a fresh tree before packaging it.
+def package_windows_app(installer_path: Path) -> None:
+    work = (RELEASE_DIR / "work").resolve()
+    work.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(dir=work, prefix="windows-app-") as temporary:
+        release_dir = Path(temporary).resolve()
+        if release_dir.parent != work:
+            raise RuntimeError(f"Windows release staging escapes its workspace: {release_dir}")
+        run([
+            require_command("cmake"), "--install",
+            FLUTTER_APP_DIR / "build/windows/x64", "--config", "Release",
+            "--prefix", release_dir, "--component", "Runtime",
+        ])
+        build_windows_msi(release_dir, installer_path)
+
+
+# Parses command-line options for the Windows Flutter build.
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Build the Operit2 Windows Flutter app.")
+    parser.add_argument("--build-name")
+    parser.add_argument("--build-number")
+    parser.add_argument("--installer-path", type=Path)
+    parser.add_argument("--enforce-lockfile", action="store_true")
+    return parser.parse_args()
+
+
+# Builds the Windows Flutter app and writes its MSI installer.
+def main() -> int:
+    args = parse_args()
+    flutter_pub_get(enforce_lockfile=args.enforce_lockfile)
+    command = [flutter_command(), "build", "windows", "--release", "--no-pub"]
+    if args.build_name:
+        command.extend(["--build-name", args.build_name])
+    if args.build_number:
+        command.extend(["--build-number", args.build_number])
+    run(command, cwd=FLUTTER_APP_DIR)
+    installer_path = args.installer_path or DIST_DIR / release_asset_name("app", "windows", "x86_64", "msi")
+    package_windows_app(installer_path)
+    print(f"Windows installer: {installer_path}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as error:
+        print(f"error: {error}", file=sys.stderr)
+        raise SystemExit(1)

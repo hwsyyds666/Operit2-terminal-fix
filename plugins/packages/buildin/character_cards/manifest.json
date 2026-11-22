@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "toolpkg_id": "com.operit.character_cards",
+  "version": "0.2.8",
+  "api_version": "2.0.0",
+  "main": "dist/main.js",
+  "public_api": "src/api.ts",
+  "display_name": {
+    "zh": "角色卡",
+    "en": "Characters"
+  },
+  "description": {
+    "zh": "创建和编辑 AI 角色，或让多个角色一起群聊；每个角色都有自己的记忆库。",
+    "en": "Create AI characters or put several in a group chat; each keeps its own memory library."
+  },
+  "logo": "package_logo",
+  "enabled_by_default": true,
+  "subpackages": [
+    {
+      "id": "character_memory",
+      "entry": "dist/tools.js"
+    }
+  ],
+  "resources": [
+    {
+      "key": "package_logo",
+      "path": "resources/logo.svg",
+      "mime": "image/svg+xml"
+    },
+    {
+      "key": "character_memory_html",
+      "path": "resources/character-memory.html",
+      "mime": "text/html"
+    },
+    {
+      "key": "character_default_avatar",
+      "path": "resources/operit-avatar.png",
+      "mime": "image/png"
+    }
+  ],
+  "wasm_modules": [
+    {
+      "id": "usearch",
+      "path": "resources/usearch.wasm",
+      "source_language": "cpp",
+      "abi": "memory",
+      "exports": [
+        "_initialize",
+        "malloc",
+        "free",
+        "index_error",
+        "index_create",
+        "index_add_batch",
+        "index_search",
+        "index_size",
+        "index_remove",
+        "index_save_size",
+        "index_save",
+        "index_load",
+        "index_destroy",
+        "index_search_filtered",
+        "index_score_keys"
+      ]
+    }
+  ]
+}

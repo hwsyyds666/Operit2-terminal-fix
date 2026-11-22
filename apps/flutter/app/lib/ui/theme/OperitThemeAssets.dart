@@ -1,0 +1,282 @@
+// ignore_for_file: file_names
+
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:crypto/crypto.dart';
+import 'package:file_selector/file_selector.dart';
+import 'package:flutter/material.dart';
+import 'package:operit_ui/operit_ui.dart';
+
+import '../../core/bridge/ProxyCoreRuntimeBridge.dart';
+import '../../core/proxy/generated/CoreProxyClients.g.dart';
+
+class ThemeAssetImport {
+  /// Creates imported theme asset metadata.
+  const ThemeAssetImport({
+    required this.storagePath,
+    required this.bytes,
+    required this.fileName,
+  });
+
+  final String storagePath;
+  final Uint8List bytes;
+  final String fileName;
+}
+
+class ThemeAssetStore implements ThemeAssetResolver {
+  /// Creates a store backed by the runtime storage repository.
+  ThemeAssetStore({
+    GeneratedRepositoryRuntimeStorageRepositoryCoreProxy? runtimeStorage,
+    ThemeFontRegistry? fontRegistry,
+  }) : _fontRegistry = fontRegistry ?? ThemeFontRegistry(),
+       _runtimeStorage =
+           runtimeStorage ??
+           const GeneratedCoreProxyClients(
+             ProxyCoreRuntimeBridge(),
+           ).repositoryRuntimeStorageRepository;
+
+  final GeneratedRepositoryRuntimeStorageRepositoryCoreProxy _runtimeStorage;
+
+  final ThemeFontRegistry _fontRegistry;
+
+  /// Prepares fonts before persisting a path that appearance will activate.
+  Future<ThemeAssetImport> importFontFile(XFile file) async {
+    if (await file.length() > themePrivateFontMaxBytes) {
+      throw StateError(
+        'Theme font exceeds the ${themePrivateFontMaxBytes ~/ (1024 * 1024)} MiB limit',
+      );
+    }
+    return importFontBytes(
+      bytes: await file.readAsBytes(),
+      fileName: _themeAssetFileName(file),
+    );
+  }
+
+  /// Imports an already-read device face without fabricating a local file path.
+  Future<ThemeAssetImport> importFontBytes({
+    required Uint8List bytes,
+    required String fileName,
+  }) async {
+    if (fileName.trim().isEmpty) {
+      throw StateError('theme asset file name is empty');
+    }
+    final extension = _themeAssetExtension(fileName);
+    await _fontRegistry.registerBytes(reference: fileName, bytes: bytes);
+    final directory = await _runtimeStorage.themeAssetsDirPath();
+    final digest = sha256.convert(bytes).toString().substring(0, 16);
+    final storagePath = '$directory/$digest.$extension';
+    await _runtimeStorage.writeBytesStream(
+      path: storagePath,
+      expectedByteLength: bytes.length,
+      bytes: Stream<Uint8List>.fromIterable(_chunks(bytes)),
+    );
+    return ThemeAssetImport(
+      storagePath: storagePath,
+      bytes: bytes,
+      fileName: fileName,
+    );
+  }
+
+  /// Reads saved fonts in bounded frames, including fonts imported before this version.
+  Future<Uint8List> readFontBytes(String storagePath) async {
+    final content = BytesBuilder(copy: false);
+    while (true) {
+      final chunk = await _runtimeStorage.readBase64Chunk(
+        path: storagePath,
+        offset: content.length,
+        length: _chunkBytes,
+      );
+      if (chunk == null) {
+        throw StateError('theme asset is missing: $storagePath');
+      }
+      if (chunk.isEmpty) break;
+      final bytes = base64Decode(chunk);
+      if (bytes.length > _chunkBytes ||
+          content.length + bytes.length > themePrivateFontMaxBytes) {
+        throw StateError('Theme font byte budget exceeded: $storagePath');
+      }
+      content.add(bytes);
+    }
+    return content.takeBytes();
+  }
+
+  static const int _chunkBytes = 1024 * 1024;
+
+  static Iterable<Uint8List> _chunks(Uint8List bytes) sync* {
+    for (var offset = 0; offset < bytes.length; offset += _chunkBytes) {
+      final end = offset + _chunkBytes;
+      yield Uint8List.sublistView(
+        bytes,
+        offset,
+        end < bytes.length ? end : bytes.length,
+      );
+    }
+  }
+
+  /// Imports one selected file into the runtime theme asset pool.
+  Future<ThemeAssetImport> importFile(XFile file) async {
+    final requestStack = StackTrace.current;
+    try {
+      final bytes = await file.readAsBytes();
+      final fileName = _themeAssetFileName(file);
+      return await importBytes(bytes: bytes, fileName: fileName);
+    } catch (error, stack) {
+      throw ThemeAssetFailure.capture(
+        reference: file.name,
+        stage: ThemeAssetStage.importAsset,
+        kind: ThemeAssetFailureKind.read,
+        cause: error,
+        originalStackTrace: stack,
+        requestStackTrace: requestStack,
+      );
+    }
+  }
+
+  /// Imports prepared bytes into the runtime theme asset pool.
+  Future<ThemeAssetImport> importBytes({
+    required Uint8List bytes,
+    required String fileName,
+  }) async {
+    final requestStack = StackTrace.current;
+    var reference = fileName;
+    var kind = ThemeAssetFailureKind.read;
+    try {
+      if (bytes.isEmpty) {
+        kind = ThemeAssetFailureKind.empty;
+        throw StateError('Theme asset is empty: $fileName');
+      }
+      final extension = _themeAssetExtension(fileName);
+      final directory = await _runtimeStorage.themeAssetsDirPath();
+      final digest = sha256.convert(bytes).toString().substring(0, 16);
+      final storagePath = '$directory/$digest.$extension';
+      reference = storagePath;
+      await _runtimeStorage.writeBase64(
+        path: storagePath,
+        base64Content: base64Encode(bytes),
+      );
+      return ThemeAssetImport(storagePath: storagePath, bytes: bytes, fileName: fileName);
+    } catch (error, stack) {
+      throw ThemeAssetFailure.capture(
+        reference: reference,
+        stage: ThemeAssetStage.importAsset,
+        kind: kind,
+        cause: error,
+        originalStackTrace: stack,
+        requestStackTrace: requestStack,
+        byteLength: bytes.length,
+      );
+    }
+  }
+
+  /// Reads imported theme asset bytes from runtime storage.
+  @override
+  Future<Uint8List> readBytes(String storagePath) async {
+    final requestStack = StackTrace.current;
+    var kind = ThemeAssetFailureKind.read;
+    int? byteLength;
+    try {
+      final base64Content = await _runtimeStorage.readBase64(path: storagePath);
+      if (base64Content == null) {
+        kind = ThemeAssetFailureKind.missing;
+        throw StateError('theme asset is missing: $storagePath');
+      }
+      final bytes = base64Decode(base64Content);
+      byteLength = bytes.length;
+      if (bytes.isEmpty) {
+        kind = ThemeAssetFailureKind.empty;
+        throw StateError('theme asset is empty: $storagePath');
+      }
+      return bytes;
+    } catch (error, stack) {
+      throw ThemeAssetFailure.capture(
+        reference: storagePath,
+        stage: ThemeAssetStage.read,
+        kind: kind,
+        cause: error,
+        originalStackTrace: stack,
+        requestStackTrace: requestStack,
+        byteLength: byteLength,
+      );
+    }
+  }
+}
+
+class ThemeAssetImage extends StatelessWidget {
+  /// Creates an image widget backed by a runtime theme asset.
+  const ThemeAssetImage({
+    super.key,
+    required this.storagePath,
+    required this.fit,
+  });
+
+  final String storagePath;
+  final BoxFit fit;
+
+  @override
+  Widget build(BuildContext context) {
+    final scoped = ThemeAssetScope.of(context);
+    return ResolvedThemeImage(
+      resolver: scoped,
+      reference: storagePath,
+      fit: fit,
+    );
+  }
+}
+
+/// Returns the browser video MIME type for one imported theme asset.
+String themeAssetVideoMimeType(String storagePath) {
+  final extension = _themeAssetExtension(storagePath);
+  return switch (extension) {
+    'mp4' => 'video/mp4',
+    'mov' => 'video/quicktime',
+    'm4v' => 'video/x-m4v',
+    'webm' => 'video/webm',
+    'mkv' => 'video/x-matroska',
+    'avi' => 'video/x-msvideo',
+    _ => throw StateError('theme video extension is not supported: $extension'),
+  };
+}
+
+/// Returns the selected file name used for theme asset validation.
+String _themeAssetFileName(XFile file) {
+  final name = file.name.trim();
+  if (name.isEmpty) {
+    throw StateError('theme asset file name is empty');
+  }
+  return name;
+}
+
+/// Returns a checked lower-case extension for one theme asset name.
+String _themeAssetExtension(String fileName) {
+  final normalized = fileName.replaceAll('\\', '/');
+  final slashIndex = normalized.lastIndexOf('/');
+  final baseName = normalized.substring(slashIndex + 1).toLowerCase();
+  final dotIndex = baseName.lastIndexOf('.');
+  if (dotIndex <= 0 || dotIndex == baseName.length - 1) {
+    throw StateError('theme asset extension is missing: $fileName');
+  }
+  final extension = baseName.substring(dotIndex + 1);
+  const supportedExtensions = <String>{
+    'jpg',
+    'jpeg',
+    'png',
+    'svg',
+    'webp',
+    'bmp',
+    'gif',
+    'mp4',
+    'mov',
+    'm4v',
+    'webm',
+    'mkv',
+    'avi',
+    'ttf',
+    'otf',
+    'ttc',
+  };
+  if (!supportedExtensions.contains(extension)) {
+    throw StateError('theme asset extension is not supported: $extension');
+  }
+  return extension;
+}

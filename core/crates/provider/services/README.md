@@ -1,0 +1,198 @@
+# operit-providers
+
+`operit-providers` owns Operit's provider contracts and built-in provider
+implementations.
+
+The crate root re-exports `AIService`, `SendMessageRequest`, `AiServiceError`,
+token/stream helpers, and `ProviderRuntimeSupport`, so SDK consumers do not
+need to import the internal `chat::llmprovider` path.
+
+## Usage
+
+External providers implement the public contracts from the crate root:
+
+```toml
+operit-providers = "2.0.0-preview.8"
+```
+
+The same crate contains the built-in LLM adapters, text-to-speech,
+speech-to-text, and market services, ToolPkg provider integration,
+conversation orchestration, store access, and tool integration.
+
+## Responsibilities
+
+- Define provider requests, errors, token counters, and streaming contracts.
+- Define provider-side interfaces for runtime-owned model bindings, prompt
+  context, token accounting, ToolPkg AI provider hooks, and timing logs.
+- Provide Operit's built-in provider implementations and orchestration.
+
+## Main Modules
+
+- `src/chat/llmprovider/AIService.rs`: provider request, result, stream, and
+  service contracts.
+- `src/chat/llmprovider/ThinkingDialect.rs`: writes a model's thinking level into
+  the request fields each provider API reads.
+- `src/runtime_support.rs`: provider-side contract implemented by
+  `operit-runtime`.
+- `src/chat`: built-in chat providers and conversation orchestration.
+- `src/tts`: built-in text-to-speech provider contracts and implementations.
+- `src/stt`: built-in speech-to-text provider contracts and implementations.
+- `src/market`: provider market services.
+
+## Model Discovery Structure
+
+`ModelListFetcher.rs` owns discovery orchestration and the only network execution
+point: `defaultHttpHost().executeHttpRequest(...)`. Its private `model_list`
+modules only prepare request data and parse response data; they do not create
+HTTP clients or introduce platform-specific branches.
+
+- `model_list/mod.rs`: selects the discovery protocol once from the provider type
+  and routes request preparation and response parsing.
+- `model_list/request.rs`: shared URL/header configuration, key-pool selection,
+  Bearer authentication, Anthropic authentication, and OpenCode routing.
+- `model_list/endpoint.rs`: structural model-resource path derivation that retains
+  gateway prefixes and explicit API versions.
+- `model_list/response.rs`: catalog-declared item selection and shared model
+  metadata parsing.
+- `model_list/gemini.rs`: Gemini query-key authentication, versioned model-list
+  paths, and generation-model filtering.
+- `model_list/tests.rs`: request and model-parsing unit tests.
+
+Private functions use Rust `snake_case`; the existing public `ModelListFetcher`
+entry point remains unchanged.
+
+Discovery returns only what the provider's own list says. A field the catalog row
+declares no JSON path for stays `None`. The runtime then recognizes each model
+against the models.dev catalog for its pricing, context and capabilities, and
+keeps the listed metadata for models the catalog does not know; see
+`docs/model-catalog.md`.
+
+## HTTP and Streaming Ownership
+
+Built-in model requests, connection probes, OpenCode discovery and Codex OAuth
+use `llmprovider/ProviderHttp.rs` to encode requests and consume asynchronous
+`HttpHost::openHttpResponseStream` callbacks. Providers do not own network
+clients. The Host owns sockets, TLS, proxy handling and connection pools;
+the native Host shares pools across streaming and buffered requests with the
+same request policy. Model requests use a shared 60-second connection timeout
+and 1000-second read-idle timeout. Each OpenAI, Claude and Gemini generation
+attempt also has a 120-second first-output deadline, starting before HTTP dispatch
+and covering the wait for response headers. Parsed text, reasoning, tool calls
+or image output release that deadline; heartbeats and metadata do not. Buffered
+requests stay bounded through complete JSON decoding. Expiry drops the owning
+HTTP request before entering the existing retry policy. There is no total
+generation deadline after first output. See `docs/model-first-output-timeout.md`
+for retry limits, evidence and regression scenarios.
+
+Model connection tests use the application's current streaming-output preference
+for chat, tool-call, image, audio, and video probes. Streaming is enabled by default.
+The runtime captures this setting once per test, and stored results include that
+mode in their configuration fingerprint so changing it invalidates previous results.
+
+Dropping a pending request or response body cancels its Host stream. Claude,
+Gemini and OpenAI readers also race idle reads against explicit cancellation.
+The SSE decoder frames complete events, including multiline data and split
+UTF-8, before provider JSON parsing. Empty events and comments carry no model
+payload. OpenAI logs invalid JSON events while still requiring a confirmed
+completion; structured upstream error payloads remain request failures.
+
+Claude and Gemini emit text, thinking and tool deltas while the upstream is
+still producing. Missing terminal events are interruptions rather than successful
+EOFs. Accepted retries roll back through the ordered revision channel; exhausted
+attempts retain their partial text and terminal failure. Explicit cancellation
+remains a separate lifecycle. A completed Claude message or Gemini finish reason
+ends consumption without waiting for the server to close HTTP.
+
+
+## OpenAI-Compatible Model Discovery Paths
+
+Operit1's Kotlin `ModelListFetcher.extractBaseUrl()` preserves the path before
+an API version segment. Directly replacing a URL's path with the catalog path
+loses that gateway prefix, so catalog discovery derives model paths structurally
+instead of overwriting the endpoint route.
+
+- Explicit `chat/completions`, `responses`, `messages`, and `models` resource
+  suffixes select the sibling `models` resource, retaining all preceding path
+  segments and their API version.
+- A base ending in a complete numeric version segment (`v1`, `v2`, or `V1`)
+  appends `models` to that configured version.
+- Other configured base paths scope the catalog operation path. Shared suffix
+  and prefix segments are merged to avoid duplicating provider namespaces.
+- Root endpoints use the catalog model path. Existing query and fragment removal
+  remains unchanged.
+
+Examples for an OpenAI-compatible catalog using `/v1/models`:
+
+| Configured endpoint path | Model-list path |
+| --- | --- |
+| `/a/b/c/v1/chat/completions` | `/a/b/c/v1/models` |
+| `/a/b/c/v1/responses` | `/a/b/c/v1/models` |
+| `/a/b/c/v2` | `/a/b/c/v2/models` |
+| `/a/b/c/chat/completions` | `/a/b/c/models` |
+| `/a/b/c` | `/a/b/c/v1/models` |
+
+Provider-specific namespaces such as `/api/v1`, `/compatible-mode/v1`, and
+`/api/coding/paas/v4` remain part of the configured route. Unlike Kotlin's
+versionless extraction branch, configured gateway paths are not reduced to the
+origin. Paths are matched by complete segments, not URL substrings.
+
+Source contract checks are in `tools/tests/openai_model_endpoint.test.mjs`.
+Rust regression cases in `model_list/tests.rs` cover nested paths, Responses,
+provider namespaces, trailing slashes, ports, and percent-encoded prefixes.
+
+## Gemini Model Discovery
+
+Both `GOOGLE` and `GEMINI_GENERIC` use the Kotlin discovery protocol: the selected
+API key is URL-encoded into the `key` query parameter. Discovery does not generate
+an `Authorization: Bearer` header for these providers. Explicit custom headers
+remain user-controlled.
+
+The configured origin is retained. Root endpoints use the catalog operation
+path; explicit `/v1` and `/v1beta` endpoints retain their version and select its
+`models` resource. Unsupported endpoint paths and missing keys produce errors
+before network execution.
+
+Only models explicitly declaring `generateContent` are listed. Their identifiers
+use the response's non-empty `baseModelId`, matching Kotlin's base-model identity,
+and are sorted by ID. Missing or malformed generation metadata is reported as an
+error rather than assuming a model's capability or inventing an identifier.
+
+Source contract checks are in `tools/tests/google_model_catalog.test.mjs`.
+These checks do not compile Rust or contact a provider. An upstream error such as
+`API_KEY_SERVICE_BLOCKED` is preserved in the returned HTTP error; changing the
+request protocol cannot establish that a real key has permission to use the
+provider service.
+
+## Anthropic Model Discovery
+
+`ModelListFetcher` sends both `ANTHROPIC` and `ANTHROPIC_GENERIC` catalog
+requests through the shared HTTP host, using `x-api-key` authentication and
+`anthropic-version: 2023-06-01`, matching the Kotlin model-list implementation.
+The API key comes from the provider's configured key selection, including
+rotation through enabled key-pool entries. Explicit custom headers replace
+matching header names case-insensitively. Missing required authentication or
+an empty version header returns a configuration error before any HTTP request.
+
+Source contract checks are in `tools/tests/anthropic_model_catalog.test.mjs`;
+request-header unit tests are in `model_list/tests.rs`.
+
+## Boundary
+
+Runtime-owned behavior is requested through `ProviderRuntimeSupport`;
+`operit-providers` does not depend on `operit-runtime`.
+
+See `core/CRATE_BOUNDARIES.md` for the full dependency direction.
+
+## Tool Continuation and Response Completion
+
+Enhanced chat consumes the finalized `ToolExecutionBatch.message` directly;
+there is no second formatting or independent truncation pass for model history.
+A nonempty continuation must carry a nonblank finalized message. Response
+completion diagnostics record sizes and execution identifiers, not response text.
+
+OpenAI-compatible streaming and non-streaming producers record terminal failures
+before closing their shared response channels. `RevisableTextStream` exposes that
+failure through boxed consumers. Enhanced chat checks it after collection for both
+initial responses and tool-result responses, before normal completion, token-usage
+persistence, or further tool dispatch. The existing runtime error lifecycle receives
+the error; partial text is retained and user cancellation remains distinct.

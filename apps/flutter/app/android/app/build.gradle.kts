@@ -1,0 +1,566 @@
+import java.io.FileInputStream
+import java.util.Properties
+import javax.inject.Inject
+import org.gradle.api.DefaultTask
+import org.gradle.api.file.DirectoryProperty
+import org.gradle.api.file.FileSystemOperations
+import org.gradle.api.provider.ListProperty
+import org.gradle.api.provider.Property
+import org.gradle.api.tasks.Input
+import org.gradle.api.tasks.InputDirectory
+import org.gradle.api.tasks.OutputDirectory
+import org.gradle.api.tasks.PathSensitive
+import org.gradle.api.tasks.PathSensitivity
+import org.gradle.api.tasks.TaskAction
+
+plugins {
+    id("com.android.application")
+    id("kotlin-android")
+    // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
+    id("dev.flutter.flutter-gradle-plugin")
+}
+
+// Release builds resolve the patched Android engine from the static Maven
+// repository published by flutter-ohos-engine-maven.
+repositories {
+    maven { url = uri("https://h4rm00n.github.io/flutter-ohos-engine-maven") }
+}
+configurations.configureEach {
+    if (!name.contains("release", ignoreCase = true)) return@configureEach
+    resolutionStrategy.eachDependency {
+        if (requested.group == "io.flutter") {
+            useVersion("1.0.0-42d3d75a-operit.9.2")
+        }
+    }
+}
+
+/** Stages ordinary assets and only the runtime ABIs selected for this build. */
+abstract class StageOperitAndroidAssets : DefaultTask() {
+    @get:InputDirectory
+    @get:PathSensitive(PathSensitivity.RELATIVE)
+    abstract val sourceDirectory: DirectoryProperty
+
+    @get:Input
+    abstract val selectedAbis: ListProperty<String>
+
+    @get:Input
+    abstract val externalRuntime: Property<Boolean>
+
+    @get:Input
+    abstract val applicationId: Property<String>
+
+    @get:OutputDirectory
+    abstract val outputDirectory: DirectoryProperty
+
+    @get:Inject
+    abstract val fileSystemOperations: FileSystemOperations
+
+    /** Synchronizes the complete asset output so previous build ABIs cannot remain. */
+    @TaskAction
+    fun stageAssets() {
+        fileSystemOperations.sync {
+            from(sourceDirectory) {
+                exclude("android-runtime/**")
+            }
+            selectedAbis.get().forEach { abi ->
+                from(sourceDirectory.dir("android-runtime/$abi")) {
+                    into("android-runtime/$abi")
+                }
+            }
+            into(outputDirectory)
+        }
+        if (externalRuntime.get()) {
+            outputDirectory.file("operit-android-module.json").get().asFile
+                .writeText("{\"runtime\":\"external\",\"protocol\":1,\"app\":\"android-module\",\"bootstrap\":\"app_process\",\"applicationId\":\"${applicationId.get()}\"}\n")
+        }
+    }
+}
+
+/** Publishes variant-isolated JNI libraries through Android's generated sources API. */
+abstract class StageOperitAndroidJniLibraries : Sync() {
+    @get:OutputDirectory
+    abstract val outputDirectory: DirectoryProperty
+}
+
+/** Embeds Android APK payloads produced by the matching build variant. */
+abstract class StageOperitAndroidPayload : Sync() {
+    @get:InputDirectory
+    @get:PathSensitive(PathSensitivity.RELATIVE)
+    abstract val apkDirectory: DirectoryProperty
+
+    @get:OutputDirectory
+    abstract val outputDirectory: DirectoryProperty
+
+}
+
+val localProperties = Properties()
+val localPropertiesFile = rootProject.file("local.properties")
+localProperties.load(FileInputStream(localPropertiesFile))
+val accessibilityProviderVersion = Properties().apply {
+    layout.projectDirectory.file("../../../../../tools/android-accessibility/version.properties")
+        .asFile.inputStream().use { load(it) }
+}
+
+data class OperitRustTarget(
+    val flutterPlatform: String,
+    val abi: String,
+    val rustTarget: String,
+    val envTarget: String,
+    val compilerRuntimeArch: String,
+)
+
+// Reads Flutter's requested Android target platforms from Gradle properties.
+fun requestedFlutterTargetPlatforms(): Set<String> {
+    val raw = providers.gradleProperty("target-platform").orNull
+        ?: throw GradleException("Missing Flutter target-platform Gradle property")
+    return raw.split(',')
+        .map { it.trim() }
+        .filter { it.isNotEmpty() }
+        .toSet()
+}
+
+// Selects only the Rust targets required by Flutter's Android build.
+fun selectedOperitRustTargets(targets: List<OperitRustTarget>): List<OperitRustTarget> {
+    val requestedPlatforms = requestedFlutterTargetPlatforms()
+    val selectedTargets = targets.filter { requestedPlatforms.contains(it.flutterPlatform) }
+    val selectedPlatforms = selectedTargets.map { it.flutterPlatform }.toSet()
+    val unsupportedPlatforms = requestedPlatforms.subtract(selectedPlatforms)
+    if (unsupportedPlatforms.isNotEmpty()) {
+        throw GradleException("Unsupported Android Rust target-platform values: $unsupportedPlatforms")
+    }
+    if (selectedTargets.isEmpty()) {
+        throw GradleException("No supported Android Rust targets selected for target-platform=$requestedPlatforms")
+    }
+    return selectedTargets
+}
+
+val operitRustTargets = listOf(
+    OperitRustTarget("android-arm64", "arm64-v8a", "aarch64-linux-android", "AARCH64_LINUX_ANDROID", "aarch64"),
+    OperitRustTarget("android-x64", "x86_64", "x86_64-linux-android", "X86_64_LINUX_ANDROID", "x86_64"),
+    OperitRustTarget("android-arm", "armeabi-v7a", "armv7-linux-androideabi", "ARMV7_LINUX_ANDROIDEABI", "arm"),
+)
+val selectedOperitRustTargets = selectedOperitRustTargets(operitRustTargets)
+val operitRuntime = providers.gradleProperty("operitRuntime").getOrElse("app")
+require(operitRuntime in setOf("app", "module")) { "Unsupported operitRuntime=$operitRuntime" }
+val operitExternalRuntime = operitRuntime == "module"
+val operitModuleAndroid = layout.projectDirectory.dir("../../../../android-module/android")
+
+android {
+    namespace = "app.operit"
+    compileSdk = flutter.compileSdkVersion
+    ndkVersion = flutter.ndkVersion
+    buildFeatures { buildConfig = true; aidl = true }
+    sourceSets.getByName("main").aidl.srcDir("../../../../../tools/android-accessibility/contract/src/main/aidl")
+    sourceSets.getByName("main").aidl.srcDir("../../../../../tools/android-ui-server/contract/src/main/aidl")
+
+    signingConfigs {
+        create("release") {
+            // Debug builds do not require release credentials during project configuration.
+            storeFile = localProperties.getProperty("RELEASE_STORE_FILE")?.let { file(it) }
+            storePassword = localProperties.getProperty("RELEASE_STORE_PASSWORD")
+            keyAlias = localProperties.getProperty("RELEASE_KEY_ALIAS")
+            keyPassword = localProperties.getProperty("RELEASE_KEY_PASSWORD")
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = JavaVersion.VERSION_17.toString()
+    }
+
+    defaultConfig {
+        applicationId = if (operitExternalRuntime) "app.operit.module" else "app.operit"
+        manifestPlaceholders["operitAppLabel"] = if (operitExternalRuntime) "Operit2 (Module)" else "Operit2"
+        manifestPlaceholders["operitShortcuts"] = if (operitExternalRuntime) "@xml/module_shortcuts" else "@xml/shortcuts"
+        buildConfigField("boolean", "OPERIT_EXTERNAL_RUNTIME", operitExternalRuntime.toString())
+        buildConfigField("int", "OPERIT_ACCESSIBILITY_VERSION_CODE", accessibilityProviderVersion.getProperty("versionCode"))
+        manifestPlaceholders["operitAppCoreEnabled"] = (!operitExternalRuntime).toString()
+        // You can update the following values to match your application needs.
+        // For more information, see: https://flutter.dev/to/review-gradle-config.
+        minSdk = flutter.minSdkVersion
+        targetSdk = flutter.targetSdkVersion
+        versionCode = flutter.versionCode
+        versionName = flutter.versionName
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        // Empty keeps Impeller's automatic backend selection (including its
+        // driver blacklist); set the operitImpellerBackend Gradle property to
+        // "vulkan" or "opengles" to force one.
+        manifestPlaceholders["operitImpellerBackend"] =
+            providers.gradleProperty("operitImpellerBackend").orNull ?: ""
+    }
+
+    sourceSets.getByName("main").assets.setSrcDirs(emptyList<String>())
+    sourceSets.getByName("main").jniLibs.setSrcDirs(emptyList<String>())
+    if (operitExternalRuntime) {
+        sourceSets.getByName("main").java.srcDir(operitModuleAndroid.dir("src/main/kotlin"))
+        sourceSets.getByName("main").res.srcDir(operitModuleAndroid.dir("src/main/res"))
+    }
+
+    buildTypes {
+        configureEach {
+            // Flutter owns ABI splits; filter native libraries only for non-split builds.
+            if (providers.gradleProperty("split-per-abi").orNull != "true") {
+                ndk.abiFilters.clear()
+                ndk.abiFilters.addAll(selectedOperitRustTargets.map { it.abi })
+            }
+        }
+
+        release {
+            signingConfig = signingConfigs.getByName("release")
+            proguardFiles("proguard-rules.pro")
+            if (operitExternalRuntime) {
+                proguardFiles(operitModuleAndroid.file("proguard-rules.pro"))
+            }
+        }
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
+}
+
+androidComponents {
+    onVariants(selector().all()) { variant ->
+        val stagedAssets = tasks.register<StageOperitAndroidAssets>(
+            "stageOperitAndroidAssets" + variant.name.replaceFirstChar { it.uppercase() },
+        ) {
+            sourceDirectory.set(layout.projectDirectory.dir("src/main/assets"))
+            selectedAbis.set(selectedOperitRustTargets.map { it.abi })
+            externalRuntime.set(operitExternalRuntime)
+            applicationId.set(variant.applicationId)
+        }
+        val assets = variant.sources.assets
+            ?: throw GradleException("Android variant ${variant.name} has no asset sources")
+        assets.addGeneratedSourceDirectory(stagedAssets) { it.outputDirectory }
+        val companionBuildType = mapOf<String?, String>("debug" to "debug", "profile" to "debug", "release" to "release")
+            .getValue(variant.buildType)
+        val companionApk = configurations.create("${variant.name}AccessibilityApk") {
+            isCanBeConsumed = false
+            isCanBeResolved = true
+        }
+        dependencies.add(companionApk.name, dependencies.project(mapOf(
+            "path" to ":accessibilityCompanion",
+            "configuration" to "${companionBuildType}Apk",
+        )))
+        val stagedCompanion = tasks.register<StageOperitAndroidPayload>(
+            "stageOperitAccessibilityApk" + variant.name.replaceFirstChar { it.uppercase() },
+        ) {
+            dependsOn(companionApk)
+            apkDirectory.set(layout.dir(provider { companionApk.singleFile }))
+            from(apkDirectory) {
+                include("*.apk")
+                into("companions")
+                rename { "operit-accessibility.apk" }
+            }
+            into(outputDirectory)
+        }
+        assets.addGeneratedSourceDirectory(stagedCompanion) { it.outputDirectory }
+        val uiServerApk = configurations.create("${variant.name}UiServerApk") {
+            isCanBeConsumed = false
+            isCanBeResolved = true
+        }
+        dependencies.add(uiServerApk.name, dependencies.project(mapOf(
+            "path" to ":windowServer",
+            "configuration" to "${companionBuildType}Apk",
+        )))
+        val stagedUiServer = tasks.register<StageOperitAndroidPayload>(
+            "stageOperitUiServer" + variant.name.replaceFirstChar { it.uppercase() },
+        ) {
+            dependsOn(uiServerApk)
+            apkDirectory.set(layout.dir(provider { uiServerApk.singleFile }))
+            from(apkDirectory) {
+                include("*.apk")
+                into("companions")
+                rename { "operit-ui-server.jar" }
+            }
+            into(outputDirectory)
+        }
+        assets.addGeneratedSourceDirectory(stagedUiServer) { it.outputDirectory }
+    }
+}
+
+flutter {
+    source = "../.."
+}
+
+dependencies {
+    implementation("com.google.mlkit:text-recognition:16.0.0")
+    implementation("com.google.mlkit:text-recognition-chinese:16.0.0")
+    implementation("com.google.mlkit:text-recognition-japanese:16.0.0")
+    implementation("com.google.mlkit:text-recognition-korean:16.0.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.0")
+    implementation("com.github.topjohnwu.libsu:core:6.0.0")
+    implementation("dev.rikka.shizuku:api:13.1.5")
+    implementation("dev.rikka.shizuku:provider:13.1.5")
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.mockito:mockito-core:5.23.0")
+    // Real org.json for JVM unit tests; shadows the "not mocked" android.jar stubs.
+    testImplementation("org.json:json:20240303")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+}
+
+val operitBridgeCrate = project.layout.projectDirectory
+    .dir("../../../native/operit-flutter-bridge")
+    .asFile
+val operitRepoRoot = project.layout.projectDirectory
+    .dir("../../../../..")
+    .asFile
+val operitPluginSyncScript = operitRepoRoot
+    .resolve("plugins/tools/sync_plugin_packages.py")
+val operitPluginSyncPython = if (System.getProperty("os.name").lowercase().contains("windows")) {
+    operitRepoRoot.resolve(".venv/Scripts/python.exe")
+} else {
+    operitRepoRoot.resolve(".venv/bin/python")
+}
+val operitBridgeJniLibs = project.layout.projectDirectory.dir("src/main/jniLibs").asFile
+val operitIsWindows = System.getProperty("os.name").lowercase().contains("windows")
+
+val operitCmakeBin = android.sdkDirectory.resolve("cmake/3.22.1/bin")
+val operitLibclangDir = when {
+    System.getenv("OPERIT_LIBCLANG_DIR") != null ->
+        file(System.getenv("OPERIT_LIBCLANG_DIR"))
+    operitIsWindows ->
+        operitRepoRoot
+            .resolve("target/operit-build-tools/libclang.runtime.win-x64.21.1.8/runtimes/win-x64/native")
+    else ->
+        file("/usr/lib")
+}
+// Converts a file path into the clang-compatible slash format.
+fun File.clangPath(): String = absolutePath.replace('\\', '/')
+
+// Android has no prebuilt rusty_v8 artifacts; the crate's default GitHub
+// download 404s for every Android target. Prepare a source-built V8 library,
+// snapshot and bindings instead, and feed them to Cargo via RUSTY_V8_* values.
+val operitV8PrepareScript = operitRepoRoot
+    .resolve("tools/build_scripts/prepare_android_v8.py")
+val operitV8BridgeLock = operitBridgeCrate.resolve("Cargo.lock")
+
+fun operitV8EnvFile(rustTarget: String): File =
+    operitBridgeCrate.resolve("target/operit-v8/$rustTarget.v8.env")
+
+// Parses the shell env file written by prepare_android_v8.py.
+fun parseOperitV8EnvFile(file: File): Map<String, String> = file.readLines()
+    .filter { it.startsWith("export ") }
+    .associate { line ->
+        val entry = line.removePrefix("export ")
+        val separator = entry.indexOf('=')
+        require(separator > 0) { "Invalid V8 environment entry in $file: $line" }
+        var value = entry.substring(separator + 1)
+        if (value.length >= 2 && value.first() == '\'' && value.last() == '\'') {
+            value = value.substring(1, value.length - 1).replace("'\\''", "'")
+        }
+        entry.substring(0, separator) to value
+    }
+
+val prepareOperitAndroidV8Tasks = selectedOperitRustTargets.associateWith { target ->
+    val abiTaskSuffix = target.abi.replace("-", "").replace("_", "")
+    tasks.register<Exec>("prepareOperitAndroidV8$abiTaskSuffix") {
+        description = "Builds the source-built V8 library and bindings required by the Rust bridge"
+        group = "operit"
+        val envFile = operitV8EnvFile(target.rustTarget)
+        inputs.files(operitV8PrepareScript, operitV8BridgeLock)
+        inputs.property("androidNdkDirectory", android.ndkDirectory.absolutePath)
+        outputs.file(envFile)
+        workingDir = operitRepoRoot
+        commandLine(
+            operitPluginSyncPython.absolutePath,
+            operitV8PrepareScript.absolutePath,
+            "--target",
+            target.rustTarget,
+            "--env-file",
+            envFile.absolutePath,
+        )
+        // Share Gradle's selected NDK with V8 instead of rediscovering the SDK.
+        environment("OPERIT_ANDROID_V8_NDK", android.ndkDirectory.absolutePath)
+        // Windows source builds locate libclang for the bindings generation.
+        environment("OPERIT_LIBCLANG_DIR", operitLibclangDir.absolutePath)
+    }
+}
+
+val syncOperitPlugins = tasks.register<Exec>("syncOperitPlugins") {
+    workingDir = operitRepoRoot
+    commandLine(
+        operitPluginSyncPython.absolutePath,
+        operitPluginSyncScript.absolutePath,
+        "--source",
+        "runtime",
+        "--no-hot-reload",
+    )
+}
+
+androidComponents {
+    onVariants(selector().all()) { variant ->
+        val variantTaskSuffix = variant.name.replaceFirstChar { it.uppercase() }
+        val rustProfile = when (variant.buildType) {
+            "debug" -> "debug"
+            "profile", "release" -> "release"
+            else -> throw GradleException("Unsupported Android Rust build type: ${variant.buildType}")
+        }
+        val cargoBuildOperitFlutterBridgeTasks = selectedOperitRustTargets.map { target ->
+            val abiTaskSuffix = target.abi.replace("-", "").replace("_", "")
+            val bridgeLibrary = operitBridgeCrate.resolve(
+                "target/${target.rustTarget}/$rustProfile/liboperit_flutter_bridge.so",
+            )
+            tasks.register<Exec>("cargoBuildOperitFlutterBridge$variantTaskSuffix$abiTaskSuffix") {
+                dependsOn(syncOperitPlugins)
+                dependsOn(prepareOperitAndroidV8Tasks.getValue(target))
+                val clangPrefix = target.rustTarget
+                val apiLevel = android.defaultConfig.minSdk
+                    ?: throw GradleException("Android minSdk is required for the Rust toolchain")
+                val ndkToolchain = android.ndkDirectory
+                    .resolve("toolchains")
+                    .resolve("llvm")
+                    .resolve("prebuilt")
+                    .resolve(if (operitIsWindows) "windows-x86_64" else "linux-x86_64")
+                    .resolve("bin")
+                val linkerPrefix = if (target.rustTarget == "armv7-linux-androideabi") {
+                    "armv7a-linux-androideabi"
+                } else {
+                    clangPrefix
+                }
+                val linker = ndkToolchain.resolve("${linkerPrefix}${apiLevel}-clang${if (operitIsWindows) ".cmd" else ""}")
+                val ar = ndkToolchain.resolve(if (operitIsWindows) "llvm-ar.exe" else "llvm-ar")
+                val clangResourceDir = ndkToolchain
+                    .parentFile
+                    .resolve("lib")
+                    .resolve("clang")
+                    .listFiles()
+                    ?.single { it.isDirectory }
+                    ?: throw GradleException("Android NDK clang resource dir not found")
+                val compilerRuntime = clangResourceDir.resolve(
+                    "lib/linux/libclang_rt.builtins-${target.compilerRuntimeArch}-android.a",
+                )
+                if (!compilerRuntime.isFile) {
+                    throw GradleException("Android compiler runtime not found: $compilerRuntime")
+                }
+                val bindgenClangArgs =
+                    "--target=${target.rustTarget} --sysroot=${ndkToolchain.parentFile.resolve("sysroot").clangPath()} -resource-dir=${clangResourceDir.clangPath()}"
+                val ccEnvTarget = target.rustTarget.replace("-", "_")
+                // CMake's Ninja generator needs the SDK's build tools in the Cargo process.
+                environment("CMAKE", operitCmakeBin.resolve("cmake${if (operitIsWindows) ".exe" else ""}").absolutePath)
+                environment("PATH", "${operitCmakeBin.absolutePath}${File.pathSeparator}${System.getenv("PATH")}")
+                environment("ANDROID_NDK_HOME", android.ndkDirectory.absolutePath)
+                environment("CC_$ccEnvTarget", linker.absolutePath)
+                environment("CXX_$ccEnvTarget", ndkToolchain.resolve("${linkerPrefix}${apiLevel}-clang++${if (operitIsWindows) ".cmd" else ""}").absolutePath)
+                environment("AR_$ccEnvTarget", ar.absolutePath)
+                environment("CARGO_TARGET_${target.envTarget}_LINKER", linker.absolutePath)
+                environment("CARGO_TARGET_${target.envTarget}_AR", ar.absolutePath)
+                environment("LIBCLANG_PATH", operitLibclangDir.absolutePath)
+                environment("BINDGEN_EXTRA_CLANG_ARGS_$ccEnvTarget", bindgenClangArgs)
+                environment("RUSTFLAGS", "-Awarnings")
+                // Applies the source-built V8 library and bindings prepared by
+                // prepareOperitAndroidV8; upstream publishes no Android artifacts.
+                doFirst {
+                    parseOperitV8EnvFile(operitV8EnvFile(target.rustTarget)).forEach { (name, value) ->
+                        environment(name, value)
+                    }
+                }
+                val cargoArguments = mutableListOf(
+                    operitPluginSyncPython.absolutePath,
+                    operitRepoRoot.resolve("tools/build_scripts/cargo_build.py").absolutePath,
+                    "cargo",
+                    "rustc",
+                    "--lib",
+                    "--manifest-path",
+                    operitBridgeCrate.resolve("Cargo.toml").absolutePath,
+                    "--target",
+                    target.rustTarget,
+                )
+                if (rustProfile == "release") {
+                    cargoArguments.add("--release")
+                }
+                if (operitExternalRuntime) {
+                    cargoArguments.addAll(listOf("--features", "android-module-app"))
+                }
+                // Rust disables default compiler libraries; V8 needs the NDK's cache flush builtin.
+                cargoArguments.addAll(listOf(
+                    "--",
+                    "-C", "link-arg=${compilerRuntime.absolutePath}",
+                    "-C", "link-arg=-Wl,--no-undefined",
+                ))
+                commandLine(cargoArguments)
+                doLast {
+                    val nativeLibraries = listOf(
+                        bridgeLibrary,
+                        bridgeLibrary.parentFile.resolve("liboperit_local_llm.so"),
+                    )
+                    nativeLibraries.forEach { library ->
+                        if (!library.isFile) {
+                            throw GradleException("Missing Android Rust $rustProfile library: $library")
+                        }
+                    }
+                }
+            }
+        }
+        val stagedJniLibraries = tasks.register<StageOperitAndroidJniLibraries>(
+            "stageOperitAndroidJniLibraries$variantTaskSuffix",
+        ) {
+            dependsOn(cargoBuildOperitFlutterBridgeTasks)
+            selectedOperitRustTargets.forEach { target ->
+                into(target.abi) {
+                    from(operitBridgeJniLibs.resolve(target.abi)) {
+                        exclude("liboperit_flutter_bridge.so", "liboperit_local_llm.so")
+                    }
+                    from(operitBridgeCrate.resolve(
+                        "target/${target.rustTarget}/$rustProfile",
+                    )) {
+                        include("liboperit_flutter_bridge.so", "liboperit_local_llm.so")
+                    }
+                }
+            }
+            into(outputDirectory)
+        }
+        val jniLibraries = variant.sources.jniLibs
+            ?: throw GradleException("Android variant ${variant.name} has no JNI library sources")
+        jniLibraries.addGeneratedSourceDirectory(stagedJniLibraries) { it.outputDirectory }
+    }
+}
+
+val requiredOperitAndroidRuntimeLibraries = listOf(
+    "libbash.so",
+    "liboperit_busybox.so",
+    "liboperit_loader.so",
+    "liboperit_proot.so",
+)
+val requiredOperitAndroidRuntimeAssets = listOf(
+    "rootfs.tar.gz.bin",
+    "rootfs.tar.gz.bin.sha256",
+)
+val verifyOperitAndroidRuntimeArtifacts = tasks.register("verifyOperitAndroidRuntimeArtifacts") {
+    doLast {
+        val missingArtifacts = selectedOperitRustTargets.flatMap { target ->
+            val libraryDirectory = operitBridgeJniLibs.resolve(target.abi)
+            val assetDirectory = project.layout.projectDirectory
+                .dir("src/main/assets/android-runtime/${target.abi}")
+                .asFile
+            requiredOperitAndroidRuntimeLibraries
+                .map { libraryName -> libraryDirectory.resolve(libraryName) }
+                .plus(
+                    requiredOperitAndroidRuntimeAssets.map { assetName ->
+                        assetDirectory.resolve(assetName)
+                    },
+                )
+                .filterNot(File::isFile)
+        }
+        if (missingArtifacts.isNotEmpty()) {
+            throw GradleException(
+                "Missing required Operit Android runtime artifacts:\n" +
+                    missingArtifacts.joinToString(separator = "\n") { it.absolutePath },
+            )
+        }
+    }
+}
+
+tasks.named("preBuild") {
+    dependsOn(syncOperitPlugins)
+    dependsOn(verifyOperitAndroidRuntimeArtifacts)
+}

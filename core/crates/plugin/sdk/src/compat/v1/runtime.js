@@ -1,0 +1,421 @@
+/** Installs the v1 compatibility surface as an SDK-internal adapter. @param {Record<string, any>} runtime */
+function __operitInstallV1Runtime(runtime) {
+    var api = runtime.__operitToolPkgApi;
+    var canonical = runtime.__operitCanonicalTools;
+    var originalToolCall = runtime.toolCall;
+    var internal = runtime.__operitV1InternalRuntime;
+    if (!internal) throw new Error('Internal V1 runtime implementation is unavailable');
+    var migratorOwner = 'com.operit.chathistory_migrator';
+
+    /** Identifies the migrator's v1 page and tool invocations. */
+    function isLegacyMigrator() {
+        var version = api.currentVersion();
+        return (version === '1.0.0' || version === '1.0.1') &&
+            runtime.__operitGetCallState(api.currentCallId()).params.__operit_ui_package_name === migratorOwner;
+    }
+
+    if (runtime.Java) __operitInstallV1MigratorChat(runtime.Java, isLegacyMigrator, originalToolCall,
+        /** Retains the owning call until the native import has delivered its receipt. @param {string} path */
+        function(path) {
+            return runtime.__operitInvokeHostAsync(runtime.__operitNativeImportV1MigratorArchive, [path]);
+        },
+    );
+    if (runtime.OperitComposeDslRuntime) {
+        var createComposeContext = runtime.OperitComposeDslRuntime.createContext;
+        /**
+         * Translates the migrator page's calls to the arguments its v1.20.2 tool metadata declares.
+         * @param {...any} args
+         */
+        function composeToolCall(...args) {
+            var [name, params, options] = args;
+            if (isLegacyMigrator() && typeof name === 'string') {
+                var qualifiedPrefix = migratorOwner + ':chathistory_migrator_tools:';
+                var childPrefix = 'chathistory_migrator_tools:';
+                var shortName = name.startsWith(qualifiedPrefix) ? name.slice(migratorOwner.length + 1) : name;
+                if (shortName.startsWith(childPrefix) && args.length === 3 && params &&
+                    options && typeof options.onIntermediateResult === 'function') {
+                    var operation = shortName.slice(childPrefix.length);
+                    if (operation.startsWith('convert_')) {
+                        var {progress_path, summary_mode, ...conversionParams} = params;
+                        return runtime.toolCall(shortName, conversionParams);
+                    }
+                    if (operation === 'generate_empty_summary' || operation === 'generate_real_summary') {
+                        var {summary_mode_id, ...summaryParams} = params;
+                        return runtime.toolCall(shortName, summaryParams);
+                    }
+                }
+                args[0] = shortName;
+            }
+            return runtime.toolCall.apply(runtime, args);
+        }
+        var legacyComposeToolCall = api.method()
+            .between('1.0.0', '2.0.0', composeToolCall)
+            .build('ComposeContext.toolCall');
+        /** Adds the historical UI bridge to the v1 context. @param {Record<string, any>} options */
+        runtime.OperitComposeDslRuntime.createContext = function(options) {
+            var bundle = createComposeContext(options);
+            Object.defineProperty(bundle.ctx, 'toolCall', {
+                /** Checks the active contract even when a page retains its context. */
+                get: function() {
+                    var version = api.currentVersion();
+                    return version === '1.0.0' || version === '1.0.1' ? legacyComposeToolCall : undefined;
+                },
+            });
+            return bundle;
+        };
+    }
+    runtime.__operitV1CanonicalTools = canonical;
+    var routes = Object.freeze({
+        'super_admin:terminal': 'terminal',
+        'code_runner:run_javascript_node': 'run_javascript_node',
+        'ffmpeg:ffmpeg_execute': 'ffmpeg_execute',
+        'ffmpeg:ffmpeg_info': 'ffmpeg_info',
+    });
+
+    /** Calls the internal implementation without publishing a package tool identity.
+     * @param {string} method
+     * @param {Record<string, any>} params
+     */
+    function invoke(method, params) {
+        var implementation = internal[method];
+        if (typeof implementation !== 'function') throw new Error('Unknown internal V1 runtime method: ' + method);
+        return Promise.resolve().then(function() { return implementation(params || {}); });
+    }
+
+    /** @type {typeof import('../../../../../../../plugins/types-v1/ffmpeg').FFmpeg} */
+    var ffmpeg = {
+        /** Executes legacy arguments through the VFS-aware runtime bridge. */
+        execute(command) { return invoke('ffmpeg_execute', { command: command }); },
+        /** Returns the selected runtime's installed FFmpeg version. */
+        info() { return invoke('ffmpeg_info', {}); },
+        /** Quotes file operands and translates the documented conversion options. */
+        convert(inputPath, outputPath, options) {
+            /** Quotes one shell argument without interpreting its contents. @param {string} value */
+            function quote(value) { return "'" + String(value).replace(/'/g, "'\\''") + "'"; }
+            var command = '-y -i ' + quote(inputPath);
+            var flags = { video_codec: '-c:v', audio_codec: '-c:a', resolution: '-s', bitrate: '-b:v' };
+            if (options) {
+                for (var key of Object.keys(flags)) {
+                    var value = options[/** @type {keyof typeof options} */ (key)];
+                    if (value !== undefined) command += ' ' + flags[/** @type {keyof typeof flags} */ (key)] + ' ' + quote(value);
+                }
+            }
+            return invoke('ffmpeg_execute', { command: command + ' ' + quote(outputPath) });
+        },
+    };
+    /** @type {Record<string, Function>} */
+    var legacyFfmpeg = {};
+    for (var [ffmpegMethod, implementation] of Object.entries(ffmpeg)) {
+        legacyFfmpeg[ffmpegMethod] = api.method().between('1.0.0', '2.0.0', implementation).build('Tools.FFmpeg.' + ffmpegMethod);
+    }
+    Object.defineProperty(runtime.Tools, 'FFmpeg', {
+        configurable: true,
+        /** Exposes the historical namespace only to admitted v1 calls. */
+        get: function() {
+            var version = api.currentVersion();
+            return version === '1.0.0' || version === '1.0.1' ? legacyFfmpeg : undefined;
+        },
+    });
+
+    // Both legacy file calls and shell commands use this existing managed filesystem.
+    var cacheImports = new Map();
+
+    /** Captures the current container before any asynchronous host work.
+     * @returns {{source: string, destination: string, pattern: RegExp} | null}
+     */
+    function cacheAddress() {
+        var state = runtime.__operitGetCallState(runtime.__operitCurrentCallId);
+        var params = state && state.params || {};
+        var owner = params.containerPackageName || params.__operit_ui_package_name || params.toolPkgId;
+        if (typeof owner !== 'string' || !/^[A-Za-z0-9._-]+$/.test(owner)) return null;
+        // Same Java UTF-16 hash used by the existing ToolPkg resource cache.
+        var hash = 0;
+        for (var i = 0; i < owner.length; i++) hash = (Math.imul(hash, 31) + owner.charCodeAt(i)) | 0;
+        var directory = owner + '-' + (hash >>> 0).toString(16);
+        var escaped = owner.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        return {
+            source: '/operitapp/data/cache/toolpkg/' + directory,
+            destination: '/tmp/operit-v1/toolpkg/' + directory,
+            pattern: new RegExp('/data/(?:user/0|data)/com\\.ai\\.assistance\\.operit/files/toolpkg_cache/' +
+                escaped + '-(?:\\*|[a-fA-F0-9]+)(?=/|$|[\\s\\x22\\x27;|&<>)])', 'g')
+        };
+    }
+
+    /** Copies packaged resources through the existing VFS and bounded runtime-file transport.
+     * Concurrent first accesses share one import; failures remain retryable.
+     * @param {{source: string, destination: string}} address
+     */
+    async function importCache(address) {
+        var pending = cacheImports.get(address.source);
+        if (!pending) {
+            /** Copies a cache tree without guessing native host paths or creating mounts.
+             * @param {string} source
+             * @param {string} destination
+             * @param {number} depth
+             */
+            async function copyTree(source, destination, depth) {
+                if (depth > 64) throw new Error('V1 package cache exceeds directory depth limit');
+                var entries = (await canonical.Files.list(source)).entries;
+                await invoke('file', { operation: 'mkdir', args: { path: destination, createParents: true } });
+                for (var entry of entries) {
+                    if (!entry.name || entry.name === '.' || entry.name === '..' || /[/\\\0]/.test(entry.name)) {
+                        throw new Error('Invalid V1 package cache entry');
+                    }
+                    // Commit the existing host revision marker only after the whole import succeeds.
+                    if (depth === 0 && entry.name === '.toolpkg-cache-signature') continue;
+                    var from = source + '/' + entry.name, to = destination + '/' + entry.name;
+                    if (entry.isDirectory) await copyTree(from, to, depth + 1);
+                    else {
+                        var data = await canonical.Files.readBinary(from);
+                        await invoke('file', { operation: 'writeBinary', args: { path: to, contentBase64: data.contentBase64 } });
+                    }
+                }
+            }
+            pending = (async function() {
+                var marker = '/.toolpkg-cache-signature';
+                var revision = await canonical.Files.readBinary(address.source + marker);
+                var existing = await invoke('file', { operation: 'exists', args: { path: address.destination + marker } });
+                if (existing.exists) {
+                    var previous = await invoke('file', { operation: 'readBinary', args: { path: address.destination + marker } });
+                    if (previous.contentBase64 === revision.contentBase64) return;
+                    await invoke('file', { operation: 'deleteFile', args: { path: address.destination + marker } });
+                }
+                await copyTree(address.source, address.destination, 0);
+                await invoke('file', { operation: 'writeBinary', args: { path: address.destination + marker, contentBase64: revision.contentBase64 } });
+            })();
+            cacheImports.set(address.source, pending);
+            pending.catch(function() { cacheImports.delete(address.source); });
+        }
+        await pending;
+    }
+
+    /** Translates only this container's old Android cache namespace.
+     * The replacement contains shell-safe characters; quotes and suffix globs remain intact,
+     * including in a quoted bash -lc script. This is namespace translation, not shell parsing.
+     * @param {string} value
+     * @returns {Promise<string>}
+     */
+    async function cachePath(value) {
+        if (typeof value !== 'string' || value.indexOf('/toolpkg_cache/') === -1) return value;
+        var address = cacheAddress();
+        if (!address) throw new Error('V1 cache path requires a current ToolPkg container');
+        var mapped = value.replace(address.pattern, address.destination);
+        if (mapped !== value) await importCache(address);
+        return mapped;
+    }
+
+    /** Rewrites only admitted legacy package identities while preserving every public overload.
+     * @param {...any} args
+     * @returns {Promise<any>}
+     */
+    async function legacyToolCall(...args) {
+        var rewritten = args.slice();
+        var name;
+        var type = 'default';
+        var index = 0;
+        if (args[0] !== null && typeof args[0] === 'object') {
+            name = args[0].name;
+            type = args[0].type === undefined ? 'default' : args[0].type;
+        } else {
+            if (typeof args[1] === 'string') { type = args[0]; index = 1; }
+            name = args[index];
+        }
+        if (type === 'default' && Object.prototype.hasOwnProperty.call(routes, name)) {
+            var target = routes[/** @type {keyof typeof routes} */ (name)];
+            var objectCall = args[0] !== null && typeof args[0] === 'object';
+            var parameters = objectCall ? (args[0].params || {}) : (args[index + 1] || {});
+            if (name === 'super_admin:terminal') {
+                if (parameters && typeof parameters.command === 'string') {
+                    var mapped = Object.assign({}, parameters, { command: await cachePath(parameters.command) });
+                    parameters = mapped;
+                }
+            }
+            return invoke(target, parameters);
+        }
+        return originalToolCall.apply(runtime, args);
+    }
+    runtime.__operitExpose('toolCall', api.method()
+        .between('1.0.0', '2.0.0', legacyToolCall)
+        .since('2.0.0', originalToolCall)
+        .build('toolCall'));
+
+    var terminal = canonical.System.terminal;
+    var currentTerminal = runtime.Tools.System.terminal;
+    // One-shot Android commands must bypass the v1 Linux terminal and its path rewrites.
+    var shellSequence = 0;
+    var shellScope = Date.now().toString(36) + '_' + Math.random().toString(36).slice(2);
+    /** Executes with the host's existing Android privilege policy and returns the v1 ADB receipt.
+     * @param {string} command
+     * @returns {Promise<import('../../../../../../../plugins/types-v1/results').ADBResultData>}
+     */
+    async function androidShell(command) {
+        if (typeof command !== 'string' || !command.trim() || command.includes('\0')) {
+            throw new TypeError('Tools.System.shell requires a nonblank command without NUL');
+        }
+        var callState = runtime.__operitGetCallState(runtime.__operitCurrentCallId);
+        if (!callState || !callState.params || callState.params.__operit_package_state !== 'android') {
+            throw new Error('Tools.System.shell requires Android');
+        }
+        // Each invocation owns its session, including concurrent callers and timeout cleanup.
+        var session = await terminal.create('v1_android_shell_' + shellScope + '_' + (++shellSequence), 'shell');
+        var failed = false;
+        try {
+            var result = await terminal.exec(session.sessionId, command, 20000);
+            if (result.timedOut) throw new Error('Android shell timed out: ' + result.output);
+            if (result.exitCode !== 0) {
+                throw new Error('Android shell exited with code ' + result.exitCode + ': ' + result.output);
+            }
+            return {
+                command: result.command,
+                output: result.output,
+                exitCode: result.exitCode,
+                /** Preserves useful string conversion alongside the structured legacy fields.
+                 * @this {import('../../../../../../../plugins/types-v1/results').ADBResultData}
+                 */
+                toString: function() { return this.output; },
+            };
+        } catch (error) {
+            failed = true;
+            throw error;
+        } finally {
+            try {
+                var closed = await terminal.close(session.sessionId);
+                if (!closed.success) throw new Error('Android shell cleanup failed: ' + closed.message);
+            } catch (error) {
+                // Keep the command's failure visible if cleanup fails as well.
+                if (!failed) throw error;
+            }
+        }
+    }
+    var legacyShell = api.method().between('1.0.0', '2.0.0', androidShell).build('Tools.System.shell');
+    Object.defineProperty(runtime.Tools.System, 'shell', {
+        configurable: true,
+        /** Keeps the supplemental legacy entry point out of the v2 API. */
+        get: function() {
+            var version = api.currentVersion();
+            return version === '1.0.0' || version === '1.0.1' ? legacyShell : undefined;
+        },
+    });
+    currentTerminal.create = api.method()
+        .between('1.0.0', '2.0.0',
+            /** Creates a legacy session using the package state selected by Rust.
+             * @param {string} sessionName
+             */
+            function(sessionName) { return invoke('create_session', { sessionName: sessionName }); })
+        .since('2.0.0', terminal.create).build('Tools.System.terminal.create');
+    currentTerminal.exec = api.method()
+        .between('1.0.0', '2.0.0',
+            /** Executes in the exact compatibility session without selecting another interpreter.
+             * @param {string} sessionId
+             * @param {string} command
+             * @param {number | string} [timeoutMs]
+             */
+            async function(sessionId, command, timeoutMs) {
+                var params = { sessionId: sessionId, command: await cachePath(command) };
+                if (timeoutMs !== undefined) /** @type {Record<string, any>} */ (params).timeoutMs = timeoutMs;
+                return invoke('execute', params);
+            })
+        .since('2.0.0', terminal.exec).build('Tools.System.terminal.exec');
+
+    currentTerminal.execStreaming = api.method()
+        .between('1.0.0', '2.0.0',
+            /** Streams the selected compatibility session through the canonical terminal transport.
+             * @param {string} sessionId
+             * @param {string} command
+             * @param {{timeoutMs?: number | string, onIntermediateResult?: (event: any) => void}} [options]
+             */
+            async function(sessionId, command, options) {
+                if (options !== undefined && (options === null || typeof options !== 'object' || Array.isArray(options))) throw new TypeError('Terminal streaming options must be an object');
+                var controls = Object.assign({}, options);
+                if (controls.timeoutMs === undefined) controls.timeoutMs = 15000;
+                return terminal.execStreaming(sessionId, await cachePath(command), controls);
+            })
+        .since('2.0.0', terminal.execStreaming).build('Tools.System.terminal.execStreaming');
+
+    /** Identifies the explicit legacy Linux VFS namespace by complete path segments.
+     * @param {unknown} path
+     * @returns {path is string}
+     */
+    function isLinux(path) { return typeof path === 'string' && (path === '/virtual/linux' || path.startsWith('/virtual/linux/') || path === '/mnt/linux' || path.startsWith('/mnt/linux/')); }
+
+    /** Converts one explicit Linux VFS address into the selected runtime's absolute path.
+     * @param {string} path
+     */
+    function linuxPath(path) {
+        if (!isLinux(path)) throw new Error('V1 runtime file operation requires a Linux VFS address');
+        var suffix = path.slice(path.startsWith('/virtual/linux') ? '/virtual/linux'.length : '/mnt/linux'.length);
+        return suffix === '' ? '/' : suffix;
+    }
+
+    /** Runs one file operation and restores its canonical VFS result path for the existing Files adapter.
+     * @param {string} operation
+     * @param {Record<string, any>} args
+     * @returns {Promise<any>}
+     */
+    async function file(operation, args) {
+        var value = await invoke('file', { operation: operation, args: args });
+        value.path = '/virtual/linux' + (value.path === '/' ? '' : value.path);
+        // The managed runtime returns a flat receipt; the canonical text-write contract wraps it.
+        if (operation === 'write') return { operation: value, aiDiffInstructions: '' };
+        return value;
+    }
+    var files = Object.assign({}, canonical.Files);
+    for (var method of ['read', 'readBinary', 'write', 'writeBinary', 'exists', 'mkdir', 'deleteFile', 'move', 'copy', 'unzip']) {
+        /** Installs a single known filesystem operation without mutating the canonical namespace.
+         * @param {string} name
+         */
+        (function(name) {
+            /** Routes the explicit Linux namespace to its actual managed runtime filesystem.
+             * @param {...any} args
+             */
+            files[name] = async function(...args) {
+                var path = name === 'read' && typeof args[0] === 'object' && args[0] !== null ? args[0].path : args[0];
+                var originalPath = path;
+                var mappedPath = await cachePath(path);
+                if (mappedPath !== path) {
+                    path = '/virtual/linux' + mappedPath;
+                    args[0] = typeof args[0] === 'object' ? Object.assign({}, args[0], { path: path }) : path;
+                }
+                if (['move', 'copy', 'unzip'].includes(name)) {
+                    var mappedDestination = await cachePath(args[1]);
+                    if (mappedDestination !== args[1]) args[1] = '/virtual/linux' + mappedDestination;
+                }
+                var sourceLinux = isLinux(path);
+                var hasDestination = name === 'move' || name === 'copy' || name === 'unzip';
+                var destinationLinux = hasDestination && isLinux(args[1]);
+                if (!sourceLinux && !destinationLinux) return canonical.Files[name].apply(canonical.Files, args);
+                if (name === 'copy' && sourceLinux !== destinationLinux) {
+                    if (args[2] === true) throw new Error('V1 cross-environment directory copy requires an explicit archive');
+                    var data = sourceLinux ? await file('readBinary', { path: linuxPath(path) }) : await canonical.Files.readBinary(path);
+                    var copied = destinationLinux
+                        ? await file('writeBinary', { path: linuxPath(args[1]), contentBase64: data.contentBase64 })
+                        : await canonical.Files.writeBinary(args[1], data.contentBase64);
+                    return Object.assign({}, copied, { operation: 'copy', path: originalPath });
+                }
+                if (hasDestination && (!sourceLinux || !destinationLinux)) throw new Error('V1 ' + name + ' requires both paths in the same runtime filesystem');
+                var params = { path: linuxPath(path) };
+                switch (name) {
+                    case 'read':
+                        if (typeof args[0] === 'object' && Object.keys(args[0]).some(
+                            /** Identifies actual read options without inspecting text contents. */
+                            function(key) { return key !== 'path'; })) throw new Error('V1 runtime read supports text paths; semantic and image reads require their host API');
+                        break;
+                    case 'write': Object.assign(params, { content: args[1], append: args[2] === true }); break;
+                    case 'writeBinary': Object.assign(params, { contentBase64: args[1] }); break;
+                    case 'mkdir': Object.assign(params, { createParents: args[1] === true }); break;
+                    case 'deleteFile': Object.assign(params, { recursive: args[1] === true }); break;
+                    case 'move': case 'copy': case 'unzip': Object.assign(params, { destination: linuxPath(args[1]), recursive: args[2] === true }); break;
+                }
+                var value = await file(name, params);
+                return mappedPath === originalPath ? value : Object.assign({}, value, { path: originalPath });
+            };
+        })(method);
+    }
+    var legacyFiles = __operitCreateV1Files(files);
+    for (var name of Object.keys(legacyFiles)) {
+        runtime.Tools.Files[name] = api.method()
+            .between('1.0.0', '2.0.0', legacyFiles[/** @type {keyof typeof legacyFiles} */ (name)])
+            .since('2.0.0', canonical.Files[/** @type {keyof typeof canonical.Files} */ (name)])
+            .build('Tools.Files.' + name);
+    }
+}

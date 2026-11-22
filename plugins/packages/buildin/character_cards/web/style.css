@@ -1,0 +1,14 @@
+:root { color-scheme: dark; font-family: system-ui, sans-serif; background: var(--surface); background-image: radial-gradient(color-mix(in srgb,var(--outline) 25%,transparent) 1px,transparent 1px); background-size: 20px 20px; color: var(--onSurface); }
+html, body, main { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+svg { display: block; width: 100%; height: 100%; touch-action: none; user-select: none; }
+.edge { stroke: var(--outline); opacity: .55; pointer-events: none; }
+.edge.selected { stroke: var(--error); }
+.edge-hit { stroke: transparent; stroke-width: 16; cursor: pointer; }
+.edge-label { fill: var(--onSurfaceVariant); stroke: var(--surface); stroke-width: 5; paint-order: stroke; stroke-linejoin: round; font-size: 10px; text-anchor: middle; pointer-events: none; }
+.node { cursor: pointer; outline: none; }
+.node rect { fill: var(--primaryContainer); stroke: var(--outline); stroke-width: 1; }
+.node.selected rect, .node:focus rect { stroke: var(--primary); stroke-width: 2.2; }
+.node text { fill: var(--onSurface); text-anchor: middle; font-size: 12px; pointer-events: none; }
+#status { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); pointer-events: none; }
+
+svg.labels-hidden .edge-label { display: none; }

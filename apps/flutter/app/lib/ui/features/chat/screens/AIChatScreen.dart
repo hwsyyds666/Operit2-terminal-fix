@@ -1,0 +1,3111 @@
+// ignore_for_file: file_names
+
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+
+import 'package:image_picker_platform_interface/image_picker_platform_interface.dart';
+import 'package:mime/mime.dart';
+
+import '../../../../core/application/PluginHotReload.dart';
+import '../../../../core/host/SelectedFileInput.dart';
+import '../../../../core/host/IncomingAttachmentService.dart';
+import '../../../../core/link/CoreLinkProtocol.dart';
+import '../../../../core/logging/ClientLogger.dart';
+import '../../../../core/proxy/generated/CoreProxyModels.g.dart' as core_proxy;
+import '../../../../core/proxy/generated/CoreProxyClients.g.dart';
+import '../../../../core/bridge/ProxyCoreRuntimeBridge.dart';
+import '../../../../data/preferences/UserPreferencesManager.dart';
+import '../../../../l10n/generated/app_localizations.dart';
+import '../../../common/contributions/ChatAttachmentResult.dart';
+import '../../../common/contributions/EmbeddedContributionDialog.dart';
+import '../../../common/contributions/ContributionPresentationResult.dart';
+import '../../../common/contributions/ToolPkgChatUiCatalog.dart';
+import '../../../main/navigation/ToolPkgCatalogChangeBus.dart';
+import '../../../main/MainLayoutController.dart';
+import '../../../main/TopBarController.dart';
+import '../../../main/components/TopBarTitleText.dart';
+import '../PendingChatDraftHandler.dart';
+import '../components/ChatScreenContent.dart';
+import '../components/ChatScrollNavigator.dart'
+    show ChatMessageNavigationController;
+import '../components/ChatMessageLocatorHost.dart';
+import '../components/ChatRuntimeScope.dart';
+import '../components/MessageEditorDialog.dart';
+import '../components/attachments/AttachmentViewerDialog.dart';
+import '../components/WorkspaceChangeConfirmDialog.dart';
+import '../components/WorkspaceShell.dart';
+import '../components/ChatMessageSlotHost.dart';
+import '../components/style/input/common/MentionSuggestionPanel.dart';
+import '../components/style/input/common/MentionTokenUtils.dart';
+import '../components/style/input/common/PendingQueueMessageItem.dart';
+import '../components/workspace/ChatContextStatsTopBarButton.dart';
+import '../components/workspace/WorkspaceLayoutMetrics.dart';
+import '../components/workspace/WorkspaceTopBarButton.dart';
+import '../../../../core/host/LocalSpeechRecorder.dart';
+import '../viewmodel/ChatSelectionTransition.dart';
+import '../viewmodel/ChatViewModel.dart';
+
+bool _chatWorkspaceOpen = false;
+const String _localSttLogTag = 'LocalSTT';
+const String _packageAttachmentPrefix = 'package_attach:';
+const String _workspaceMentionAttachmentPrefix = 'workspace_mention:';
+
+/// Derives text inserted by one editing update from the previous selection.
+String? _insertedTextFromInputChange({
+  required TextEditingValue previousValue,
+  required TextEditingValue proposedValue,
+}) {
+  final selection = previousValue.selection;
+  final previousText = previousValue.text;
+  if (!selection.isValid ||
+      selection.start > previousText.length ||
+      selection.end > previousText.length) {
+    return null;
+  }
+  final prefix = previousText.substring(0, selection.start);
+  final suffix = previousText.substring(selection.end);
+  final proposedText = proposedValue.text;
+  if (proposedText.length < prefix.length + suffix.length ||
+      !proposedText.startsWith(prefix) ||
+      !proposedText.endsWith(suffix)) {
+    return null;
+  }
+  final insertedTextEnd = proposedText.length - suffix.length;
+  return proposedText.substring(selection.start, insertedTextEnd);
+}
+
+/// Returns clipboard text when it exactly matches the insertion modulo line endings.
+String? _pastedTextFromClipboard({
+  required TextEditingValue previousValue,
+  required TextEditingValue proposedValue,
+  required String clipboardText,
+}) {
+  final insertedText = _insertedTextFromInputChange(
+    previousValue: previousValue,
+    proposedValue: proposedValue,
+  );
+  if (insertedText == null ||
+      _normalizedLineEndings(insertedText) !=
+          _normalizedLineEndings(clipboardText)) {
+    return null;
+  }
+  return clipboardText;
+}
+
+/// Normalizes platform line-ending conventions for exact clipboard comparison.
+String _normalizedLineEndings(String value) {
+  return value.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
+}
+
+class AIChatScreen extends StatelessWidget {
+  /// Creates the full host-owned AI chat screen.
+  const AIChatScreen({super.key, this.viewModel});
+
+  final ChatViewModel? viewModel;
+
+  /// Builds the full chat surface owned by the main application host.
+  @override
+  Widget build(BuildContext context) {
+    return _AIChatSurface(viewModel: viewModel, embedded: false);
+  }
+}
+
+/// Renders AI chat content without the host workspace or top-bar integration.
+class AIChatEmbed extends StatelessWidget {
+  /// Creates an embedded host chat, optionally bound to one conversation.
+  const AIChatEmbed({
+    super.key,
+    this.viewModel,
+    this.chatId,
+    this.showInput = true,
+    this.clients = const GeneratedCoreProxyClients(ProxyCoreRuntimeBridge()),
+  }) : assert(viewModel == null || chatId == null);
+
+  final ChatViewModel? viewModel;
+  final String? chatId;
+  final bool showInput;
+  final GeneratedCoreProxyClients clients;
+
+  /// Uses a local chat selection for an explicitly identified conversation.
+  @override
+  Widget build(BuildContext context) {
+    final target = chatId;
+    if (target != null) {
+      return _BoundAIChatEmbed(
+        key: ValueKey(target),
+        clients: clients,
+        chatId: target,
+        showInput: showInput,
+      );
+    }
+    return _AIChatSurface(
+      viewModel: viewModel,
+      embedded: true,
+      showInput: showInput,
+    );
+  }
+}
+
+/// Binds the existing host chat surface without changing the main chat runtime.
+class _BoundAIChatEmbed extends StatefulWidget {
+  /// Creates a conversation-owned embed on the supplied host client.
+  const _BoundAIChatEmbed({
+    required this.clients,
+    required this.chatId,
+    required this.showInput,
+    super.key,
+  });
+
+  final GeneratedCoreProxyClients clients;
+  final String chatId;
+  final bool showInput;
+
+  /// Owns the local selection before mounting native chat subscriptions.
+  @override
+  State<_BoundAIChatEmbed> createState() => _BoundAIChatEmbedState();
+}
+
+class _BoundAIChatEmbedState extends State<_BoundAIChatEmbed> {
+  late final _chatCore = widget.clients.chatRuntimeHolderMainForSlot(
+    'embedded-chat:${widget.chatId}',
+  );
+  late final _viewModel = ChatViewModel.withChatObservation(
+    bridge: widget.clients.bridge,
+    chat: _chatCore,
+    observationChat: widget.clients.chatRuntimeHolderMain,
+  );
+  late final Future<void> _binding = _chatCore.switchChatLocal(
+    chatId: widget.chatId,
+  );
+
+  /// Renders the shared chat after its exact conversation is selected, or exposes the binding error.
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<void>(
+      future: _binding,
+      builder: (context, snapshot) {
+        if (snapshot.hasError) {
+          return Center(child: SelectableText(snapshot.error.toString()));
+        }
+        if (snapshot.connectionState != ConnectionState.done) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        return _AIChatSurface(
+          viewModel: _viewModel,
+          embedded: true,
+          showInput: widget.showInput,
+          draftStoreKey: 'embedded-chat:${widget.chatId}',
+        );
+      },
+    );
+  }
+}
+
+class _AIChatSurface extends StatefulWidget {
+  /// Creates the shared implementation for a full chat screen or embedded chat.
+  const _AIChatSurface({
+    required this.viewModel,
+    required this.embedded,
+    this.showInput = true,
+    this.draftStoreKey = 'main',
+  });
+
+  final ChatViewModel? viewModel;
+  final bool embedded;
+  final bool showInput;
+  final String draftStoreKey;
+
+  /// Creates the state shared by the full and embedded chat surfaces.
+  @override
+  State<_AIChatSurface> createState() => _AIChatSurfaceState();
+}
+
+enum _BusyDraftSendMode { queue, guide, interrupt }
+
+enum _QueuedMessageSendMode { automatic, guide, interrupt }
+
+final Map<String, Map<String?, TextEditingValue>> _chatInputDraftStores =
+    <String, Map<String?, TextEditingValue>>{};
+
+class _ChatContentData {
+  const _ChatContentData({
+    required this.messages,
+    required this.loading,
+    required this.errorMessage,
+    required this.inputProcessingState,
+    required this.currentChatId,
+    required this.hasOlderDisplayHistory,
+    required this.hasNewerDisplayHistory,
+    required this.isLoadingDisplayWindow,
+    required this.isMultiSelectMode,
+    required this.selectedMessageTimestamps,
+    required this.chatUiContext,
+    required this.isPreparingChatSwitch,
+    required this.pendingQueueMessages,
+    required this.isPendingQueueExpanded,
+    required this.toolPermissionRequests,
+    required this.attachments,
+    required this.isSpeechRecording,
+    required this.isSpeechTranscribing,
+  });
+
+  final List<ChatUiMessage> messages;
+  final bool loading;
+  final String? errorMessage;
+  final core_proxy.InputProcessingState inputProcessingState;
+  final String? currentChatId;
+  final bool hasOlderDisplayHistory;
+  final bool hasNewerDisplayHistory;
+  final bool isLoadingDisplayWindow;
+  final bool isMultiSelectMode;
+  final Set<int> selectedMessageTimestamps;
+  final ({
+    core_proxy.ChatDisplayIdentity? identity,
+    ({core_proxy.ToolPkgUiRoute route, Object? input})? avatarAction,
+    String? backgroundUri,
+  })?
+  chatUiContext;
+  final bool isPreparingChatSwitch;
+  final List<PendingQueueMessageItem> pendingQueueMessages;
+  final bool isPendingQueueExpanded;
+  final List<core_proxy.RuntimeHostInteractionToolPermissionRequest>
+  toolPermissionRequests;
+  final List<AttachmentInfo> attachments;
+  final bool isSpeechRecording;
+  final bool isSpeechTranscribing;
+}
+
+class _MentionDeletionNormalization {
+  /// Creates the normalized input value and removed mention token metadata.
+  const _MentionDeletionNormalization({
+    required this.value,
+    this.removedMentionToken,
+  });
+
+  final TextEditingValue value;
+  final String? removedMentionToken;
+}
+
+class _AIChatSurfaceState extends State<_AIChatSurface> {
+  late final ChatViewModel _viewModel = widget.viewModel ?? ChatViewModel();
+  final TextEditingController _messageController = TextEditingController();
+  TextEditingValue _previousMessageInputValue = TextEditingValue.empty;
+  final FocusNode _inputFocusNode = FocusNode();
+  final ScrollController _scrollController = ScrollController();
+  final _messageNavigation = ChatMessageNavigationController();
+  final LocalSpeechRecorder _speechRecorder = LocalSpeechRecorder();
+  late final Map<String?, TextEditingValue> _inputDraftsByChatId;
+  final List<ChatUiMessage> _messages = <ChatUiMessage>[];
+  List<AttachmentInfo> _attachments = const <AttachmentInfo>[];
+  Set<String>? _attachmentHostCapabilities;
+  late final ValueNotifier<_ChatContentData> _chatContentDataNotifier;
+  late final ValueNotifier<bool> _autoScrollToBottomNotifier;
+  late final ValueNotifier<String?> _toastMessageNotifier;
+
+  bool _loading = true;
+  final Set<String> _regeneratingChatIds = <String>{};
+  core_proxy.InputProcessingState _inputProcessingState =
+      core_proxy.InputProcessingState.idle();
+  String? _errorMessage;
+  Object? _chatFlowError;
+  String? _chatFlowErrorMessage;
+  StreamSubscription<String?>? _currentChatIdSubscription;
+  StreamSubscription<List<ChatUiMessage>>? _messagesSubscription;
+  StreamSubscription<core_proxy.ChatState>? _chatStateSubscription;
+  String? _requestedChatFlowChatId;
+  bool _hasBoundChatFlow = false;
+  int _chatFlowBindingGeneration = 0;
+
+  /// Expires composer presentations on pending as well as committed selections.
+  int _chatSelectionGeneration = 0;
+  int? _lastChatSelectionTransitionGeneration;
+  StreamSubscription<String?>? _toastEventSubscription;
+  TopBarController? _topBarController;
+  MainLayoutController? _mainLayoutController;
+  final Object _topBarTitleOwner = Object();
+  final Object _topBarActionsOwner = Object();
+  final Object _mainLayoutOwner = Object();
+  late final MainLayoutAttachmentBuilder _workspaceMainLayoutAttachment =
+      _buildWorkspaceMainLayoutAttachment;
+  String _currentChatTitle = '';
+  ({
+    core_proxy.ChatDisplayIdentity? identity,
+    ({core_proxy.ToolPkgUiRoute route, Object? input})? avatarAction,
+    String? backgroundUri,
+  })?
+  _chatUiContext;
+  int _chatUiContextGeneration = 0;
+  StreamSubscription<void>? _chatUiCatalogSubscription;
+  String? _currentChatId;
+  String? _currentWorkspacePath;
+  String? _currentFileDirectory;
+  List<core_proxy.Workspace> _workspaces = const <core_proxy.Workspace>[];
+  StreamSubscription<List<core_proxy.Workspace>>? _workspacesSubscription;
+  String? _toastMessage;
+  ChatUiMessage? _replyToMessage;
+  bool _isMultiSelectMode = false;
+  Set<int> _selectedMessageTimestamps = const <int>{};
+  bool _autoScrollToBottom = true;
+  bool _hasOlderDisplayHistory = false;
+  bool _hasNewerDisplayHistory = false;
+  bool _isLoadingDisplayWindow = false;
+  bool _isPreparingChatSwitch = false;
+  String? _pendingChatSwitchTargetId;
+  late bool _workspaceOpen;
+  bool _isCurrentMainScreen = true;
+  bool _topBarActionsUpdateScheduled = false;
+  bool _pendingQueueEnqueueInFlight = false;
+  bool _cameraRequestInFlight = false;
+  bool _isApplyingChatDraft = false;
+  bool _isSpeechRecording = false;
+  bool _isSpeechTranscribing = false;
+  List<core_proxy.RuntimeHostInteractionToolPermissionRequest>
+  _toolPermissionRequests =
+      const <core_proxy.RuntimeHostInteractionToolPermissionRequest>[];
+  bool _showMentionSuggestionPanel = false;
+  String _mentionSearchQuery = '';
+  String? _mentionSuggestionTriggerChar;
+
+  /// Initializes chat state and subscriptions.
+  @override
+  void initState() {
+    super.initState();
+    _inputDraftsByChatId = _chatInputDraftStores.putIfAbsent(
+      widget.draftStoreKey,
+      () => <String?, TextEditingValue>{},
+    );
+    _chatContentDataNotifier = ValueNotifier<_ChatContentData>(
+      _currentChatContentData(),
+    );
+    _autoScrollToBottomNotifier = ValueNotifier<bool>(_autoScrollToBottom);
+    _toastMessageNotifier = ValueNotifier<String?>(_toastMessage);
+    _workspaceOpen = _chatWorkspaceOpen;
+    if (!widget.embedded) {
+      WorkspaceShell.session.onOpenRequested = _openWorkspace;
+    }
+    _watchChatFlows();
+    _watchToastEvent();
+    _workspacesSubscription = _viewModel
+        .clients
+        .repositoryWorkspacePreferenceStore
+        .allWorkspacesFlow()
+        .listen((workspaces) {
+          if (!mounted) return;
+          _workspaces = List<core_proxy.Workspace>.unmodifiable(workspaces);
+          _updateTopBarTitle();
+        });
+    _chatUiCatalogSubscription = ToolPkgCatalogChangeBus.listen(
+      _requestChatUiContextRefresh,
+    );
+    PluginHotReload.revision.addListener(_requestChatUiContextRefresh);
+    unawaited(_reloadChatUiContext());
+    if (!widget.embedded) {
+      ChatSelectionTransition.requests.addListener(_onChatSelectionTransition);
+      PendingChatDraftHandler.revision.addListener(_consumePendingChatDraft);
+      _onChatSelectionTransition();
+    }
+    _messageController.addListener(_onMessageControllerChanged);
+    unawaited(_loadLongPastedTextInputSettings());
+    unawaited(_loadAttachmentHostCapabilities());
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      if (!widget.embedded) _consumePendingChatDraft();
+      _refreshAttachments();
+      if (!widget.embedded) {
+        unawaited(_recoverLostCameraPhoto());
+      }
+    });
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (widget.embedded) {
+      _isCurrentMainScreen = false;
+      return;
+    }
+    _topBarController = TopBarScope.of(context);
+    _mainLayoutController = MainLayoutScope.of(context);
+    _isCurrentMainScreen = MainScreenActivityScope.isCurrentScreenOf(context);
+    _updateIncomingAttachmentReceiver();
+    if (_isCurrentMainScreen) {
+      _scheduleTopBarActionsUpdate();
+    } else {
+      _topBarController?.clearActions(owner: _topBarActionsOwner);
+      _topBarController?.clearTitleContent(owner: _topBarTitleOwner);
+      _mainLayoutController?.clearAttachment(owner: _mainLayoutOwner);
+      _mainLayoutController?.clearWorkspaceDockDestination(
+        owner: _mainLayoutOwner,
+      );
+    }
+  }
+
+  /// Releases chat state and subscriptions.
+  @override
+  void dispose() {
+    IncomingAttachmentService.instance.clearComposer(this);
+    _saveCurrentInputDraft();
+    ChatSelectionTransition.requests.removeListener(_onChatSelectionTransition);
+    PendingChatDraftHandler.revision.removeListener(_consumePendingChatDraft);
+    _messageController.removeListener(_onMessageControllerChanged);
+    _messageController.dispose();
+    _inputFocusNode.dispose();
+    _scrollController.dispose();
+    _messageNavigation.dispose();
+    _chatContentDataNotifier.dispose();
+    _autoScrollToBottomNotifier.dispose();
+    _toastMessageNotifier.dispose();
+    _currentChatIdSubscription?.cancel();
+    _messagesSubscription?.cancel();
+    _chatStateSubscription?.cancel();
+    _toastEventSubscription?.cancel();
+    _workspacesSubscription?.cancel();
+    unawaited(_chatUiCatalogSubscription?.cancel());
+    PluginHotReload.revision.removeListener(_requestChatUiContextRefresh);
+    unawaited(_speechRecorder.dispose());
+    _topBarController?.clearActions(owner: _topBarActionsOwner);
+    _topBarController?.clearTitleContent(owner: _topBarTitleOwner);
+    _mainLayoutController?.clearAttachment(owner: _mainLayoutOwner);
+    _mainLayoutController?.clearWorkspaceDockDestination(
+      owner: _mainLayoutOwner,
+    );
+    if (WorkspaceShell.session.onOpenRequested == _openWorkspace) {
+      WorkspaceShell.session.onOpenRequested = null;
+    }
+    super.dispose();
+  }
+
+  /// Reads attachment capabilities from the active runtime's host descriptor.
+  Future<void> _loadAttachmentHostCapabilities() async {
+    try {
+      final descriptor = await _viewModel.clients.servicesRuntimeHostInfoService
+          .runtimeHostDescriptor();
+      if (!mounted) return;
+      setState(
+        () => _attachmentHostCapabilities = descriptor.capabilities.toSet(),
+      );
+    } catch (error, stackTrace) {
+      ClientLogger.e(
+        'Unable to read attachment host capabilities',
+        tag: 'AIChatScreen',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      if (mounted) _showLocalToast('无法读取附件 Host 能力：$error');
+    }
+  }
+
+  /// Checks an exact host capability identifier without platform-specific UI logic.
+  bool _hasAttachmentHostCapability(String id) =>
+      _attachmentHostCapabilities?.lookup(id) != null;
+
+  /// Runs one attachment action and presents its actual failure to the user.
+  Future<void> _runAttachmentAction(Future<void> Function() action) async {
+    try {
+      await action();
+    } catch (error, stackTrace) {
+      ClientLogger.e(
+        'Attachment action failed',
+        tag: 'AIChatScreen',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      if (mounted) _showLocalToast('添加附件失败：$error');
+    }
+  }
+
+  /// Loads the global long-paste conversion settings used by this chat surface.
+  Future<void> _loadLongPastedTextInputSettings() async {
+    try {
+      await const UserPreferencesManager().loadLongPastedTextInputSettings();
+    } catch (error, stackTrace) {
+      ClientLogger.e(
+        'Unable to load long pasted text preferences',
+        tag: 'AIChatScreen',
+        error: error,
+        stackTrace: stackTrace,
+      );
+    }
+  }
+
+  void _consumePendingChatDraft() {
+    if (!mounted) {
+      return;
+    }
+    final draft = PendingChatDraftHandler.takePendingDraft();
+    if (draft == null || draft.isEmpty) {
+      return;
+    }
+    _messageController.text = draft;
+    _messageController.selection = TextSelection.collapsed(
+      offset: draft.length,
+    );
+    _inputFocusNode.requestFocus();
+  }
+
+  void _onMessageControllerChanged() {
+    final previousValue = _previousMessageInputValue;
+    final proposedValue = _messageController.value;
+    if (_isApplyingChatDraft) {
+      _previousMessageInputValue = proposedValue;
+      return;
+    }
+    final normalization = _normalizeMentionDeletion(
+      previousValue,
+      proposedValue,
+    );
+    final acceptedValue = normalization.value;
+    if (acceptedValue != proposedValue) {
+      _applyMessageControllerValue(acceptedValue);
+    }
+    _previousMessageInputValue = acceptedValue;
+    final removedMentionToken = normalization.removedMentionToken;
+    if (removedMentionToken != null &&
+        !_hasMentionToken(acceptedValue.text, removedMentionToken)) {
+      unawaited(
+        _removeMentionAttachments(removedMentionToken).catchError((
+          Object error,
+          StackTrace stackTrace,
+        ) {
+          ClientLogger.e(
+            'Failed to remove mention attachments',
+            tag: 'AIChatScreen',
+            error: error,
+            stackTrace: stackTrace,
+          );
+        }),
+      );
+    }
+    final settings = UserPreferencesManager.longPastedTextInputSettings.value;
+    final insertedText = _insertedTextFromInputChange(
+      previousValue: previousValue,
+      proposedValue: acceptedValue,
+    );
+    if (settings.enabled &&
+        insertedText != null &&
+        insertedText.runes.length > settings.threshold) {
+      unawaited(
+        _convertLongPastedText(
+          previousValue: previousValue,
+          proposedValue: acceptedValue,
+          chatId: _currentChatId,
+        ),
+      );
+      return;
+    }
+    _recordMessageInputChange(acceptedValue);
+  }
+
+  /// Persists and dispatches one accepted message input editing value.
+  void _recordMessageInputChange(TextEditingValue value) {
+    _saveInputDraft(value);
+    _updateMentionSuggestionState(value);
+    unawaited(
+      _viewModel
+          .dispatchChatInputChanged(
+            chatId: _currentChatId,
+            text: value.text,
+            selectionStart: value.selection.start,
+            selectionEnd: value.selection.end,
+            attachmentCount: _attachments.length,
+          )
+          .catchError((Object error, StackTrace stackTrace) {
+            ClientLogger.e(
+              'chat input change hook failed',
+              tag: 'AIChatScreen',
+              error: error,
+              stackTrace: stackTrace,
+            );
+          }),
+    );
+  }
+
+  /// Applies a controller value without re-entering accepted input processing.
+  void _applyMessageControllerValue(TextEditingValue value) {
+    _isApplyingChatDraft = true;
+    try {
+      _messageController.value = value;
+    } finally {
+      _isApplyingChatDraft = false;
+    }
+  }
+
+  /// Expands a single backspace at a committed mention into full-token deletion.
+  _MentionDeletionNormalization _normalizeMentionDeletion(
+    TextEditingValue previous,
+    TextEditingValue proposed,
+  ) {
+    if (!previous.selection.isValid ||
+        !proposed.selection.isValid ||
+        previous.selection.start != previous.selection.end ||
+        proposed.selection.start != proposed.selection.end ||
+        previous.text.length != proposed.text.length + 1) {
+      return _MentionDeletionNormalization(value: proposed);
+    }
+
+    final oldCursor = _clampedTextOffset(
+      previous.selection.start,
+      previous.text.length,
+    );
+    final newCursor = _clampedTextOffset(
+      proposed.selection.start,
+      proposed.text.length,
+    );
+    if (newCursor != oldCursor - 1) {
+      return _MentionDeletionNormalization(value: proposed);
+    }
+
+    final expectedText = previous.text.replaceRange(newCursor, oldCursor, '');
+    if (expectedText != proposed.text) {
+      return _MentionDeletionNormalization(value: proposed);
+    }
+
+    final mentionToken = findMentionTokenEndingAtCursor(
+      previous.text,
+      oldCursor,
+    );
+    if (mentionToken == null) {
+      return _MentionDeletionNormalization(value: proposed);
+    }
+
+    final removedMentionToken = previous.text
+        .substring(mentionToken.start + 1, mentionToken.contentEndExclusive)
+        .trim();
+    final normalizedText = previous.text.replaceRange(
+      mentionToken.start,
+      mentionToken.endExclusive,
+      '',
+    );
+    return _MentionDeletionNormalization(
+      value: proposed.copyWith(
+        text: normalizedText,
+        selection: TextSelection.collapsed(offset: mentionToken.start),
+        composing: TextRange.empty,
+      ),
+      removedMentionToken: removedMentionToken.isEmpty
+          ? null
+          : removedMentionToken,
+    );
+  }
+
+  /// Clamps an editing offset into the available text range.
+  int _clampedTextOffset(int offset, int textLength) {
+    if (offset < 0) {
+      return 0;
+    }
+    if (offset > textLength) {
+      return textLength;
+    }
+    return offset;
+  }
+
+  /// Updates the visible mention suggestion state from the accepted input.
+  void _updateMentionSuggestionState(TextEditingValue value) {
+    final activeMention = findActiveMentionTrigger(value);
+    if (activeMention == null) {
+      _clearMentionSuggestionState();
+      return;
+    }
+    final changed =
+        !_showMentionSuggestionPanel ||
+        _mentionSuggestionTriggerChar != activeMention.triggerChar ||
+        _mentionSearchQuery != activeMention.query;
+    if (!changed) {
+      return;
+    }
+    if (!mounted) {
+      _showMentionSuggestionPanel = true;
+      _mentionSuggestionTriggerChar = activeMention.triggerChar;
+      _mentionSearchQuery = activeMention.query;
+      return;
+    }
+    setState(() {
+      _showMentionSuggestionPanel = true;
+      _mentionSuggestionTriggerChar = activeMention.triggerChar;
+      _mentionSearchQuery = activeMention.query;
+    });
+  }
+
+  /// Clears the active mention suggestion state.
+  void _clearMentionSuggestionState() {
+    if (!_showMentionSuggestionPanel &&
+        _mentionSuggestionTriggerChar == null &&
+        _mentionSearchQuery.isEmpty) {
+      return;
+    }
+    if (!mounted) {
+      _showMentionSuggestionPanel = false;
+      _mentionSuggestionTriggerChar = null;
+      _mentionSearchQuery = '';
+      return;
+    }
+    setState(() {
+      _showMentionSuggestionPanel = false;
+      _mentionSuggestionTriggerChar = null;
+      _mentionSearchQuery = '';
+    });
+  }
+
+  /// Replaces the active mention token with the selected token text.
+  bool _replaceCurrentMentionToken(String token) {
+    final trimmedToken = token.trim();
+    if (trimmedToken.isEmpty) {
+      return false;
+    }
+
+    final current = _messageController.value;
+    final activeMention = findActiveMentionTrigger(current);
+    if (activeMention == null) {
+      return false;
+    }
+    final text = current.text;
+    final cursor = _clampedTextOffset(current.selection.start, text.length);
+    final before = text.substring(0, activeMention.triggerIndex);
+    final after = text.substring(cursor);
+    final insertion = StringBuffer()
+      ..write(activeMention.triggerChar)
+      ..write(trimmedToken);
+    if (after.isEmpty || !isMentionWhitespace(after.substring(0, 1))) {
+      insertion.write(' ');
+    }
+    final insertedText = insertion.toString();
+    final nextText = before + insertedText + after;
+    _messageController.value = TextEditingValue(
+      text: nextText,
+      selection: TextSelection.collapsed(
+        offset: before.length + insertedText.length,
+      ),
+      composing: TextRange.empty,
+    );
+    _inputFocusNode.requestFocus();
+    return true;
+  }
+
+  /// Selects a package suggestion from the active mention panel.
+  Future<void> _selectMentionPackage(String packageName) async {
+    final trimmedPackageName = packageName.trim();
+    if (trimmedPackageName.isEmpty) {
+      return;
+    }
+    if (!_replaceCurrentMentionToken(trimmedPackageName)) {
+      return;
+    }
+    _clearMentionSuggestionState();
+    final attachmentPath = '$_packageAttachmentPrefix$trimmedPackageName';
+    await _handleSpecialAttachment(attachmentPath);
+    if (!_hasMentionToken(_messageController.text, trimmedPackageName)) {
+      await _removeAttachment(attachmentPath);
+    }
+  }
+
+  /// Selects a workspace entry suggestion from the active mention panel.
+  Future<void> _selectMentionWorkspaceEntry(String relativePath) async {
+    final normalizedRelativePath = _normalizeWorkspaceMentionPath(relativePath);
+    if (normalizedRelativePath.isEmpty) {
+      return;
+    }
+    if (!_replaceCurrentMentionToken(normalizedRelativePath)) {
+      return;
+    }
+    _clearMentionSuggestionState();
+    final attachmentPath =
+        '$_workspaceMentionAttachmentPrefix$normalizedRelativePath';
+    await _handleSpecialAttachment(attachmentPath);
+    if (!_hasMentionToken(_messageController.text, normalizedRelativePath)) {
+      await _removeAttachment(attachmentPath);
+    }
+  }
+
+  /// Removes package and workspace attachments linked to one mention token.
+  Future<void> _removeMentionAttachments(String token) async {
+    final trimmedToken = token.trim();
+    if (trimmedToken.isEmpty) {
+      return;
+    }
+    await _viewModel.removeAttachment('$_packageAttachmentPrefix$trimmedToken');
+    await _viewModel.removeAttachment(
+      '$_workspaceMentionAttachmentPrefix$trimmedToken',
+    );
+    await _refreshAttachments();
+  }
+
+  /// Reports whether the text still has an exact mention token.
+  bool _hasMentionToken(String text, String token) {
+    final trimmedToken = token.trim();
+    if (trimmedToken.isEmpty) {
+      return false;
+    }
+    for (final mentionToken in findMentionTokens(text)) {
+      final value = text.substring(
+        mentionToken.start + 1,
+        mentionToken.contentEndExclusive,
+      );
+      if (value == trimmedToken) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// Normalizes a workspace mention path for the input token and attachment id.
+  String _normalizeWorkspaceMentionPath(String relativePath) {
+    var normalizedPath = relativePath.trim().replaceAll(r'\', '/');
+    while (normalizedPath.startsWith('/')) {
+      normalizedPath = normalizedPath.substring(1);
+    }
+    while (normalizedPath.endsWith('/')) {
+      normalizedPath = normalizedPath.substring(0, normalizedPath.length - 1);
+    }
+    return normalizedPath;
+  }
+
+  /// Converts a verified long clipboard insertion into a text attachment.
+  Future<void> _convertLongPastedText({
+    required TextEditingValue previousValue,
+    required TextEditingValue proposedValue,
+    required String? chatId,
+  }) async {
+    try {
+      final clipboardData = await Clipboard.getData(Clipboard.kTextPlain);
+      final clipboardText = clipboardData?.text;
+      if (clipboardText == null) {
+        _recordDeferredMessageInputChange(chatId, proposedValue);
+        return;
+      }
+      final pastedText = _pastedTextFromClipboard(
+        previousValue: previousValue,
+        proposedValue: proposedValue,
+        clipboardText: clipboardText,
+      );
+      if (pastedText == null) {
+        _recordDeferredMessageInputChange(chatId, proposedValue);
+        return;
+      }
+      if (!_matchesPendingLongPaste(chatId, proposedValue)) {
+        return;
+      }
+      await _viewModel.attachPastedText(pastedText);
+      if (!_matchesPendingLongPaste(chatId, proposedValue)) {
+        return;
+      }
+      try {
+        await _refreshAttachments();
+      } catch (error, stackTrace) {
+        ClientLogger.e(
+          'Unable to refresh attachments after converting pasted text',
+          tag: 'AIChatScreen',
+          error: error,
+          stackTrace: stackTrace,
+        );
+      }
+      if (!_matchesPendingLongPaste(chatId, proposedValue)) {
+        return;
+      }
+      _isApplyingChatDraft = true;
+      _messageController.value = previousValue;
+      _isApplyingChatDraft = false;
+      _previousMessageInputValue = previousValue;
+      _recordMessageInputChange(previousValue);
+    } catch (error, stackTrace) {
+      ClientLogger.e(
+        'Unable to convert pasted text to an attachment',
+        tag: 'AIChatScreen',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      _recordDeferredMessageInputChange(chatId, proposedValue);
+    }
+  }
+
+  /// Records a deferred input update while it still belongs to the active chat.
+  void _recordDeferredMessageInputChange(
+    String? chatId,
+    TextEditingValue proposedValue,
+  ) {
+    if (_matchesPendingLongPaste(chatId, proposedValue)) {
+      _recordMessageInputChange(proposedValue);
+    }
+  }
+
+  /// Checks whether a long-paste conversion still targets the active editor value.
+  bool _matchesPendingLongPaste(
+    String? chatId,
+    TextEditingValue proposedValue,
+  ) {
+    return mounted &&
+        _currentChatId == chatId &&
+        _messageController.value == proposedValue;
+  }
+
+  void _saveCurrentInputDraft() {
+    _saveInputDraft(_messageController.value);
+  }
+
+  /// Stores one editing value as the active chat's current draft.
+  void _saveInputDraft(TextEditingValue value) {
+    _inputDraftsByChatId[_currentChatId] = value;
+  }
+
+  void _restoreInputDraftForChat(String? chatId) {
+    final value = _inputDraftsByChatId[chatId] ?? TextEditingValue.empty;
+    _isApplyingChatDraft = true;
+    _messageController.value = value;
+    _isApplyingChatDraft = false;
+    _showMentionSuggestionPanel = false;
+    _mentionSuggestionTriggerChar = null;
+    _mentionSearchQuery = '';
+  }
+
+  bool get _isQueueBlocked {
+    return _loading || _inputProcessingState.isProcessing;
+  }
+
+  /// Requests a Rust-owned automatic dequeue after the active chat becomes ready.
+  void _syncPendingQueueAfterSnapshot() {
+    final contentData = _chatContentDataNotifier.value;
+    if (!_isQueueBlocked && contentData.pendingQueueMessages.isNotEmpty) {
+      _schedulePendingQueueAutoDequeue();
+    }
+  }
+
+  /// Schedules an atomic Rust dequeue only while the owning chat remains active.
+  void _schedulePendingQueueAutoDequeue() {
+    final queueChatId = _currentChatId;
+    final contentData = _chatContentDataNotifier.value;
+    if (queueChatId == null || contentData.pendingQueueMessages.isEmpty) {
+      return;
+    }
+    Future<void>.delayed(const Duration(milliseconds: 250), () {
+      final currentContentData = _chatContentDataNotifier.value;
+      if (!mounted ||
+          _currentChatId != queueChatId ||
+          _isQueueBlocked ||
+          currentContentData.pendingQueueMessages.isEmpty) {
+        return;
+      }
+      unawaited(_takeNextPendingQueueMessageIfReady(queueChatId));
+    });
+  }
+
+  /// Atomically takes and submits the next Rust-owned queued message when available.
+  Future<void> _takeNextPendingQueueMessageIfReady(String chatId) async {
+    try {
+      final item = await _viewModel.takeNextPendingQueueMessageIfReady(chatId);
+      if (item == null) {
+        return;
+      }
+      await _sendQueuedItemNow(chatId, item, _QueuedMessageSendMode.automatic);
+    } catch (error, stackTrace) {
+      ClientLogger.e(
+        'Failed to dequeue pending chat message',
+        tag: 'AIChatScreen',
+        error: error,
+        stackTrace: stackTrace,
+      );
+    }
+  }
+
+  /// Enqueues the current draft in the Rust-owned queue for the active chat.
+  void _enqueueDraftToPendingQueue() {
+    unawaited(_enqueueDraftToPendingQueueInRuntime());
+  }
+
+  /// Commits the current draft to the Rust-owned queue without losing a changed draft.
+  Future<void> _enqueueDraftToPendingQueueInRuntime() async {
+    final draftText = _messageController.text.trim();
+    final chatId = _currentChatId;
+    if (_pendingQueueEnqueueInFlight || draftText.isEmpty || chatId == null) {
+      return;
+    }
+    _pendingQueueEnqueueInFlight = true;
+    try {
+      await _viewModel.enqueuePendingQueueMessage(
+        chatId: chatId,
+        messageText: draftText,
+      );
+      _clearSubmittedDraft(chatId, draftText);
+      if (!mounted || _currentChatId != chatId) {
+        return;
+      }
+      _showLocalToast(AppLocalizations.of(context)!.chatQueueAdded);
+    } catch (error, stackTrace) {
+      ClientLogger.e(
+        'Failed to enqueue pending chat message',
+        tag: 'AIChatScreen',
+        error: error,
+        stackTrace: stackTrace,
+      );
+    } finally {
+      _pendingQueueEnqueueInFlight = false;
+    }
+  }
+
+  /// Clears only the draft version accepted by Core, preserving newer typing.
+  void _clearSubmittedDraft(String chatId, String submittedText) {
+    final savedDraft = _inputDraftsByChatId[chatId];
+    if (savedDraft != null && savedDraft.text.trim() == submittedText) {
+      _inputDraftsByChatId[chatId] = TextEditingValue.empty;
+    }
+    if (!mounted || _currentChatId != chatId) {
+      return;
+    }
+    if (_messageController.text.trim() == submittedText) {
+      _clearMentionSuggestionState();
+      _messageController.clear();
+    }
+  }
+
+  /// Deletes one message from the Rust-owned queue for the active chat.
+  void _deletePendingQueueMessage(int id) {
+    unawaited(_deletePendingQueueMessageInRuntime(id));
+  }
+
+  /// Applies a pending-message deletion through the chat runtime.
+  Future<void> _deletePendingQueueMessageInRuntime(int id) async {
+    final chatId = _currentChatId;
+    if (chatId == null) {
+      return;
+    }
+    try {
+      await _viewModel.deletePendingQueueMessage(chatId: chatId, messageId: id);
+    } catch (error, stackTrace) {
+      ClientLogger.e(
+        'Failed to delete pending chat message',
+        tag: 'AIChatScreen',
+        error: error,
+        stackTrace: stackTrace,
+      );
+    }
+  }
+
+  /// Moves one Rust-owned queue item into the input editor for the active chat.
+  void _editPendingQueueMessage(int id) {
+    unawaited(_editPendingQueueMessageInRuntime(id));
+  }
+
+  /// Atomically takes a queue item before placing it in the active input editor.
+  Future<void> _editPendingQueueMessageInRuntime(int id) async {
+    final chatId = _currentChatId;
+    if (chatId == null) {
+      return;
+    }
+    try {
+      final item = await _viewModel.takePendingQueueMessage(
+        chatId: chatId,
+        messageId: id,
+        suppressNextAutoDequeue: false,
+      );
+      if (item == null) {
+        return;
+      }
+      if (!mounted || _currentChatId != chatId) {
+        await _viewModel.restorePendingQueueMessage(
+          chatId: chatId,
+          message: item,
+        );
+        return;
+      }
+      _messageController.text = item.text;
+      _messageController.selection = TextSelection.collapsed(
+        offset: item.text.length,
+      );
+      _inputFocusNode.requestFocus();
+    } catch (error, stackTrace) {
+      ClientLogger.e(
+        'Failed to edit pending chat message',
+        tag: 'AIChatScreen',
+        error: error,
+        stackTrace: stackTrace,
+      );
+    }
+  }
+
+  /// Sends a manually selected item through the chat that owns the Rust queue.
+  void _sendPendingQueueMessage(int id) {
+    unawaited(_sendPendingQueueMessageInRuntime(id));
+  }
+
+  /// Atomically takes the selected queue item before submitting it.
+  Future<void> _sendPendingQueueMessageInRuntime(int id) async {
+    final queueChatId = _currentChatId;
+    if (queueChatId == null) {
+      return;
+    }
+    try {
+      final item = await _viewModel.takePendingQueueMessage(
+        chatId: queueChatId,
+        messageId: id,
+        suppressNextAutoDequeue: true,
+      );
+      if (item == null) {
+        return;
+      }
+      await _sendQueuedItemNow(
+        queueChatId,
+        item,
+        _QueuedMessageSendMode.interrupt,
+      );
+    } catch (error, stackTrace) {
+      ClientLogger.e(
+        'Failed to send pending chat message',
+        tag: 'AIChatScreen',
+        error: error,
+        stackTrace: stackTrace,
+      );
+    }
+  }
+
+  /// Converts one queued item into guidance for its still-active chat turn.
+  void _guidePendingQueueMessage(int id) {
+    unawaited(_guidePendingQueueMessageInRuntime(id));
+  }
+
+  /// Restores the claimed queue item when hooks or Core reject its guidance.
+  Future<void> _guidePendingQueueMessageInRuntime(int id) async {
+    final queueChatId = _currentChatId;
+    if (queueChatId == null) {
+      return;
+    }
+    PendingQueueMessageItem? claimedItem;
+    try {
+      final item = await _viewModel.takePendingQueueMessage(
+        chatId: queueChatId,
+        messageId: id,
+        suppressNextAutoDequeue: false,
+      );
+      if (item == null) {
+        return;
+      }
+      claimedItem = item;
+      await _sendQueuedItemNow(queueChatId, item, _QueuedMessageSendMode.guide);
+    } catch (error, stackTrace) {
+      final item = claimedItem;
+      if (item != null) {
+        await _viewModel.restorePendingQueueMessage(
+          chatId: queueChatId,
+          message: item,
+        );
+      }
+      ClientLogger.e(
+        'Failed to guide with pending chat message',
+        tag: 'AIChatScreen',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      if (mounted) {
+        _showLocalToast(error.toString());
+      }
+    }
+  }
+
+  /// Runs queue submission hooks and sends the item to its owning chat.
+  Future<void> _sendQueuedItemNow(
+    String queueChatId,
+    PendingQueueMessageItem item,
+    _QueuedMessageSendMode mode,
+  ) async {
+    final shouldSuppressAutoDequeue = mode == _QueuedMessageSendMode.interrupt;
+    var queuedText = item.text;
+    final decision = await _viewModel.dispatchChatInputSubmitRequested(
+      chatId: queueChatId,
+      text: queuedText,
+      selectionStart: queuedText.length,
+      selectionEnd: queuedText.length,
+      attachments: const [],
+      replyToMessageTimestamp: null,
+    );
+    if (decision != null) {
+      final timeoutMessage = decision.message;
+      if (decision.timedOut && timeoutMessage != null) {
+        _showLocalToast(timeoutMessage);
+      }
+      if (decision.action == chatInputActionBlock) {
+        if (shouldSuppressAutoDequeue) {
+          await _viewModel.clearPendingQueueAutoDequeueSuppression(queueChatId);
+        }
+        await _viewModel.restorePendingQueueMessage(
+          chatId: queueChatId,
+          message: item,
+        );
+        final message = decision.message;
+        if (mounted && message != null && message.trim().isNotEmpty) {
+          _showLocalToast(message);
+        }
+        return;
+      }
+      if (decision.action == chatInputActionConsume) {
+        if (shouldSuppressAutoDequeue) {
+          await _viewModel.clearPendingQueueAutoDequeueSuppression(queueChatId);
+        }
+        final message = decision.message;
+        if (mounted && message != null && message.trim().isNotEmpty) {
+          _showLocalToast(message);
+        }
+        return;
+      }
+      if (decision.action == chatInputActionReplace) {
+        final updatedText = decision.text;
+        if (updatedText != null) {
+          queuedText = updatedText;
+        }
+      }
+    }
+    if (mode == _QueuedMessageSendMode.guide) {
+      if (queuedText.trim().isEmpty) {
+        await _viewModel.restorePendingQueueMessage(
+          chatId: queueChatId,
+          message: item,
+        );
+        return;
+      }
+      await _viewModel.steerMessage(
+        chatId: queueChatId,
+        messageText: queuedText.trim(),
+      );
+      return;
+    }
+    if (shouldSuppressAutoDequeue) {
+      await _viewModel.cancelMessage(queueChatId);
+    }
+    if (queuedText.trim().isEmpty) {
+      return;
+    }
+    if (mounted && _currentChatId == queueChatId) {
+      _inputFocusNode.unfocus();
+    }
+    await _viewModel.sendUserMessage(
+      queuedText.trim(),
+      chatIdOverride: queueChatId,
+    );
+    if (mounted && _currentChatId == queueChatId) {
+      await _refreshAttachments();
+    }
+  }
+
+  /// Persists the pending-queue expanded state through the chat runtime.
+  void _setPendingQueueExpanded(bool expanded) {
+    unawaited(_setPendingQueueExpandedInRuntime(expanded));
+  }
+
+  /// Applies a queue-expansion change to the currently active chat.
+  Future<void> _setPendingQueueExpandedInRuntime(bool expanded) async {
+    final chatId = _currentChatId;
+    if (chatId == null) {
+      return;
+    }
+    try {
+      await _viewModel.setPendingQueueExpanded(
+        chatId: chatId,
+        isExpanded: expanded,
+      );
+    } catch (error, stackTrace) {
+      ClientLogger.e(
+        'Failed to update pending queue expanded state',
+        tag: 'AIChatScreen',
+        error: error,
+        stackTrace: stackTrace,
+      );
+    }
+  }
+
+  void _showLocalToast(String message) {
+    if (!mounted || message.trim().isEmpty) {
+      return;
+    }
+    _toastMessage = message;
+    _toastMessageNotifier.value = message;
+  }
+
+  Future<void> _refreshAttachments() async {
+    final attachments = await _viewModel.attachments();
+    if (!mounted) {
+      return;
+    }
+    _attachments = attachments;
+    _publishChatContentData();
+  }
+
+  /// Selects only image metadata and streams content into the receiving Host.
+  Future<void> _handleAttachImage() =>
+      _handleSelectedAttachments(imagesOnly: true);
+
+  /// Selects file metadata without materializing complete files in the picker.
+  Future<void> _handleAttachFile() => _handleSelectedAttachments();
+
+  Future<void> _handleSelectedAttachments({bool imagesOnly = false}) async {
+    var files = <SelectedFileInput>[];
+    final chatId = _currentChatId;
+    try {
+      files = await SelectedFileInput.pick(imagesOnly: imagesOnly);
+      for (final file in files) {
+        if (!mounted || _currentChatId != chatId) break;
+        await _viewModel.attachSelectedFile(
+          file,
+          expectedChatId: chatId,
+          isCancelled: () => !mounted || _currentChatId != chatId,
+        );
+      }
+    } catch (error, stackTrace) {
+      ClientLogger.e(
+        'Failed to upload selected attachment',
+        tag: 'AIChatScreen',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      if (mounted) _showLocalToast('无法添加附件: $error');
+    } finally {
+      // Also release later selections if an upload fails or the screen is closed.
+      for (final file in files) {
+        try {
+          await file.close();
+        } catch (error) {
+          ClientLogger.e(
+            'Failed to close selected attachment',
+            tag: 'AIChatScreen',
+            error: error,
+          );
+        }
+      }
+      if (mounted) await _refreshAttachments();
+    }
+  }
+
+  Future<void> _handleAttachmentPaths(List<String> paths) async {
+    final chatId = _currentChatId;
+    for (final path in paths) {
+      if (!mounted || _currentChatId != chatId) break;
+      final input = await SelectedFileInput.fromXFile(XFile(path));
+      await _viewModel.attachSelectedFile(
+        input,
+        expectedChatId: chatId,
+        isCancelled: () => !mounted || _currentChatId != chatId,
+      );
+    }
+    await _refreshAttachments();
+  }
+
+  /// Binds external delivery only after the selected main conversation is ready.
+  void _updateIncomingAttachmentReceiver() {
+    if (widget.embedded ||
+        !_isCurrentMainScreen ||
+        _isPreparingChatSwitch ||
+        _currentChatId == null ||
+        _requestedChatFlowChatId != _currentChatId ||
+        _chatFlowError != null) {
+      IncomingAttachmentService.instance.clearComposer(this);
+      return;
+    }
+    IncomingAttachmentService.instance.installComposer(
+      this,
+      _handleIncomingFiles,
+    );
+  }
+
+  /// Attaches a share batch to the captured conversation using the drop upload path.
+  Future<void> _handleIncomingFiles(List<SelectedFileInput> files) async {
+    final chatId = _currentChatId;
+    final generation = _chatSelectionGeneration;
+
+    /// Cancels the captured batch when its owning surface or selection expires.
+    bool cancelled() => !mounted || generation != _chatSelectionGeneration;
+    for (final file in files) {
+      try {
+        await _viewModel.attachSelectedFile(
+          file,
+          expectedChatId: chatId,
+          isCancelled: cancelled,
+        );
+      } catch (error, stack) {
+        ClientLogger.e(
+          'Failed to attach shared file ${file.name}',
+          tag: 'AIChatScreen',
+          error: error,
+          stackTrace: stack,
+        );
+        if (mounted) _showLocalToast('无法添加附件 ${file.name}: $error');
+      }
+    }
+    if (mounted) await _refreshAttachments();
+  }
+
+  /// Adds pasted image payloads to the current attachment list.
+  Future<void> _handlePastedImages(
+    List<PastedImageAttachmentPayload> images,
+  ) async {
+    for (final image in images) {
+      await _viewModel.attachPastedImage(image);
+    }
+    await _refreshAttachments();
+  }
+
+  /// Adds a runtime-owned special attachment through the shared chat boundary.
+  Future<void> _handleSpecialAttachment(String filePath) async {
+    await _viewModel.handleAttachment(filePath);
+    await _refreshAttachments();
+  }
+
+  Future<void> _handleAttachPackage(String packageName) {
+    return _handleSpecialAttachment('package_attach:$packageName');
+  }
+
+  /// Recovers the camera result after Android recreates the activity/process.
+  Future<void> _recoverLostCameraPhoto() async {
+    if (_cameraRequestInFlight) return;
+    _cameraRequestInFlight = true;
+    try {
+      final response = await ImagePickerPlatform.instance.getLostData();
+      if (!mounted || response.isEmpty) return;
+      if (response.exception != null) throw response.exception!;
+      final files =
+          response.files ??
+          (response.file == null ? <XFile>[] : <XFile>[response.file!]);
+      await _handleCapturedPhotos(files);
+    } on UnimplementedError {
+      // Some picker implementations have no interrupted-capture recovery.
+    } on MissingPluginException {
+      // No picker is registered on this host.
+    } catch (error, stackTrace) {
+      _reportCameraError(error, stackTrace);
+    } finally {
+      _cameraRequestInFlight = false;
+    }
+  }
+
+  void _reportCameraError(Object error, StackTrace stackTrace) {
+    ClientLogger.e(
+      'Failed to capture or recover camera photo',
+      tag: 'AIChatScreen',
+      error: error,
+      stackTrace: stackTrace,
+    );
+    if (!mounted) return;
+    final fallback = AppLocalizations.of(context)!.attachmentCameraUnavailable;
+    _showLocalToast(
+      error is PlatformException ? error.message ?? fallback : fallback,
+    );
+  }
+
+  /// Streams captured photos after inspecting only a bounded image header.
+  Future<void> _handleCapturedPhotos(List<XFile> files) async {
+    final chatId = _currentChatId;
+    for (final file in files) {
+      if (!mounted || _currentChatId != chatId) return;
+      final header = await file.openRead(0, 32).first;
+      final mimeType =
+          lookupMimeType(file.name, headerBytes: header) ??
+          file.mimeType ??
+          'image/jpeg';
+      if (!mimeType.startsWith('image/')) {
+        throw StateError('Camera returned a non-image file');
+      }
+      final input = await SelectedFileInput.fromXFile(
+        file,
+        name:
+            'camera_${DateTime.now().microsecondsSinceEpoch}.${extensionFromMime(mimeType)}',
+        mimeType: mimeType,
+      );
+      await _viewModel.attachSelectedFile(
+        input,
+        expectedChatId: chatId,
+        isCancelled: () => !mounted || _currentChatId != chatId,
+      );
+    }
+    if (mounted) await _refreshAttachments();
+  }
+
+  Future<void> _handleTakePhoto() async {
+    if (_cameraRequestInFlight) return;
+    _cameraRequestInFlight = true;
+    try {
+      final file = await ImagePickerPlatform.instance.getImageFromSource(
+        source: ImageSource.camera,
+      );
+      if (mounted && file != null) {
+        await _handleCapturedPhotos([file]);
+      }
+    } catch (error, stackTrace) {
+      _reportCameraError(error, stackTrace);
+    } finally {
+      _cameraRequestInFlight = false;
+    }
+  }
+
+  /// Checks both chat identity and selection generation for one open presentation.
+  bool _isPluginAttachmentRequestCurrent(ChatAttachmentRequest request) {
+    return mounted &&
+        request.isCurrent(
+          currentChatId: _currentChatId,
+          requestedChatId: _requestedChatFlowChatId,
+          currentSelectionGeneration: _chatSelectionGeneration,
+          switching: _isPreparingChatSwitch,
+        );
+  }
+
+  /// Registers validated generic text or committed files for the requesting chat.
+  Future<void> _handlePluginAttachment(
+    Object? value,
+    String? expectedChatId,
+    ChatAttachmentRequest request,
+  ) async {
+    if (expectedChatId != request.chatId ||
+        !_isPluginAttachmentRequestCurrent(request)) {
+      throw StateError(
+        'The attachment presentation belongs to an expired chat selection.',
+      );
+    }
+    final attachment = ChatAttachmentResult.fromPresentationValue(value);
+    try {
+      switch (attachment) {
+        case ChatUiTextAttachment():
+          final bytes = Uint8List.fromList(utf8.encode(attachment.content));
+          await _viewModel.attachSelectedFile(
+            SelectedFileInput.fromStream(
+              name: attachment.name,
+              byteLength: bytes.length,
+              mimeType: attachment.mediaType,
+              stream: Stream<Uint8List>.value(bytes),
+            ),
+            expectedChatId: request.chatId,
+            isCancelled: () => !_isPluginAttachmentRequestCurrent(request),
+          );
+        case ChatUiFileAttachment():
+          await _viewModel.clients.chatRuntimeHolderMain.attachUploadedFile(
+            attachment: attachment.attachment,
+            expectedChatId: request.chatId,
+          );
+      }
+      if (_isPluginAttachmentRequestCurrent(request)) {
+        await _refreshAttachments();
+      }
+    } catch (error, stackTrace) {
+      ClientLogger.e(
+        'Failed to attach plugin contribution',
+        tag: 'AIChatScreen',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      rethrow;
+    }
+  }
+
+  /// Adds document context through the same draft attachment path as pasted text.
+  Future<void> _attachWorkspaceFileQuote(String fileName, String text) async {
+    final chatId = _currentChatId;
+    if (chatId == null) return;
+    final request = ChatAttachmentRequest(
+      chatId: chatId,
+      chatSelectionGeneration: _chatSelectionGeneration,
+    );
+    if (!_isPluginAttachmentRequestCurrent(request)) return;
+    final chinese = Localizations.localeOf(context).languageCode == 'zh';
+    final label = chinese
+        ? '额外信息 · 文档选区'
+        : 'Additional information · Document selection';
+    try {
+      await _viewModel.attachPastedText('$label: $fileName\n\n$text');
+      if (!_isPluginAttachmentRequestCurrent(request)) return;
+      final attachments = await _viewModel.attachments();
+      if (_isPluginAttachmentRequestCurrent(request)) {
+        _attachments = attachments;
+        _publishChatContentData();
+      }
+    } catch (error, stackTrace) {
+      ClientLogger.e(
+        'Failed to attach workspace selection',
+        tag: 'AIChatScreen',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      if (_isPluginAttachmentRequestCurrent(request)) {
+        _showLocalToast(
+          chinese ? '无法附加文档选区' : 'Could not attach the selection',
+        );
+      }
+    }
+  }
+
+  Future<void> _removeAttachment(String filePath) async {
+    await _viewModel.removeAttachment(filePath);
+    await _refreshAttachments();
+  }
+
+  void _previewAttachment(AttachmentInfo attachment) {
+    showDialog<void>(
+      context: context,
+      barrierColor: Colors.transparent,
+      builder: (dialogContext) => AttachmentViewerDialog(
+        visible: true,
+        attachment: ChatAttachment(
+          id: attachment.filePath,
+          filename: attachment.fileName,
+          mimeType: attachment.mimeType,
+          size: attachment.fileSize,
+          content: attachment.content,
+          path: attachment.vfsPath ?? attachment.filePath,
+          nodeId: attachment.nodeId,
+        ),
+        onDismiss: () => Navigator.of(dialogContext).pop(),
+      ),
+    );
+  }
+
+  void _watchToastEvent() {
+    _toastEventSubscription?.cancel();
+    _toastEventSubscription = _viewModel.watchToastEvent().listen(
+      (message) {
+        if (!mounted || message == null || message.trim().isEmpty) {
+          return;
+        }
+        _toastMessage = message;
+        _toastMessageNotifier.value = message;
+      },
+      onError: (Object error, StackTrace stackTrace) {
+        debugPrint('Failed to watch toast event: $error\n$stackTrace');
+      },
+    );
+  }
+
+  void _dismissToast() {
+    if (mounted) {
+      _toastMessage = null;
+      _toastMessageNotifier.value = null;
+    }
+    _viewModel.clearToastEvent().catchError((
+      Object error,
+      StackTrace stackTrace,
+    ) {
+      debugPrint('Failed to clear toast event: $error\n$stackTrace');
+    });
+  }
+
+  /// Opens the independent chat-scoped message and state streams for this surface.
+  void _watchChatFlows() {
+    _currentChatIdSubscription?.cancel();
+    _currentChatIdSubscription = _viewModel.watchCurrentChatId().listen(
+      _bindChatFlows,
+      onError: _handleChatFlowError,
+    );
+  }
+
+  /// Rebinds the two per-chat Core watches after the selected chat changes.
+  void _bindChatFlows(String? chatId) {
+    if (_hasBoundChatFlow && chatId == _requestedChatFlowChatId) {
+      return;
+    }
+    _hasBoundChatFlow = true;
+    _requestedChatFlowChatId = chatId;
+    IncomingAttachmentService.instance.clearComposer(this);
+    _chatSelectionGeneration += 1;
+    _clearChatFlowError();
+    final generation = ++_chatFlowBindingGeneration;
+    unawaited(_rebindChatFlows(chatId, generation));
+  }
+
+  /// Cancels the previous chat watches before opening the requested pair.
+  Future<void> _rebindChatFlows(String? chatId, int generation) async {
+    final transition = ChatSelectionTransition.requests.value;
+    final switchTimer = transition?.chatId == chatId
+        ? transition?.startedAt
+        : null;
+    var firstMessagesLogged = false;
+    var firstStateLogged = false;
+    final previousMessagesSubscription = _messagesSubscription;
+    final previousChatStateSubscription = _chatStateSubscription;
+    _messagesSubscription = null;
+    _chatStateSubscription = null;
+    // Native watch shutdown waits for the routed stream task to observe its
+    // close signal.  It must not delay opening the replacement chat watches.
+    if (previousMessagesSubscription != null) {
+      unawaited(
+        previousMessagesSubscription.cancel().catchError((Object error) {
+          ClientLogger.e(
+            'Failed to close previous chat message watch',
+            tag: 'AIChatScreen',
+            error: error,
+          );
+        }),
+      );
+    }
+    if (previousChatStateSubscription != null) {
+      unawaited(
+        previousChatStateSubscription.cancel().catchError((Object error) {
+          ClientLogger.e(
+            'Failed to close previous chat state watch',
+            tag: 'AIChatScreen',
+            error: error,
+          );
+        }),
+      );
+    }
+    if (!mounted || generation != _chatFlowBindingGeneration) {
+      return;
+    }
+    if (chatId == null || chatId.isEmpty) {
+      if (mounted && generation == _chatFlowBindingGeneration) {
+        _mutateChatContentData(() {
+          _clearChatFlowError();
+          _loading = false;
+          _messages.clear();
+          WorkspaceShell.session.pluginHostState = const {};
+          _currentChatId = null;
+          _inputProcessingState = core_proxy.InputProcessingState.idle();
+        });
+      }
+      return;
+    }
+    _messagesSubscription = _viewModel
+        .watchMessages(chatId)
+        .listen(
+          (messages) {
+            if (generation == _chatFlowBindingGeneration &&
+                _requestedChatFlowChatId == chatId) {
+              if (!firstMessagesLogged && switchTimer != null) {
+                firstMessagesLogged = true;
+                ClientLogger.v(
+                  'chat_switch.messages_received chatId=$chatId elapsedMs=${switchTimer.elapsedMilliseconds} count=${messages.length}',
+                  tag: 'ChatSwitchTrace',
+                  verboseLevel: VerboseLevel.level2,
+                );
+              }
+              _applyMessages(messages);
+            }
+          },
+          onError: (Object error, StackTrace stackTrace) {
+            _handleBoundChatFlowError(
+              error: error,
+              stackTrace: stackTrace,
+              chatId: chatId,
+              generation: generation,
+            );
+          },
+        );
+    _chatStateSubscription = _viewModel
+        .watchChatState(chatId)
+        .listen(
+          (state) {
+            if (generation == _chatFlowBindingGeneration &&
+                _requestedChatFlowChatId == chatId &&
+                state.currentChatId == chatId) {
+              if (!firstStateLogged && switchTimer != null) {
+                firstStateLogged = true;
+                ClientLogger.v(
+                  'chat_switch.state_received chatId=$chatId elapsedMs=${switchTimer.elapsedMilliseconds}',
+                  tag: 'ChatSwitchTrace',
+                  verboseLevel: VerboseLevel.level2,
+                );
+              }
+              _applyChatState(state);
+            }
+          },
+          onError: (Object error, StackTrace stackTrace) {
+            _handleBoundChatFlowError(
+              error: error,
+              stackTrace: stackTrace,
+              chatId: chatId,
+              generation: generation,
+            );
+          },
+        );
+  }
+
+  /// Applies a message-window change without changing chat execution state.
+  void _applyMessages(List<ChatUiMessage> messages) {
+    if (!mounted) {
+      return;
+    }
+    _messages
+      ..clear()
+      ..addAll(messages);
+    WorkspaceShell.session.pluginHostState = {
+      'chatId': _currentChatId,
+      'messages': [for (final message in messages) pluginMessageState(message)],
+    };
+    if (_selectedMessageTimestamps.isNotEmpty) {
+      final selectableTimestamps = messages
+          .where((message) {
+            final sender = message.sender;
+            return sender == 'user' || sender == 'ai';
+          })
+          .map((message) => message.timestamp)
+          .toSet();
+      _selectedMessageTimestamps = _selectedMessageTimestamps
+          .where(selectableTimestamps.contains)
+          .toSet();
+    }
+    _publishChatContentData();
+    _scheduleScrollToBottom();
+  }
+
+  /// Applies a locally requested visual transition before routed Core state arrives.
+  void _onChatSelectionTransition() {
+    final request = ChatSelectionTransition.requests.value;
+    if (request == null) {
+      if (_isPreparingChatSwitch) {
+        _pendingChatSwitchTargetId = null;
+        _mutateChatContentData(() {
+          _isPreparingChatSwitch = false;
+        });
+      }
+      _updateIncomingAttachmentReceiver();
+      return;
+    }
+    if (request.generation != _lastChatSelectionTransitionGeneration) {
+      _lastChatSelectionTransitionGeneration = request.generation;
+      _chatSelectionGeneration += 1;
+    }
+    if (request.chatId == _currentChatId && !_isPreparingChatSwitch) {
+      ChatSelectionTransition.complete(request.chatId);
+      return;
+    }
+    _pendingChatSwitchTargetId = request.chatId;
+    _setAutoScrollToBottom(true);
+    _mutateChatContentData(() {
+      _clearChatFlowError();
+      _isPreparingChatSwitch = true;
+      _isMultiSelectMode = false;
+      _selectedMessageTimestamps = const <int>{};
+    });
+    _updateIncomingAttachmentReceiver();
+  }
+
+  /// Applies one routed chat-state change without replacing the message window.
+  void _applyChatState(core_proxy.ChatState state) {
+    if (!mounted) {
+      return;
+    }
+    final chatChanged = _currentChatId != state.currentChatId;
+    final workspaceChanged =
+        _currentWorkspacePath != state.currentWorkspacePath ||
+        _currentFileDirectory != state.currentFileDirectory;
+    if (chatChanged) {
+      _saveCurrentInputDraft();
+      _currentChatId = state.currentChatId;
+      WorkspaceShell.session.pluginHostState = {
+        'chatId': state.currentChatId,
+        'messages': const <Object?>[],
+      };
+      _isMultiSelectMode = false;
+      _selectedMessageTimestamps = const <int>{};
+      _restoreInputDraftForChat(state.currentChatId);
+    }
+    _currentChatTitle = state.currentChatTitle;
+    if (chatChanged) {
+      _chatUiContext = null;
+      unawaited(_reloadChatUiContext());
+    }
+    _currentWorkspacePath = state.currentWorkspacePath;
+    _currentFileDirectory = state.currentFileDirectory;
+    final chatFlowErrorMessage = _chatFlowErrorMessage;
+    if (_chatFlowError != null) {
+      _loading = false;
+      _inputProcessingState = core_proxy.InputProcessingState.error(
+        message: chatFlowErrorMessage!,
+      );
+    } else {
+      _loading = state.isLoading;
+      _inputProcessingState = state.inputProcessingState;
+    }
+    _hasOlderDisplayHistory = state.hasOlderDisplayHistory;
+    _hasNewerDisplayHistory = state.hasNewerDisplayHistory;
+    _isLoadingDisplayWindow = state.isLoadingDisplayWindow;
+    _toolPermissionRequests = state.toolPermissionRequests;
+    if (_pendingChatSwitchTargetId == state.currentChatId) {
+      _pendingChatSwitchTargetId = null;
+      _isPreparingChatSwitch = false;
+      ChatSelectionTransition.complete(state.currentChatId);
+    }
+    _chatContentDataNotifier.value = _currentChatContentData(
+      pendingQueueMessages: state.pendingQueueMessages,
+      isPendingQueueExpanded: state.isPendingQueueExpanded,
+    );
+    _updateTopBarTitle();
+    if ((workspaceChanged || chatChanged) && mounted) {
+      setState(() {});
+      _updateTopBarActions();
+      _mainLayoutController?.refreshAttachment(owner: _mainLayoutOwner);
+    }
+    _syncPendingQueueAfterSnapshot();
+    _updateIncomingAttachmentReceiver();
+  }
+
+  /// Clears the terminal error owned by the active chat-flow binding.
+  void _clearChatFlowError() {
+    _chatFlowError = null;
+    _chatFlowErrorMessage = null;
+    _errorMessage = null;
+  }
+
+  /// Surfaces an unrecoverable routed-flow failure to this chat surface.
+  void _handleChatFlowError(Object error, StackTrace stackTrace) {
+    ClientLogger.e(
+      'chat routed flow failed',
+      tag: 'AIChatScreen',
+      error: error,
+      stackTrace: stackTrace,
+    );
+    if (!mounted) {
+      return;
+    }
+    final routePermissionDenied =
+        error is CoreLinkError && error.isRoutePermissionDenied;
+    final errorMessage = routePermissionDenied
+        ? AppLocalizations.of(context)!.chatRoutePermissionDenied(
+            error.targetNodeId!,
+            error.requiredCapability!,
+          )
+        : error is CoreLinkError
+        ? error.message
+        : error.toString();
+    _chatFlowError = error;
+    IncomingAttachmentService.instance.clearComposer(this);
+    _chatFlowErrorMessage = errorMessage;
+    _errorMessage = errorMessage;
+    _loading = false;
+    if (routePermissionDenied) {
+      _inputProcessingState = core_proxy.InputProcessingState.error(
+        message: errorMessage,
+      );
+    }
+    _publishChatContentData();
+  }
+
+  /// Surfaces an error only while its chat-flow binding remains current.
+  void _handleBoundChatFlowError({
+    required Object error,
+    required StackTrace stackTrace,
+    required String chatId,
+    required int generation,
+  }) {
+    if (!mounted ||
+        generation != _chatFlowBindingGeneration ||
+        _requestedChatFlowChatId != chatId) {
+      return;
+    }
+    _handleChatFlowError(error, stackTrace);
+  }
+
+  /// Sends one chat-scoped permission decision through the chat view model.
+  Future<void> _respondToToolPermission(
+    String chatId,
+    String requestId,
+    ChatToolPermissionResult result,
+  ) {
+    return _viewModel.respondToolPermissionRequest(
+      chatId: chatId,
+      requestId: requestId,
+      result: result,
+    );
+  }
+
+  void _sendMessage() {
+    unawaited(_sendMessageWithHooks(_BusyDraftSendMode.queue));
+  }
+
+  /// Guides the active turn with the current draft instead of queueing it.
+  void _guideMessage() {
+    unawaited(_sendMessageWithHooks(_BusyDraftSendMode.guide));
+  }
+
+  /// Explicitly cancels the active turn before sending the current draft.
+  void _interruptAndSendMessage() {
+    unawaited(_sendMessageWithHooks(_BusyDraftSendMode.interrupt));
+  }
+
+  /// Dispatches submit_requested before mutating the visible input field.
+  ///
+  /// Runs unawaited from [_sendMessage]; a failed hook dispatch or send must stay
+  /// visible as a toast instead of surfacing only as an uncaught zone error.
+  Future<void> _sendMessageWithHooks(_BusyDraftSendMode busyMode) async {
+    try {
+      await _sendMessageWithHooksInner(busyMode);
+    } catch (error, stackTrace) {
+      ClientLogger.e(
+        'Failed to send chat message',
+        tag: 'AIChatScreen',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      if (mounted) {
+        _showLocalToast(error.toString());
+      }
+    }
+  }
+
+  /// Applies the submit decision before changing the composer or starting a send.
+  Future<void> _sendMessageWithHooksInner(_BusyDraftSendMode busyMode) async {
+    final text = _messageController.text.trim();
+    final hasAttachments = _attachments.isNotEmpty;
+    if (text.isEmpty && !hasAttachments) {
+      return;
+    }
+    final wasQueueBlocked = _isQueueBlocked;
+    if (wasQueueBlocked &&
+        text.isNotEmpty &&
+        busyMode == _BusyDraftSendMode.queue) {
+      _clearMentionSuggestionState();
+      _enqueueDraftToPendingQueue();
+      return;
+    }
+    if (wasQueueBlocked && text.isEmpty) {
+      return;
+    }
+    if (busyMode == _BusyDraftSendMode.guide &&
+        (hasAttachments || _replyToMessage != null)) {
+      _showLocalToast(AppLocalizations.of(context)!.chatGuidanceTextOnly);
+      return;
+    }
+    if (_currentChatId == null || _currentChatId!.trim().isEmpty) {
+      _showLocalToast(AppLocalizations.of(context)!.chatPleaseCreateNewChat);
+      return;
+    }
+
+    final chatId = _currentChatId!;
+    final inputValue = _messageController.value;
+    final decision = await _viewModel.dispatchChatInputSubmitRequested(
+      chatId: chatId,
+      text: text,
+      selectionStart: inputValue.selection.start,
+      selectionEnd: inputValue.selection.end,
+      attachments: _attachments,
+      replyToMessageTimestamp: _replyToMessage?.timestamp,
+    );
+    if (!mounted || _currentChatId != chatId) {
+      return;
+    }
+    if (decision != null) {
+      final timeoutMessage = decision.message;
+      if (decision.timedOut && timeoutMessage != null) {
+        _showLocalToast(timeoutMessage);
+      }
+      if (decision.action == chatInputActionBlock ||
+          decision.action == chatInputActionConsume) {
+        if (decision.action == chatInputActionConsume && decision.clearInput) {
+          _clearMentionSuggestionState();
+          _messageController.clear();
+          await _viewModel.clearAttachments();
+          await _refreshAttachments();
+        }
+        final message = decision.message;
+        if (message != null && message.trim().isNotEmpty) {
+          _showLocalToast(message);
+        }
+        return;
+      }
+      if (decision.action == chatInputActionReplace) {
+        final updatedText = decision.text;
+        if (updatedText != null) {
+          _messageController.value = TextEditingValue(
+            text: updatedText,
+            selection: TextSelection.collapsed(offset: updatedText.length),
+          );
+        }
+      }
+    }
+
+    final submittedText = _messageController.text.trim();
+    if (busyMode == _BusyDraftSendMode.guide) {
+      if (submittedText.isEmpty) {
+        return;
+      }
+      await _viewModel.steerMessage(chatId: chatId, messageText: submittedText);
+      _clearSubmittedDraft(chatId, submittedText);
+      if (mounted && _currentChatId == chatId) {
+        _showLocalToast(AppLocalizations.of(context)!.chatGuidanceAccepted);
+      }
+      return;
+    }
+    if (busyMode == _BusyDraftSendMode.interrupt) {
+      await _viewModel.cancelMessage(chatId);
+    }
+    _clearMentionSuggestionState();
+    _messageController.clear();
+    _inputFocusNode.unfocus();
+    _startSendMessageText(submittedText, chatId);
+  }
+
+  /// Starts or stops local speech input from the chat action button.
+  Future<void> _toggleSpeechInput() async {
+    if (_isSpeechTranscribing) {
+      return;
+    }
+    try {
+      if (_isSpeechRecording) {
+        await _finishSpeechInput();
+      } else {
+        await _startSpeechInput();
+      }
+    } catch (error, stackTrace) {
+      ClientLogger.e(
+        'speech input failed',
+        tag: _localSttLogTag,
+        error: error,
+        stackTrace: stackTrace,
+      );
+      if (!mounted) {
+        return;
+      }
+      _mutateChatContentData(() {
+        _isSpeechRecording = false;
+        _isSpeechTranscribing = false;
+      });
+      _showLocalToast(
+        AppLocalizations.of(context)!.chatSpeechInputFailed('$error'),
+      );
+    }
+  }
+
+  /// Starts one WAV recording after validating the selected STT provider config.
+  Future<void> _startSpeechInput() async {
+    final selectedConfigId = await _viewModel
+        .clients
+        .preferencesSttConfigManager
+        .getSelectedSttConfigId();
+    if (!mounted) {
+      return;
+    }
+    if (selectedConfigId == null) {
+      _showLocalToast(
+        AppLocalizations.of(context)!.chatSpeechInputConfigurationRequired,
+      );
+      return;
+    }
+    await _speechRecorder.start();
+    if (!mounted) {
+      return;
+    }
+    _mutateChatContentData(() {
+      _isSpeechRecording = true;
+    });
+  }
+
+  /// Stops recording, transcribes its bytes, and updates the current draft.
+  Future<void> _finishSpeechInput() async {
+    _mutateChatContentData(() {
+      _isSpeechRecording = false;
+      _isSpeechTranscribing = true;
+    });
+    final recordedAudio = await _speechRecorder.stop();
+    try {
+      final response = await _viewModel.clients.servicesSttRecognitionService
+          .transcribeCurrent(
+            audioBytes: recordedAudio.bytes,
+            fileName: recordedAudio.fileName,
+            contentType: recordedAudio.contentType,
+            language: null,
+          );
+      final text = response.text.trim();
+      if (text.isEmpty) {
+        if (mounted) {
+          _showLocalToast(
+            AppLocalizations.of(context)!.chatSpeechNoTextRecognized,
+          );
+        }
+        return;
+      }
+      _messageController.value = TextEditingValue(
+        text: text,
+        selection: TextSelection.collapsed(offset: text.length),
+      );
+      _inputFocusNode.requestFocus();
+    } finally {
+      if (mounted) {
+        _mutateChatContentData(() {
+          _isSpeechTranscribing = false;
+        });
+      }
+    }
+  }
+
+  /// Starts one send while retaining the chat id that accepted the submit hook.
+  void _startSendMessageText(String text, String chatId) {
+    if (_currentChatId != chatId) {
+      return;
+    }
+    _clearChatFlowError();
+    _mutateChatContentData(() {
+      _autoScrollToBottom = true;
+      _autoScrollToBottomNotifier.value = true;
+      _loading = true;
+      _inputProcessingState = core_proxy.InputProcessingState.processing(
+        message: 'message_processing',
+      );
+    });
+    _scheduleScrollToBottom();
+    _sendMessageAfterNextFrame(text, chatId);
+  }
+
+  /// Requests the latest display window before ChatArea follows layout growth.
+  void _scheduleScrollToBottom() {
+    if (!_autoScrollToBottom) {
+      return;
+    }
+    if (_hasNewerDisplayHistory && !_isLoadingDisplayWindow) {
+      unawaited(
+        _viewModel.showLatestMessagesForCurrentChat().catchError((
+          Object error,
+          StackTrace stackTrace,
+        ) {
+          debugPrint('Failed to show latest messages: $error\n$stackTrace');
+        }),
+      );
+      return;
+    }
+  }
+
+  /// Sends the submitted text after layout has accepted the optimistic UI state.
+  void _sendMessageAfterNextFrame(String text, String chatId) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+      _viewModel
+          .sendUserMessage(
+            text,
+            replyToMessage: _replyToMessage,
+            chatIdOverride: chatId,
+          )
+          .then((_) async {
+            if (!mounted || _currentChatId != chatId) {
+              return null;
+            }
+            _replyToMessage = null;
+            await _refreshAttachments();
+            return null;
+          })
+          .catchError((Object error, StackTrace stackTrace) {
+            debugPrint('Failed to send chat message: $error\n$stackTrace');
+            if (!mounted) {
+              return null;
+            }
+            if (_currentChatId != chatId) {
+              return null;
+            }
+            _mutateChatContentData(() {
+              _errorMessage = error.toString();
+              _loading = false;
+              _inputProcessingState = core_proxy.InputProcessingState.error(
+                message: error.toString(),
+              );
+            });
+            return null;
+          });
+    });
+  }
+
+  /// Cancels the active turn for the selected chat.
+  void _cancelMessage() {
+    final chatId = _currentChatId;
+    if (chatId == null ||
+        _isPreparingChatSwitch ||
+        _requestedChatFlowChatId != chatId) {
+      return;
+    }
+    _viewModel.cancelMessage(chatId).catchError((
+      Object error,
+      StackTrace stackTrace,
+    ) {
+      debugPrint('Failed to cancel chat message: $error\n$stackTrace');
+    });
+  }
+
+  void _setAutoScrollToBottom(bool value) {
+    if (_autoScrollToBottom == value) {
+      return;
+    }
+    _autoScrollToBottom = value;
+    _autoScrollToBottomNotifier.value = value;
+  }
+
+  /// Reads the complete lightweight message index independently of the transcript window.
+  Future<List<ChatMessageLocatorPreview>> _loadMessageLocatorEntries(
+    String chatId,
+    String query,
+  ) {
+    return _viewModel.loadChatMessageLocatorPreviews(chatId, query);
+  }
+
+  Future<void> _setMessageFavorite(int timestamp, bool isFavorite) async {
+    await _viewModel.setMessageFavorite(timestamp, isFavorite);
+  }
+
+  /// Returns the active chat identifier for a message action.
+  String? _activeChatIdForMessageAction() {
+    final chatId = _currentChatId;
+    if (chatId == null || chatId.trim().isEmpty) {
+      return null;
+    }
+    return chatId;
+  }
+
+  /// Deletes one message identified by its stable timestamp.
+  Future<void> _deleteMessage(int messageTimestamp) async {
+    final chatId = _activeChatIdForMessageAction();
+    if (chatId == null) {
+      return;
+    }
+    await _viewModel.deleteMessage(chatId, messageTimestamp);
+  }
+
+  /// Deletes the selected message and all following messages in one chat.
+  Future<bool> _deleteMessagesFrom(int messageTimestamp) async {
+    final chatId = _activeChatIdForMessageAction();
+    if (chatId == null) {
+      return false;
+    }
+    return _viewModel.deleteMessagesFrom(chatId, messageTimestamp);
+  }
+
+  Future<void> _deleteMessageVariant(int timestamp, int variantIndex) async {
+    await _viewModel.deleteMessageVariant(timestamp, variantIndex);
+  }
+
+  /// Selects the displayed response variant for a message.
+  Future<void> _selectMessageVariant(
+    int timestamp,
+    int selectedVariantIndex,
+  ) async {
+    await _viewModel.selectMessageVariant(timestamp, selectedVariantIndex);
+  }
+
+  /// Requests a workspace rollback anchored to a message timestamp.
+  void _requestRollbackToMessage(int messageTimestamp) {
+    final chatId = _activeChatIdForMessageAction();
+    if (chatId == null) {
+      return;
+    }
+    _showWorkspaceChangeConfirm(
+      mode: WorkspaceChangeConfirmMode.rollback,
+      chatId: chatId,
+      messageTimestamp: messageTimestamp,
+      onConfirm: () async {
+        final draftText = await _viewModel.rollbackToMessage(
+          chatId,
+          messageTimestamp,
+        );
+        if (draftText != null && mounted) {
+          _messageController.value = TextEditingValue(
+            text: draftText,
+            selection: TextSelection.collapsed(offset: draftText.length),
+          );
+          _inputFocusNode.requestFocus();
+        }
+      },
+    );
+  }
+
+  /// Opens the editor for a message identified by its timestamp.
+  void _selectMessageToEdit(ChatUiMessage message) {
+    final chatId = _activeChatIdForMessageAction();
+    if (chatId == null) {
+      return;
+    }
+    showDialog<void>(
+      context: context,
+      builder: (context) {
+        return MessageEditorDialog(
+          initialText: message.editableText,
+          showResendButton: message.sender == 'user',
+          onSave: (content) async {
+            await _viewModel.updateMessage(chatId, message.timestamp, content);
+          },
+          onResend: (content) async {
+            if (_currentWorkspacePath != null &&
+                _currentWorkspacePath!.trim().isNotEmpty) {
+              await _showWorkspaceChangeConfirm(
+                mode: WorkspaceChangeConfirmMode.editAndResend,
+                chatId: chatId,
+                messageTimestamp: message.timestamp,
+                onConfirm: () async {
+                  await _viewModel.rewindAndResendMessage(
+                    chatId,
+                    message.timestamp,
+                    content,
+                  );
+                },
+              );
+            } else {
+              await _viewModel.rewindAndResendMessage(
+                chatId,
+                message.timestamp,
+                content,
+              );
+            }
+          },
+        );
+      },
+    );
+  }
+
+  Future<void> _showWorkspaceChangeConfirm({
+    required WorkspaceChangeConfirmMode mode,
+    required String chatId,
+    required int messageTimestamp,
+    required Future<void> Function() onConfirm,
+  }) async {
+    final changes = await _viewModel.previewWorkspaceChangesForMessage(
+      chatId,
+      messageTimestamp,
+    );
+    if (!mounted) {
+      return;
+    }
+    if (changes == null) {
+      await showDialog<void>(
+        context: context,
+        builder: (context) {
+          return AlertDialog(
+            title: Text(
+              mode == WorkspaceChangeConfirmMode.rollback ? '无法回滚' : '无法编辑并重发',
+            ),
+            content: const Text('仅支持恢复最近一轮工作区改动；该消息的快照已被后续改动覆盖，请使用 Git 处理文件。'),
+            actions: <Widget>[
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(),
+                child: const Text('知道了'),
+              ),
+            ],
+          );
+        },
+      );
+      return;
+    }
+    await showDialog<void>(
+      context: context,
+      builder: (context) {
+        return WorkspaceChangeConfirmDialog(
+          mode: mode,
+          changes: changes,
+          onConfirm: onConfirm,
+        );
+      },
+    );
+  }
+
+  /// Regenerates one AI message identified by its timestamp.
+  Future<void> _regenerateMessage(int messageTimestamp) async {
+    final chatId = _activeChatIdForMessageAction();
+    if (chatId == null) {
+      return;
+    }
+    if (_isQueueBlocked || _regeneratingChatIds.contains(chatId)) {
+      _showLocalToast('当前对话正在处理，请结束后再重新生成');
+      return;
+    }
+    _regeneratingChatIds.add(chatId);
+    try {
+      await _viewModel.regenerateSingleAiMessage(chatId, messageTimestamp);
+    } finally {
+      _regeneratingChatIds.remove(chatId);
+    }
+  }
+
+  void _insertSummary(ChatUiMessage message) {
+    unawaited(
+      _viewModel.insertSummary(message).catchError((
+        Object error,
+        StackTrace stackTrace,
+      ) {
+        debugPrint('Failed to insert summary: $error\n$stackTrace');
+        _showLocalToast('插入总结失败：$error');
+        return false;
+      }),
+    );
+  }
+
+  Future<void> _createBranch(int timestamp) async {
+    await _viewModel.createBranch(timestamp);
+  }
+
+  void _replyToMessageTarget(ChatUiMessage message) {
+    _mutateChatContentData(() {
+      _replyToMessage = message;
+    });
+    _inputFocusNode.requestFocus();
+  }
+
+  /// Starts multi-select mode with one message timestamp selected.
+  void _toggleMultiSelectMode(int messageTimestamp) {
+    _mutateChatContentData(() {
+      _isMultiSelectMode = true;
+      _selectedMessageTimestamps = <int>{messageTimestamp};
+    });
+  }
+
+  /// Toggles one message timestamp in the current selection.
+  void _toggleMessageSelection(int messageTimestamp) {
+    _mutateChatContentData(() {
+      final next = Set<int>.of(_selectedMessageTimestamps);
+      if (next.contains(messageTimestamp)) {
+        next.remove(messageTimestamp);
+      } else {
+        next.add(messageTimestamp);
+      }
+      _selectedMessageTimestamps = next;
+    });
+  }
+
+  void _exitMultiSelectMode() {
+    _mutateChatContentData(() {
+      _isMultiSelectMode = false;
+      _selectedMessageTimestamps = const <int>{};
+    });
+  }
+
+  void _clearMessageSelection() {
+    _mutateChatContentData(() {
+      _selectedMessageTimestamps = const <int>{};
+    });
+  }
+
+  void _selectAllMessages() {
+    _mutateChatContentData(() {
+      _isMultiSelectMode = true;
+      _selectedMessageTimestamps = _messages
+          .where((message) {
+            final sender = message.sender;
+            return sender == 'user' || sender == 'ai';
+          })
+          .map((message) => message.timestamp)
+          .toSet();
+    });
+  }
+
+  Future<void> _deleteSelectedMessages() async {
+    final messageTimestamps = Set<int>.of(_selectedMessageTimestamps);
+    if (messageTimestamps.isEmpty) {
+      return;
+    }
+    final chatId = _activeChatIdForMessageAction();
+    if (chatId == null) {
+      return;
+    }
+    await _viewModel.deleteMessages(chatId, messageTimestamps);
+    _exitMultiSelectMode();
+  }
+
+  Future<void> _loadOlderDisplayWindow() async {
+    await _viewModel.loadOlderMessagesForCurrentChat();
+  }
+
+  Future<void> _loadNewerDisplayWindow() async {
+    await _viewModel.loadNewerMessagesForCurrentChat();
+  }
+
+  Future<void> _showLatestDisplayWindow() async {
+    await _viewModel.showLatestMessagesForCurrentChat();
+  }
+
+  /// Requests display context after a durable plugin or package catalog change.
+  void _requestChatUiContextRefresh() {
+    unawaited(_reloadChatUiContext());
+  }
+
+  /// Loads the actual current chat profile without interpreting plugin bindings.
+  Future<void> _reloadChatUiContext() async {
+    final generation = ++_chatUiContextGeneration;
+    final chatId = _currentChatId;
+    try {
+      final next = await ToolPkgChatUiCatalog(
+        clients: _viewModel.clients,
+      ).loadContext(chatId: chatId);
+      if (!mounted ||
+          generation != _chatUiContextGeneration ||
+          chatId != _currentChatId) {
+        return;
+      }
+      _mutateChatContentData(() => _chatUiContext = next);
+      _updateTopBarTitle();
+    } catch (error, stackTrace) {
+      if (!mounted || generation != _chatUiContextGeneration) return;
+      _mutateChatContentData(() => _chatUiContext = null);
+      ClientLogger.e(
+        'Failed to load registered chat UI context',
+        tag: 'AIChatScreen',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      _showLocalToast(error.toString());
+    }
+  }
+
+  /// Opens only the plugin-provided avatar preview, not the application title.
+  Future<void> _showChatAvatarPreview() async {
+    final action = _chatUiContext?.avatarAction;
+    if (action == null) return;
+    try {
+      final result = await showEmbeddedContributionDialog(
+        route: action.route,
+        input: action.input,
+        context: context,
+        clients: _viewModel.clients,
+        hostState: <String, Object?>{'chatId': _currentChatId},
+      );
+      if (mounted &&
+          result?.status == ContributionPresentationStatus.completed) {
+        // Preview completion may update display data; registered routes stay valid.
+        _requestChatUiContextRefresh();
+      }
+    } catch (error) {
+      if (mounted) _showLocalToast(error.toString());
+    }
+  }
+
+  String? _getBoundWorkspaceName() {
+    final path = _currentWorkspacePath?.trim();
+    if (path == null || path.isEmpty) {
+      return null;
+    }
+    for (final ws in _workspaces) {
+      final name = ws.name.trim();
+      if (name.isEmpty) continue;
+      for (final folder in ws.folders) {
+        final fPath = folder.path.trim();
+        if (fPath == path ||
+            path.startsWith('$fPath/') ||
+            path.startsWith('$fPath\\')) {
+          return name;
+        }
+      }
+    }
+    final normalized = path.replaceAll('\\', '/');
+    final segments = normalized
+        .split('/')
+        .where((s) => s.trim().isNotEmpty)
+        .toList();
+    if (segments.isNotEmpty) {
+      return segments.last.trim();
+    }
+    return path;
+  }
+
+  /// Publishes a display-only application/chat title, without a tap target.
+  void _updateTopBarTitle() {
+    final controller = _topBarController;
+    if (controller == null || !_isCurrentMainScreen) {
+      return;
+    }
+    final workspaceName = _getBoundWorkspaceName();
+    final chatTitle = _currentChatTitle.trim();
+
+    final String primaryText;
+    final String secondaryText;
+    if (workspaceName != null && workspaceName.isNotEmpty) {
+      primaryText = workspaceName;
+      secondaryText = chatTitle;
+    } else {
+      primaryText = chatTitle.isNotEmpty ? chatTitle : 'New Chat';
+      secondaryText = '';
+    }
+
+    controller.setTitleContent(
+      TopBarTitleContent((context) {
+        return TopBarTitleText(
+          primaryText: primaryText,
+          secondaryText: secondaryText,
+          contentColor: Theme.of(context).colorScheme.onSurface,
+        );
+      }),
+      owner: _topBarTitleOwner,
+    );
+  }
+
+  void _updateTopBarActions() {
+    final controller = _topBarController;
+    if (controller == null || !_isCurrentMainScreen) {
+      return;
+    }
+    controller.setActions((context) {
+      return <Widget>[
+        ChatContextStatsTopBarButton(
+          viewModel: _viewModel,
+          currentChatId: _currentChatId,
+        ),
+        WorkspaceTopBarButton(
+          open: _workspaceOpen,
+          hasBoundWorkspace: _currentWorkspacePath?.trim().isNotEmpty == true,
+          onPressed: _toggleWorkspace,
+        ),
+      ];
+    }, owner: _topBarActionsOwner);
+  }
+
+  void _scheduleTopBarActionsUpdate() {
+    if (_topBarActionsUpdateScheduled) {
+      return;
+    }
+    _topBarActionsUpdateScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _topBarActionsUpdateScheduled = false;
+      if (!mounted) {
+        return;
+      }
+      _updateTopBarActions();
+    });
+  }
+
+  void _toggleWorkspace() {
+    _setWorkspaceOpen(!_workspaceOpen);
+  }
+
+  void _setWorkspaceOpen(bool value) {
+    if (_workspaceOpen == value) {
+      return;
+    }
+    setState(() {
+      _workspaceOpen = value;
+      _chatWorkspaceOpen = value;
+    });
+    _updateTopBarActions();
+    _mainLayoutController?.refreshAttachment(owner: _mainLayoutOwner);
+  }
+
+  /// Opens the side workspace for an external request from the active layout.
+  void _openWorkspace() {
+    _setWorkspaceOpen(true);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (widget.embedded) {
+      return ChatRuntimeScope(
+        chatCore: _viewModel.chatCore,
+        chatId: _currentChatId,
+        child: _buildChatContent(),
+      );
+    }
+    _isCurrentMainScreen = MainScreenActivityScope.isCurrentScreenOf(context);
+    _syncWorkspaceMainLayoutAttachment(_isCurrentMainScreen);
+    if (_isCurrentMainScreen &&
+        MediaQuery.sizeOf(context).width < workspaceTabletBreakpoint) {
+      _mainLayoutController?.setWorkspaceDockDestination(
+        _openWorkspace,
+        owner: _mainLayoutOwner,
+      );
+    } else {
+      _mainLayoutController?.clearWorkspaceDockDestination(
+        owner: _mainLayoutOwner,
+      );
+    }
+    return ChatRuntimeScope(
+      chatCore: _viewModel.chatCore,
+      chatId: _currentChatId,
+      child: _buildChatContent(),
+    );
+  }
+
+  /// Builds the active mention suggestion panel for the current input value.
+  Widget? _buildMentionSuggestionPanel() {
+    final triggerChar = _mentionSuggestionTriggerChar;
+    if (!_showMentionSuggestionPanel || triggerChar == null) {
+      return null;
+    }
+    return MentionSuggestionPanel(
+      viewModel: _viewModel,
+      searchQuery: _mentionSearchQuery,
+      triggerChar: triggerChar,
+      hasBoundWorkspace: _currentWorkspacePath?.trim().isNotEmpty == true,
+      onPackageSelected: (packageName) {
+        unawaited(
+          _selectMentionPackage(packageName).catchError((
+            Object error,
+            StackTrace stackTrace,
+          ) {
+            ClientLogger.e(
+              'Failed to select mention package',
+              tag: 'AIChatScreen',
+              error: error,
+              stackTrace: stackTrace,
+            );
+          }),
+        );
+      },
+      onFileSelected: (relativePath) {
+        unawaited(
+          _selectMentionWorkspaceEntry(relativePath).catchError((
+            Object error,
+            StackTrace stackTrace,
+          ) {
+            ClientLogger.e(
+              'Failed to select mention workspace entry',
+              tag: 'AIChatScreen',
+              error: error,
+              stackTrace: stackTrace,
+            );
+          }),
+        );
+      },
+    );
+  }
+
+  /// Builds the chat content with the current message input overlays.
+  Widget _buildChatContent() {
+    return ValueListenableBuilder<_ChatContentData>(
+      valueListenable: _chatContentDataNotifier,
+      builder: (context, data, _) {
+        final attachmentRequest = ChatAttachmentRequest(
+          chatId: data.currentChatId,
+          chatSelectionGeneration: _chatSelectionGeneration,
+        );
+        final content = ChatScreenContent(
+          showInput: widget.showInput,
+          messages: data.messages,
+          loading: data.loading,
+          errorMessage: data.errorMessage,
+          messageController: _messageController,
+          inputFocusNode: _inputFocusNode,
+          scrollController: _scrollController,
+          inputProcessingState: data.inputProcessingState,
+          mentionSuggestionPanel: _buildMentionSuggestionPanel(),
+          viewModel: _viewModel,
+          currentChatId: data.currentChatId,
+          fileDirectory: _currentFileDirectory,
+          chatIdentity: data.chatUiContext?.identity,
+          backgroundUri: data.chatUiContext?.backgroundUri,
+          onIdentityTap: data.chatUiContext?.avatarAction == null
+              ? null
+              : _showChatAvatarPreview,
+          autoScrollToBottomListenable: _autoScrollToBottomNotifier,
+          hasOlderDisplayHistory: data.hasOlderDisplayHistory,
+          hasNewerDisplayHistory: data.hasNewerDisplayHistory,
+          isLoadingDisplayWindow: data.isLoadingDisplayWindow,
+          messageNavigation: _messageNavigation,
+          loadLocatorEntries: _loadMessageLocatorEntries,
+          onRevealMessageForLocator: _viewModel.revealMessageForCurrentChat,
+          onAutoScrollToBottomChanged: _setAutoScrollToBottom,
+          onLoadOlderDisplayWindow: _loadOlderDisplayWindow,
+          onLoadNewerDisplayWindow: _loadNewerDisplayWindow,
+          onShowLatestDisplayWindow: _showLatestDisplayWindow,
+          onToggleFavoriteMessage: _setMessageFavorite,
+          onDeleteMessage: _deleteMessage,
+          onDeleteMessagesFrom: _deleteMessagesFrom,
+          onDeleteMessageVariant: _deleteMessageVariant,
+          onSelectMessageVariant: _selectMessageVariant,
+          onRollbackToMessage: _requestRollbackToMessage,
+          onSelectMessageToEdit: _selectMessageToEdit,
+          onRegenerateMessage: _regenerateMessage,
+          onInsertSummary: _insertSummary,
+          onCreateBranch: _createBranch,
+          onReplyToMessage: _replyToMessageTarget,
+          onToggleMultiSelectMode: _toggleMultiSelectMode,
+          onToggleMessageSelection: _toggleMessageSelection,
+          onExitMultiSelectMode: _exitMultiSelectMode,
+          onSelectAllMessages: _selectAllMessages,
+          onClearMessageSelection: _clearMessageSelection,
+          onDeleteSelectedMessages: _deleteSelectedMessages,
+          onRefreshRequested: _viewModel.showLatestMessagesForCurrentChat,
+          isMultiSelectMode: data.isMultiSelectMode,
+          selectedMessageTimestamps: data.selectedMessageTimestamps,
+          isPreparingChatSwitch: data.isPreparingChatSwitch,
+          isSpeechRecording: data.isSpeechRecording,
+          isSpeechTranscribing: data.isSpeechTranscribing,
+          onSpeechInput: _toggleSpeechInput,
+          onSendMessage: _sendMessage,
+          onQueueMessage: _enqueueDraftToPendingQueue,
+          onGuideMessage: _guideMessage,
+          onInterruptAndSendMessage: _interruptAndSendMessage,
+          onCancelMessage: _cancelMessage,
+          pendingQueueMessages: data.pendingQueueMessages,
+          isPendingQueueExpanded: data.isPendingQueueExpanded,
+          toolPermissionRequests: data.toolPermissionRequests,
+          onToolPermissionDecision: _respondToToolPermission,
+          onPendingQueueExpandedChange: _setPendingQueueExpanded,
+          onDeletePendingQueueMessage: _deletePendingQueueMessage,
+          onEditPendingQueueMessage: _editPendingQueueMessage,
+          onSendPendingQueueMessage: _sendPendingQueueMessage,
+          onGuidePendingQueueMessage: _guidePendingQueueMessage,
+          attachments: data.attachments,
+          onAttachImage: () => _runAttachmentAction(_handleAttachImage),
+          onTakePhoto:
+              ImagePickerPlatform.instance.supportsImageSource(
+                ImageSource.camera,
+              )
+              ? _handleTakePhoto
+              : null,
+          onPluginAttachment: (value, expectedChatId) =>
+              _handlePluginAttachment(value, expectedChatId, attachmentRequest),
+          onAttachFile: () => _runAttachmentAction(_handleAttachFile),
+          onAttachFiles: (paths) {
+            _handleAttachmentPaths(paths).catchError((
+              Object error,
+              StackTrace stackTrace,
+            ) {
+              debugPrint('Failed to attach dropped files: $error\n$stackTrace');
+              return null;
+            });
+          },
+          onPasteImages: (images) {
+            _handlePastedImages(images).catchError((
+              Object error,
+              StackTrace stackTrace,
+            ) {
+              debugPrint('Failed to attach pasted images: $error\n$stackTrace');
+              return null;
+            });
+          },
+          onAttachScreenContent:
+              _hasAttachmentHostCapability('screen.capture') &&
+                  _hasAttachmentHostCapability('ocr.recognition')
+              ? () => _runAttachmentAction(
+                  () => _handleSpecialAttachment('screen_capture'),
+                )
+              : null,
+          onAttachNotifications:
+              _hasAttachmentHostCapability('system.notifications.read')
+              ? () => _runAttachmentAction(
+                  () => _handleSpecialAttachment('notifications_capture'),
+                )
+              : null,
+          onAttachLocation: _hasAttachmentHostCapability('system.location')
+              ? () => _runAttachmentAction(
+                  () => _handleSpecialAttachment('location_capture'),
+                )
+              : null,
+          onAttachPackage: (packageName) {
+            _handleAttachPackage(packageName).catchError((
+              Object error,
+              StackTrace stackTrace,
+            ) {
+              debugPrint('Failed to attach package: $error\n$stackTrace');
+              return null;
+            });
+          },
+          onRemoveAttachment: (filePath) {
+            _removeAttachment(filePath).catchError((
+              Object error,
+              StackTrace stackTrace,
+            ) {
+              debugPrint('Failed to remove attachment: $error\n$stackTrace');
+              return null;
+            });
+          },
+          onPreviewAttachment: _previewAttachment,
+          toastMessageListenable: _toastMessageNotifier,
+          onDismissToast: _dismissToast,
+        );
+        return ChatMessageLocatorHost(
+          currentChatId: data.currentChatId,
+          navigation: _messageNavigation,
+          loadEntries: _loadMessageLocatorEntries,
+          onToggleFavorite: _setMessageFavorite,
+          acceptsSidebarRequests: !widget.embedded && _isCurrentMainScreen,
+          child: content,
+        );
+      },
+    );
+  }
+
+  Widget _buildWorkspaceMainLayoutAttachment(
+    BuildContext context,
+    Widget child,
+  ) {
+    return WorkspaceShell(
+      workspaceOpen: _workspaceOpen,
+      onWorkspaceOpenChanged: _setWorkspaceOpen,
+      currentChatId: _currentChatId,
+      hasBoundWorkspace: _currentWorkspacePath?.trim().isNotEmpty == true,
+      workspacePath: _currentWorkspacePath,
+      fileDirectory: _currentFileDirectory,
+      chatCore: _viewModel.chatCore,
+      onListWorkspaceFiles: _viewModel.listWorkspaceFiles,
+      onMutateWorkspaceFile: _viewModel.mutateWorkspaceFile,
+      onListWorkspaceBindingDirectories:
+          _viewModel.listWorkspaceBindingDirectories,
+      onReadWorkspaceTextFile: _viewModel.readWorkspaceTextFile,
+      onReadWorkspaceFileBytes: _viewModel.readWorkspaceFileBytes,
+      onWriteWorkspaceFileBytes: _viewModel.writeWorkspaceFileBytes,
+      onOpenWorkspaceFile: _viewModel.openWorkspaceFile,
+      onCreateWorkspace: _createWorkspace,
+      onBindWorkspace: _bindWorkspace,
+      onUnbindWorkspace: _unbindWorkspace,
+      onFileQuote: _attachWorkspaceFileQuote,
+      child: child,
+    );
+  }
+
+  void _syncWorkspaceMainLayoutAttachment(bool active) {
+    final controller = _mainLayoutController;
+    if (controller == null) {
+      return;
+    }
+    if (active) {
+      controller.setAttachment(
+        _workspaceMainLayoutAttachment,
+        owner: _mainLayoutOwner,
+      );
+      return;
+    }
+    controller.clearAttachment(owner: _mainLayoutOwner);
+  }
+
+  void _mutateChatContentData(VoidCallback mutate) {
+    mutate();
+    _publishChatContentData();
+  }
+
+  void _publishChatContentData() {
+    final previousContentData = _chatContentDataNotifier.value;
+    _chatContentDataNotifier.value = _currentChatContentData(
+      pendingQueueMessages: previousContentData.pendingQueueMessages,
+      isPendingQueueExpanded: previousContentData.isPendingQueueExpanded,
+    );
+  }
+
+  _ChatContentData _currentChatContentData({
+    List<PendingQueueMessageItem> pendingQueueMessages =
+        const <PendingQueueMessageItem>[],
+    bool isPendingQueueExpanded = true,
+  }) {
+    return _ChatContentData(
+      messages: List<ChatUiMessage>.unmodifiable(_messages),
+      loading: _loading,
+      errorMessage: _errorMessage,
+      inputProcessingState: _inputProcessingState,
+      currentChatId: _currentChatId,
+      hasOlderDisplayHistory: _hasOlderDisplayHistory,
+      hasNewerDisplayHistory: _hasNewerDisplayHistory,
+      isLoadingDisplayWindow: _isLoadingDisplayWindow,
+      isMultiSelectMode: _isMultiSelectMode,
+      selectedMessageTimestamps: _selectedMessageTimestamps,
+      chatUiContext: _chatUiContext,
+      isPreparingChatSwitch: _isPreparingChatSwitch,
+      pendingQueueMessages: List<PendingQueueMessageItem>.unmodifiable(
+        pendingQueueMessages,
+      ),
+      isPendingQueueExpanded: isPendingQueueExpanded,
+      toolPermissionRequests:
+          List<
+            core_proxy.RuntimeHostInteractionToolPermissionRequest
+          >.unmodifiable(_toolPermissionRequests),
+      attachments: List<AttachmentInfo>.unmodifiable(_attachments),
+      isSpeechRecording: _isSpeechRecording,
+      isSpeechTranscribing: _isSpeechTranscribing,
+    );
+  }
+
+  Future<void> _createWorkspace(String name) async {
+    final chatId = _currentChatId;
+    if (chatId == null) {
+      throw StateError('No current chat');
+    }
+    await _viewModel.createAndBindWorkspace(chatId, name);
+  }
+
+  Future<void> _unbindWorkspace() async {
+    final chatId = _currentChatId;
+    if (chatId == null) {
+      throw StateError('No current chat');
+    }
+    await _viewModel.unbindChatFromWorkspace(chatId);
+  }
+
+  Future<void> _bindWorkspace(String workspace) async {
+    final chatId = _currentChatId;
+    if (chatId == null) {
+      throw StateError('No current chat');
+    }
+    await _viewModel.bindChatToWorkspace(chatId, workspace);
+  }
+}

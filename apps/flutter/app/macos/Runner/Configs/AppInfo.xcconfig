@@ -1,0 +1,29 @@
+// Application-level settings for the Runner target.
+//
+// This may be replaced with something auto-generated from metadata (e.g., pubspec.yaml) in the
+// future. If not, the values below would default to using the project name when this becomes a
+// 'flutter create' template.
+
+// The application's name. By default this is also the title of the Flutter window.
+PRODUCT_NAME = Operit2
+
+// The application's bundle identifier
+PRODUCT_BUNDLE_IDENTIFIER = com.ai.assistance.operit2
+
+// The copyright displayed in application information
+PRODUCT_COPYRIGHT = Copyright © 2026 app.operit. All rights reserved.
+
+OPERIT_CODE_SIGN_STYLE = Automatic
+
+// Optional developer-local identity; keep certificate references out of source control.
+// Without this file, retain Flutter's existing ad-hoc signing behavior.
+#include? "Signing.local.xcconfig"
+
+// Direct Flutter / VS Code runs use the unrestricted desktop distribution.
+// Release scripts override only OPERIT_MACOS_TYPE for their selected package.
+OPERIT_MACOS_TYPE = unsandbox
+OPERIT_MACOS_ENTITLEMENTS_sandbox = Runner/$(OPERIT_MACOS_ENTITLEMENTS_FILE)
+OPERIT_MACOS_ENTITLEMENTS_unsandbox = Runner/Unsandbox$(OPERIT_MACOS_ENTITLEMENTS_FILE)
+OPERIT_MACOS_SANDBOX_sandbox = YES
+OPERIT_MACOS_SANDBOX_unsandbox = NO
+ENABLE_HARDENED_RUNTIME = YES
