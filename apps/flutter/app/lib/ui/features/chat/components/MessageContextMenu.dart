@@ -36,6 +36,7 @@ class MessageContextMenu extends StatefulWidget {
     required this.chatId,
     required this.messageIndex,
     this.resolveMessageIndex,
+    this.loadCanonicalMessage,
     required this.clients,
     required this.packageManager,
     required this.onToggleFavoriteMessage,
@@ -60,6 +61,7 @@ class MessageContextMenu extends StatefulWidget {
   final String chatId;
   final int messageIndex;
   final int? Function()? resolveMessageIndex;
+  final Future<ChatUiMessage?> Function()? loadCanonicalMessage;
   final GeneratedCoreProxyClients clients;
   final GeneratedApplicationPackageManagerCoreProxy packageManager;
   final MessageFavoriteAction onToggleFavoriteMessage;
@@ -317,7 +319,11 @@ class _MessageContextMenuState extends State<MessageContextMenu> {
         icon: Icons.account_tree,
         label: l10n.chatCreateBranch,
       ),
-      _menuItem(value: _MessageMenuAction.info, icon: Icons.info, label: l10n.chatMessageInfoDialogTitle),
+      _menuItem(
+        value: _MessageMenuAction.info,
+        icon: Icons.info,
+        label: l10n.chatMessageInfoDialogTitle,
+      ),
       _menuItem(
         value: _MessageMenuAction.multiSelect,
         icon: Icons.check_circle,
@@ -485,10 +491,16 @@ class _MessageContextMenuState extends State<MessageContextMenu> {
   }
 
   /// Builds the ToolPkg snapshot with text from the selected message parts.
-  Map<String, Object?> _toolPkgMessageSnapshot() {
+  Future<Map<String, Object?>> _toolPkgMessageSnapshot() async {
+    final source = widget.message;
+    final load = widget.loadCanonicalMessage;
+    final message = load == null ? source : await load() ?? source;
+    if (message.selectedVariantIndex != source.selectedVariantIndex) {
+      throw StateError('The selected message revision changed.');
+    }
     return <String, Object?>{
-      ...widget.message.toJson(),
-      'content': widget.message.displayText,
+      ...message.toJson(),
+      'content': message.displayText,
     };
   }
 
@@ -504,7 +516,7 @@ class _MessageContextMenuState extends State<MessageContextMenu> {
       itemId: item.itemId,
       chatId: widget.chatId,
       messageIndex: index,
-      message: _toolPkgMessageSnapshot(),
+      message: await _toolPkgMessageSnapshot(),
     );
     final dialog = item.dialog;
     if (dialog != null) {
@@ -529,7 +541,7 @@ class _MessageContextMenuState extends State<MessageContextMenu> {
     final state = <String, Object?>{
       'chatId': widget.chatId,
       'messageIndex': index,
-      'message': _toolPkgMessageSnapshot(),
+      'message': await _toolPkgMessageSnapshot(),
       'menuItemId': item.itemId,
     };
     final rawState = dialogResult['state'];
@@ -646,55 +658,35 @@ class _MessageContextMenuState extends State<MessageContextMenu> {
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: <Widget>[
-                Text(
-                  l10n.chatMessageSender(message.sender),
-                ),
-                Text(
-                  l10n.chatMessageTimestamp(message.timestamp.toString()),
-                ),
+                Text(l10n.chatMessageSender(message.sender)),
+                Text(l10n.chatMessageTimestamp(message.timestamp.toString())),
                 if (message.roleName.isNotEmpty)
-                  Text(
-                    l10n.chatMessageRole(message.roleName),
-                  ),
+                  Text(l10n.chatMessageRole(message.roleName)),
                 if (message.modelName.isNotEmpty)
-                  Text(
-                    l10n.chatMessageModel(message.modelName),
-                  ),
+                  Text(l10n.chatMessageModel(message.modelName)),
                 if (message.provider.isNotEmpty)
-                  Text(
-                    l10n.chatMessageProvider(message.provider),
-                  ),
+                  Text(l10n.chatMessageProvider(message.provider)),
                 Text(
-                  l10n.chatMessageTokensInput(
-                        message.inputTokens.toString(),
-                      ),
+                  l10n.chatMessageTokensInput(message.inputTokens.toString()),
                 ),
                 Text(
                   l10n.chatMessageTokensCached(
-                        message.cachedInputTokens.toString(),
-                      ),
+                    message.cachedInputTokens.toString(),
+                  ),
                 ),
+                Text(l10n.chatMessageCacheHitRate(formatCacheHitRate(message))),
                 Text(
-                  l10n.chatMessageCacheHitRate(formatCacheHitRate(message)),
-                ),
-                Text(
-                  l10n.chatMessageTokensOutput(
-                        message.outputTokens.toString(),
-                      ),
+                  l10n.chatMessageTokensOutput(message.outputTokens.toString()),
                 ),
                 if (formatTokenSpeed(message).isNotEmpty)
-                  Text(
-                    l10n.chatMessageTokenSpeed(formatTokenSpeed(message)),
-                  ),
+                  Text(l10n.chatMessageTokenSpeed(formatTokenSpeed(message))),
                 Text(
-                  l10n.chatMessageWaitDuration(
-                        '${message.waitDurationMs}ms',
-                      ),
+                  l10n.chatMessageWaitDuration('${message.waitDurationMs}ms'),
                 ),
                 Text(
                   l10n.chatMessageOutputDuration(
-                        '${message.outputDurationMs}ms',
-                      ),
+                    '${message.outputDurationMs}ms',
+                  ),
                 ),
               ],
             ),

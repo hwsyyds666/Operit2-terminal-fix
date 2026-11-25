@@ -83,6 +83,34 @@ void main() {
     },
   );
 
+  test('hydrates mounted rows in one batch and pauses while hidden', () async {
+    final reads = <List<int>>[];
+    final controller = ChatTranscriptController(
+      readPage: (_, _) async => _page(981, 1000),
+      readMessage: (_) async => throw StateError('single read'),
+      readBodies: (ids) async {
+        reads.add(ids);
+        return ids.map(_message).toList();
+      },
+      visibleTimestamp: () => 1000,
+      followLatest: () => true,
+      onChanged: () {},
+      onError: (error) => throw error,
+    );
+    addTearDown(controller.dispose);
+    await controller.load('latest');
+    controller.setActive(false);
+    final work = controller.messages.reversed
+        .take(6)
+        .map(controller.hydrate)
+        .toList();
+    await Future<void>.delayed(Duration.zero);
+    expect(reads, isEmpty);
+    controller.setActive(true);
+    expect((await Future.wait(work)).whereType<ChatMessage>(), hasLength(6));
+    expect(reads.single, [1000, 999, 998, 997, 996, 995]);
+  });
+
   testWidgets('long Markdown mounts blocks near the outer viewport', (
     tester,
   ) async {

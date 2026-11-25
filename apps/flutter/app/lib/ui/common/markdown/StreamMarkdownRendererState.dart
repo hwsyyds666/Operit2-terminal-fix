@@ -152,10 +152,12 @@ class MutableMarkdownNode {
   String? linkUrl;
   MutableMarkdownNode? parent;
   MarkdownNodeStable? _stable;
+  void Function()? onRootInvalidated;
 
   void invalidate() {
     _stable = null;
     parent?.invalidate();
+    onRootInvalidated?.call();
   }
 
   String? xmlTagName;
@@ -244,6 +246,80 @@ class MarkdownEventNodeBuilder {
   final Map<String, _MarkdownEventNodeBuilderSnapshot> _savepoints =
       <String, _MarkdownEventNodeBuilderSnapshot>{};
   int _pendingHtmlBreakCount = 0;
+  final _dirtyRoots = <int>{};
+  int _observedRoots = 0;
+  int? _streamingRoot;
+  bool _replaceRenderList = false;
+  int layoutRevision = 0;
+
+  void _invalidateRenderList() {
+    _dirtyRoots.clear();
+    _observedRoots = 0;
+    _streamingRoot = null;
+    _replaceRenderList = true;
+    layoutRevision++;
+  }
+
+  /// Updates only roots touched by semantic events since the previous frame.
+  void updateRenderNodes(
+    List<MarkdownNodeStable> target, {
+    required bool isStreaming,
+  }) {
+    if (_replaceRenderList || target.length > nodes.length) {
+      target.clear();
+      _replaceRenderList = false;
+    }
+    for (var i = _observedRoots; i < nodes.length; i++) {
+      final rootIndex = i;
+      nodes[i].onRootInvalidated = () => _dirtyRoots.add(rootIndex);
+      _dirtyRoots.add(i);
+    }
+    _observedRoots = nodes.length;
+
+    int? active;
+    if (isStreaming) {
+      for (var i = nodes.length - 1; i >= 0; i--) {
+        if (_isRenderableStreamingNode(nodes[i])) {
+          active = i;
+          break;
+        }
+      }
+    }
+    if (_streamingRoot != active) {
+      final previous = _streamingRoot;
+      if (previous != null && previous < nodes.length) {
+        nodes[previous].isStreaming = false;
+        _dirtyRoots.add(previous);
+      }
+      if (active != null) {
+        nodes[active].isStreaming = true;
+        _dirtyRoots.add(active);
+      }
+      _streamingRoot = active;
+    }
+    final previousLength = target.length;
+    var layoutChanged = previousLength != nodes.length;
+    for (final index in _dirtyRoots) {
+      if (index >= previousLength) continue;
+      final before = target[index];
+      final after = nodes[index].toStable();
+      if (before.type != after.type ||
+          after.type == MarkdownNodeType.xmlBlock &&
+              (before.xmlTagName != after.xmlTagName ||
+                  after.xmlTagName == null &&
+                      before.content != after.content) ||
+          after.type == MarkdownNodeType.plainText &&
+              before.content.trim().isEmpty != after.content.trim().isEmpty) {
+        layoutChanged = true;
+      }
+      target[index] = after;
+    }
+    if (layoutChanged) layoutRevision++;
+    for (var i = previousLength; i < nodes.length; i++) {
+      target.add(nodes[i].toStable());
+    }
+    _dirtyRoots.clear();
+  }
 
   void reset() {
     for (final controller in _xmlControllers.values) {
@@ -253,6 +329,7 @@ class MarkdownEventNodeBuilder {
       controller.close();
     }
     nodes.clear();
+    _invalidateRenderList();
     _blocks.clear();
     _inlineStyles.clear();
     _inlines.clear();
@@ -965,6 +1042,7 @@ class _MarkdownEventNodeBuilderSnapshot {
   final int pendingHtmlBreakCount;
 
   void restore(MarkdownEventNodeBuilder builder) {
+    builder._invalidateRenderList();
     builder.nodes
       ..clear()
       ..addAll(<MutableMarkdownNode>[for (final node in nodes) node.copy()]);

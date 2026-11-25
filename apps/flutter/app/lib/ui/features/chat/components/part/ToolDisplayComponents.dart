@@ -14,6 +14,7 @@ import '../../../../common/markdown/StreamMarkdownRenderer.dart';
 import 'ChatActivityDisclosure.dart';
 import 'ChatActivityRowStyle.dart';
 import 'FileDiffDisplay.dart';
+import 'TranscriptToolOutput.dart';
 
 class CompactToolDisplay extends StatelessWidget {
   const CompactToolDisplay({
@@ -118,9 +119,7 @@ class CodeContentWithLineNumbers extends StatelessWidget {
                   style: Theme.of(context).textTheme.bodySmall?.copyWith(
                     color: textColor.withValues(alpha: 0.8),
                     fontFamily: operitCodeFontFamilyOf(context),
-                    fontFamilyFallback: operitCodeFontFamilyFallbackOf(
-                      context,
-                    ),
+                    fontFamilyFallback: operitCodeFontFamilyFallbackOf(context),
                   ),
                 ),
               ),
@@ -381,9 +380,11 @@ class ToolCallRow extends StatefulWidget {
     super.key,
     required this.presentation,
     required this.isStreaming,
+    this.deferredResultId,
   });
   final ToolPresentation presentation;
   final bool isStreaming;
+  final String? deferredResultId;
   @override
   State<ToolCallRow> createState() => _ToolCallRowState();
 }
@@ -429,12 +430,17 @@ class _ToolCallRowState extends State<ToolCallRow> {
     final color = presentation.isSuccess == false
         ? theme.colorScheme.error
         : theme.colorScheme.onSurfaceVariant;
+    final deferredId = widget.deferredResultId;
+    final loadOutput = deferredId == null
+        ? null
+        : TranscriptToolOutputScope.of(context);
+    final hasDetails = presentation.hasDetails || loadOutput != null;
     final content = Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         InkWell(
-          onTap: presentation.hasDetails
+          onTap: hasDetails
               ? () => setState(() {
                   _expanded = !_expanded;
                   _userToggled = true;
@@ -476,7 +482,7 @@ class _ToolCallRowState extends State<ToolCallRow> {
                       color: color,
                     ),
                   ),
-                if (presentation.hasDetails)
+                if (hasDetails)
                   AnimatedRotation(
                     turns: _expanded ? 0.25 : 0,
                     duration: ChatActivityDisclosure.duration,
@@ -488,7 +494,7 @@ class _ToolCallRowState extends State<ToolCallRow> {
           ),
         ),
         ChatActivityDisclosure(
-          child: _expanded && presentation.hasDetails
+          child: _expanded && hasDetails
               ? Padding(
                   key: const ValueKey('tool-details'),
                   padding: const EdgeInsets.only(
@@ -514,6 +520,12 @@ class _ToolCallRowState extends State<ToolCallRow> {
                           showPath:
                               presentation.resultData!['path'] !=
                               presentation.target,
+                        ),
+                      if (deferredId != null && loadOutput != null)
+                        _DeferredToolOutput(
+                          key: ValueKey(deferredId),
+                          load: () => loadOutput(deferredId),
+                          isSuccess: presentation.isSuccess,
                         ),
                       if (presentation.result.isNotEmpty)
                         ToolInlineDetailSurface(
@@ -968,4 +980,48 @@ List<String> extractParamPayloadsForSize(String params) {
   return payloads.isNotEmpty
       ? payloads
       : <String>[normalizeEscapedTextForDisplay(params)];
+}
+
+class _DeferredToolOutput extends StatefulWidget {
+  const _DeferredToolOutput({
+    super.key,
+    required this.load,
+    required this.isSuccess,
+  });
+
+  final Future<String?> Function() load;
+  final bool? isSuccess;
+
+  @override
+  State<_DeferredToolOutput> createState() => _DeferredToolOutputState();
+}
+
+class _DeferredToolOutputState extends State<_DeferredToolOutput> {
+  late Future<String?> _output = widget.load();
+
+  @override
+  Widget build(BuildContext context) {
+    final strings = AppLocalizations.of(context)!;
+    return FutureBuilder<String?>(
+      future: _output,
+      builder: (context, snapshot) {
+        if (snapshot.hasError) {
+          return TextButton(
+            onPressed: () => setState(() => _output = widget.load()),
+            child: Text(strings.retry),
+          );
+        }
+        if (snapshot.connectionState != ConnectionState.done) {
+          return const LinearProgressIndicator();
+        }
+        final output = snapshot.data;
+        if (output == null || output.isEmpty) return const SizedBox.shrink();
+        return ToolInlineDetailSurface(
+          title: strings.toolResultLabel,
+          text: output,
+          isSuccess: widget.isSuccess,
+        );
+      },
+    );
+  }
 }

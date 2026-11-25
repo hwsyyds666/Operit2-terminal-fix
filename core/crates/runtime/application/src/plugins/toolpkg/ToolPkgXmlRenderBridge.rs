@@ -82,6 +82,11 @@ impl ToolPkgXmlRenderBridge {
         xmlRenderRegistry().replace(hooks);
     }
 
+    pub fn hasHookForTag(tag: &str) -> bool {
+        xmlRenderRegistry().hooks.lock().expect("XML render hook registry")
+            .iter().any(|hook| hook.tag == tag)
+    }
+
     /// Observes XML hook replacements after the new registrations are available for rendering.
     #[allow(non_snake_case)]
     pub fn revisionFlow() -> StateFlow<i64> {

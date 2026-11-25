@@ -1,11 +1,12 @@
 // ignore_for_file: file_names
 
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 
-/// Enables body virtualization only inside a completed chat transcript row.
+/// Enables block virtualization inside a chat transcript row.
 class TranscriptMarkdownScope extends InheritedWidget {
   const TranscriptMarkdownScope({
     super.key,
@@ -46,7 +47,10 @@ class TranscriptMarkdownViewport extends StatefulWidget {
 class _TranscriptMarkdownViewportState
     extends State<TranscriptMarkdownViewport> {
   final _measuredHeights = <int, double>{};
-  late List<double> _offsets = _measureOffsets();
+  late _BlockExtents _extents = _BlockExtents(
+    widget.blockCount,
+    _measuredHeights,
+  );
   ScrollPosition? _position;
   bool _scheduled = false;
   bool _measurementsChanged = false;
@@ -56,7 +60,7 @@ class _TranscriptMarkdownViewportState
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    final position = Scrollable.maybeOf(context)?.position;
+    final position = Scrollable.maybeOf(context, axis: Axis.vertical)?.position;
     if (position != _position) {
       _position?.removeListener(_schedule);
       _position = position;
@@ -70,7 +74,7 @@ class _TranscriptMarkdownViewportState
     super.didUpdateWidget(oldWidget);
     if (oldWidget.blockCount != widget.blockCount) {
       _measuredHeights.removeWhere((index, _) => index >= widget.blockCount);
-      _offsets = _measureOffsets();
+      _extents = _BlockExtents(widget.blockCount, _measuredHeights);
     }
     _schedule();
   }
@@ -81,29 +85,6 @@ class _TranscriptMarkdownViewportState
     super.dispose();
   }
 
-  List<double> _measureOffsets() {
-    final offsets = <double>[0];
-    for (var index = 0; index < widget.blockCount; index++) {
-      offsets.add(offsets.last + (_measuredHeights[index] ?? 64));
-    }
-    return offsets;
-  }
-
-  /// Finds the first block whose lower edge lies below the requested position.
-  int _blockAt(double offset) {
-    var first = 0;
-    var end = widget.blockCount;
-    while (first < end) {
-      final middle = (first + end) ~/ 2;
-      if (_offsets[middle + 1] <= offset) {
-        first = middle + 1;
-      } else {
-        end = middle;
-      }
-    }
-    return first;
-  }
-
   void _schedule() {
     if (_scheduled || !mounted) return;
     _scheduled = true;
@@ -112,18 +93,21 @@ class _TranscriptMarkdownViewportState
       if (!mounted) return;
       final box = context.findRenderObject();
       if (box is! RenderBox || !box.hasSize || !box.attached) return;
-      final viewport = RenderAbstractViewport.maybeOf(box) as RenderBox?;
-      if (viewport == null || !viewport.hasSize) return;
+      RenderObject? viewport = RenderAbstractViewport.maybeOf(box);
+      // A table's horizontal scroll view is nested in the transcript viewport.
+      while (viewport != null && viewport is! RenderViewportBase) {
+        viewport = RenderAbstractViewport.maybeOf(viewport.parent);
+      }
+      if (viewport is! RenderBox || !viewport.hasSize) return;
       final top = box.localToGlobal(Offset.zero, ancestor: viewport).dy;
       if (!top.isFinite) return;
       final changed = _measurementsChanged;
       _measurementsChanged = false;
-      if (changed) _offsets = _measureOffsets();
       const prefetch = 240.0;
-      final first = _blockAt(-top - prefetch);
+      final first = _extents.blockAt(-top - prefetch);
       final end = math.min(
         widget.blockCount,
-        _blockAt(viewport.size.height - top + prefetch) + 1,
+        _extents.blockAt(viewport.size.height - top + prefetch) + 1,
       );
       if (changed || first != _first || end != _end) {
         setState(() {
@@ -151,12 +135,16 @@ class _TranscriptMarkdownViewportState
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        if (first > 0) SizedBox(height: _offsets[first]),
+        if (first > 0) SizedBox(height: _extents.before(first)),
         for (var index = first; index < end; index++)
           _BlockMeasurement(
             key: ValueKey(index),
             onMeasured: (height) {
               if (_measuredHeights[index] == height) return;
+              _extents.resize(
+                index,
+                height - (_measuredHeights[index] ?? _BlockExtents.estimate),
+              );
               _measuredHeights[index] = height;
               _measurementsChanged = true;
               _schedule();
@@ -164,7 +152,9 @@ class _TranscriptMarkdownViewportState
             child: widget.builder(context, index),
           ),
         if (end < widget.blockCount)
-          SizedBox(height: _offsets.last - _offsets[end]),
+          SizedBox(
+            height: _extents.before(widget.blockCount) - _extents.before(end),
+          ),
       ],
     );
   }
@@ -197,5 +187,47 @@ class _MeasuredBlock extends RenderProxyBox {
   void performLayout() {
     super.performLayout();
     onMeasured(size.height);
+  }
+}
+
+/// A prefix sum index. Layout updates a measured block without walking the reply.
+class _BlockExtents {
+  _BlockExtents(this.length, Map<int, double> heights)
+    : _changes = Float64List(length + 1) {
+    for (final entry in heights.entries) {
+      resize(entry.key, entry.value - estimate);
+    }
+  }
+
+  static const estimate = 64.0;
+  final int length;
+  final Float64List _changes;
+
+  void resize(int index, double delta) {
+    for (var i = index + 1; i <= length; i += i & -i) {
+      _changes[i] += delta;
+    }
+  }
+
+  double before(int index) {
+    var offset = index * estimate;
+    for (var i = index; i > 0; i -= i & -i) {
+      offset += _changes[i];
+    }
+    return offset;
+  }
+
+  int blockAt(double offset) {
+    var first = 0;
+    var end = length;
+    while (first < end) {
+      final middle = (first + end) >> 1;
+      if (before(middle + 1) <= offset) {
+        first = middle + 1;
+      } else {
+        end = middle;
+      }
+    }
+    return first;
   }
 }

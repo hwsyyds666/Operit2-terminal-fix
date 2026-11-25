@@ -10,6 +10,8 @@ class ChatTranscriptController {
   ChatTranscriptController({
     required this.readPage,
     required this.readMessage,
+    this.readBodies,
+    this.readToolOutput,
     required this.visibleTimestamp,
     required this.followLatest,
     required this.onChanged,
@@ -18,6 +20,8 @@ class ChatTranscriptController {
 
   final Future<ChatTranscriptPage> Function(String, int?) readPage;
   final Future<ChatMessage?> Function(int) readMessage;
+  final Future<String?> Function(int, int, String)? readToolOutput;
+  final Future<List<ChatMessage>> Function(List<int>)? readBodies;
   final int? Function() visibleTimestamp;
   final bool Function() followLatest;
   final void Function() onChanged;
@@ -25,7 +29,15 @@ class ChatTranscriptController {
 
   final _rows = SplayTreeMap<int, ChatMessage>();
   final _pending = <ChatTranscriptChange>[];
-  late final _preparation = TranscriptPreparationQueue(2);
+  final _waiting = <int, (ChatMessage, Completer<ChatMessage?>)>{};
+  bool _bodyScheduled = false;
+  bool _active = true;
+
+  void setActive(bool active) {
+    _active = active;
+    if (active) _scheduleBodies();
+  }
+
   final _details = <int, (ChatMessage, Future<ChatMessage?>)>{};
   List<ChatMessage> messages = const [];
   bool hasOlder = false;
@@ -39,7 +51,10 @@ class ChatTranscriptController {
 
   void dispose() {
     _disposed = true;
-    _preparation.dispose();
+    for (final (_, completer) in _waiting.values) {
+      completer.complete(null);
+    }
+    _waiting.clear();
     _details.clear();
   }
 
@@ -245,13 +260,76 @@ class ChatTranscriptController {
       _details[row.timestamp] = cached;
       return cached.$2;
     }
-    final result = _preparation.run(() async {
-      if (_disposed || !identical(_rows[row.timestamp], row)) return null;
-      return readMessage(row.timestamp);
-    });
-    _details[row.timestamp] = (row, result);
-    if (_details.length > 24) _details.remove(_details.keys.first);
-    return result;
+    final previous = _waiting.remove(row.timestamp);
+    previous?.$2.complete(null);
+    final completer = Completer<ChatMessage?>();
+    _waiting[row.timestamp] = (row, completer);
+    _details[row.timestamp] = (row, completer.future);
+    if (_details.length > 48) _details.remove(_details.keys.first);
+    _scheduleBodies();
+    return completer.future;
+  }
+
+  void _scheduleBodies() {
+    if (_disposed || !_active || _bodyScheduled || _waiting.isEmpty) return;
+    _bodyScheduled = true;
+    scheduleMicrotask(_readBodies);
+  }
+
+  Future<void> _readBodies() async {
+    try {
+      if (!_active || _disposed) return;
+      final pending = _waiting.keys.take(8).toList();
+      final batch = <int, (ChatMessage, Completer<ChatMessage?>)>{};
+      for (final timestamp in pending) {
+        final entry = _waiting.remove(timestamp)!;
+        if (identical(_rows[timestamp], entry.$1)) {
+          batch[timestamp] = entry;
+        } else {
+          entry.$2.complete(null);
+        }
+      }
+      if (batch.isEmpty) return;
+      try {
+        final timestamps = batch.keys.toList();
+        final load = readBodies;
+        final bodies = load != null
+            ? await load(timestamps)
+            : (await Future.wait(
+                timestamps.map(readMessage),
+              )).whereType<ChatMessage>();
+        final byTimestamp = {for (final body in bodies) body.timestamp: body};
+        for (final entry in batch.entries) {
+          final (row, completer) = entry.value;
+          final body = byTimestamp[entry.key];
+          completer.complete(
+            !_disposed &&
+                    identical(_rows[entry.key], row) &&
+                    body?.selectedVariantIndex == row.selectedVariantIndex
+                ? body
+                : null,
+          );
+        }
+      } catch (error, stackTrace) {
+        for (final entry in batch.values) {
+          entry.$2.completeError(error, stackTrace);
+        }
+      }
+    } finally {
+      _bodyScheduled = false;
+      _scheduleBodies();
+    }
+  }
+
+  /// Drops work for rows that left the viewport before their batch started.
+  void releaseBody(ChatMessage row) {
+    final waiting = _waiting[row.timestamp];
+    if (waiting == null || !identical(waiting.$1, row)) return;
+    _waiting.remove(row.timestamp);
+    if (identical(_details[row.timestamp]?.$2, waiting.$2.future)) {
+      _details.remove(row.timestamp);
+    }
+    waiting.$2.complete(null);
   }
 
   Future<ChatMessage?> retryBody(ChatMessage row) {

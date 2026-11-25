@@ -51,6 +51,7 @@ class MessageTransformCache {
   String? _chatId;
   int? _revision;
   bool? _hasDisplayTransforms;
+  bool get dependsOnDepth => _hasDisplayTransforms != false;
   bool _disposed = false;
   final _pending = <_MessageProjection>{};
   bool _dispatchScheduled = false;

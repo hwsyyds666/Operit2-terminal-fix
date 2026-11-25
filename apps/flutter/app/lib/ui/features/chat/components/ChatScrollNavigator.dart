@@ -65,6 +65,8 @@ class ChatScrollNavigator extends StatefulWidget {
     super.key,
     this.messageNavigation,
     this.onLeft = false,
+    this.reverse = false,
+    this.loadPreview,
     required this.messages,
     required this.currentChatId,
     required this.scrollController,
@@ -85,6 +87,8 @@ class ChatScrollNavigator extends StatefulWidget {
 
   final ChatMessageNavigationController? messageNavigation;
   final bool onLeft;
+  final bool reverse;
+  final Future<ChatUiMessage?> Function(int timestamp)? loadPreview;
   final List<ChatUiMessage> messages;
   final String? currentChatId;
   final ScrollController scrollController;
@@ -115,6 +119,18 @@ class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
   int? _hoveredEntryIndex;
   double _hoveredEntryCenter = 0;
   int _locatorLoadGeneration = 0;
+  Future<ChatUiMessage?>? _hoveredPreview;
+  int? _hoveredTimestamp;
+
+  void _requestHoveredPreview(ChatMessageLocatorPreview entry) {
+    if (_hoveredTimestamp == entry.timestamp) return;
+    _hoveredTimestamp = entry.timestamp;
+    _hoveredPreview =
+        entry.previewContent.isNotEmpty ||
+            entry.displayMode == 'HIDDEN_PLACEHOLDER'
+        ? null
+        : widget.loadPreview?.call(entry.timestamp);
+  }
 
   /// Loads global index metadata and bounded previews through the dedicated index API.
   @override
@@ -151,7 +167,11 @@ class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
               _favoritesChanged(oldWidget.messages, widget.messages);
     if (chatChanged || needsIndexRefresh) {
       _hoveredEntryIndex = null;
-      if (chatChanged) _replaceLocatorEntries(const []);
+      if (chatChanged) {
+        _hoveredTimestamp = null;
+        _hoveredPreview = null;
+        _replaceLocatorEntries(const []);
+      }
       _loadLocatorEntries();
     }
   }
@@ -241,6 +261,9 @@ class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
                       setState(() {
                         _hoveredEntryIndex = index;
                         _hoveredEntryCenter = center;
+                        if (index != null && index < entries.length) {
+                          _requestHoveredPreview(entries[index]);
+                        }
                       });
                     },
                     onTapTick: _handleJumpToMessage,
@@ -264,7 +287,32 @@ class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
                 child: IgnorePointer(
                   child: SizedBox(
                     width: previewWidth,
-                    child: _CodexHoverTooltipCard(entry: entries[hoveredIndex]),
+                    child: FutureBuilder<ChatUiMessage?>(
+                      future: _hoveredPreview,
+                      builder: (context, snapshot) {
+                        final entry = entries[hoveredIndex];
+                        final loaded = snapshot.data;
+                        if (loaded == null ||
+                            loaded.timestamp != entry.timestamp) {
+                          return _CodexHoverTooltipCard(entry: entry);
+                        }
+                        final display = loaded.displayText;
+                        return _CodexHoverTooltipCard(
+                          entry: ChatMessageLocatorPreview(
+                            messageIndex: entry.messageIndex,
+                            timestamp: entry.timestamp,
+                            sender: entry.sender,
+                            displayName: loaded.roleName,
+                            previewContent: String.fromCharCodes(
+                              display.runes.take(90),
+                            ),
+                            contentLength: display.length,
+                            displayMode: entry.displayMode,
+                            isFavorite: entry.isFavorite,
+                          ),
+                        );
+                      },
+                    ),
                   ),
                 ),
               ),
@@ -298,10 +346,16 @@ class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
     final position = scroll.position;
     if (position.hasContentDimensions) {
       // A transcript that fits entirely in the viewport stays on its latest message.
-      if (position.pixels >= position.maxScrollExtent) {
+      if (position.pixels ==
+          (widget.reverse
+              ? position.minScrollExtent
+              : position.maxScrollExtent)) {
         return widget.messages.lastOrNull?.timestamp;
       }
-      if (position.pixels <= position.minScrollExtent) {
+      if (position.pixels ==
+          (widget.reverse
+              ? position.maxScrollExtent
+              : position.minScrollExtent)) {
         return widget.messages.firstOrNull?.timestamp;
       }
     }

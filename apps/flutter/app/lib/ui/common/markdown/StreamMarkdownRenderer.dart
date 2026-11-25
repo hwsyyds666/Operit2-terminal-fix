@@ -96,7 +96,7 @@ class StreamMarkdownRenderer extends StatefulWidget {
   State<StreamMarkdownRenderer> createState() => _StreamMarkdownRendererState();
 }
 
-const Duration _streamRenderInterval = Duration(milliseconds: 200);
+const Duration _streamRenderInterval = Duration(milliseconds: 32);
 const Duration _nodeFadeInDuration = Duration(milliseconds: 800);
 
 class _StreamMarkdownRendererState extends State<StreamMarkdownRenderer> {
@@ -316,31 +316,27 @@ class _StreamMarkdownRendererState extends State<StreamMarkdownRenderer> {
     setState(() => _synchronizeRenderNodes(isStreaming: !_streamDone));
   }
 
-  /// Rebuilds stable render nodes while preserving existing animation keys.
+  /// Commits the changed root blocks and schedules reveals for new blocks.
   void _synchronizeRenderNodes({required bool isStreaming}) {
-    final nextNodes = _rendererState.eventBuilder.toStableNodes(
+    final nodes = _rendererState.renderNodes;
+    final oldCount = nodes.length;
+    _rendererState.eventBuilder.updateRenderNodes(
+      nodes,
       isStreaming: isStreaming,
     );
-    final nextKeys = <String>{
-      for (var index = 0; index < nextNodes.length; index++)
-        _nodeKeyForIndex(_rendererId, index),
-    };
-    final keysToReveal = <String>[];
-
-    for (final key in nextKeys) {
-      if (!_rendererState.nodeAnimationStates.containsKey(key)) {
-        _rendererState.nodeAnimationStates[key] = false;
-        keysToReveal.add(key);
-      }
+    final animations = _rendererState.nodeAnimationStates;
+    for (var index = nodes.length; index < oldCount; index++) {
+      final key = _nodeKeyForIndex(_rendererId, index);
+      animations.remove(key);
+      _scheduledVisibleNodeKeys.remove(key);
     }
-    _rendererState.nodeAnimationStates.removeWhere(
-      (key, value) => !nextKeys.contains(key),
-    );
-    _scheduledVisibleNodeKeys.removeWhere((key) => !nextKeys.contains(key));
-    _rendererState.renderNodes
-      ..clear()
-      ..addAll(nextNodes);
-    _scheduleNodeFadeIn(keysToReveal);
+    final reveal = <String>[];
+    for (var index = oldCount; index < nodes.length; index++) {
+      final key = _nodeKeyForIndex(_rendererId, index);
+      animations[key] = false;
+      reveal.add(key);
+    }
+    _scheduleNodeFadeIn(reveal);
   }
 
   /// Applies semantic events; only lifecycle effects belong to the widget.
@@ -412,6 +408,7 @@ class _StreamMarkdownRendererState extends State<StreamMarkdownRenderer> {
     ).dispatch(context);
     final content = _MarkdownNodeColumn(
       nodes: _rendererState.renderNodes,
+      layoutRevision: _rendererState.eventBuilder.layoutRevision,
       rendererId: _rendererId,
       textColor: widget.textColor,
       backgroundColor: widget.backgroundColor,
@@ -490,6 +487,7 @@ class _StaticMarkdownNodeCache {
 class _MarkdownNodeColumn extends StatefulWidget {
   const _MarkdownNodeColumn({
     required this.nodes,
+    required this.layoutRevision,
     required this.rendererId,
     required this.textColor,
     required this.backgroundColor,
@@ -509,6 +507,7 @@ class _MarkdownNodeColumn extends StatefulWidget {
   });
 
   final List<MarkdownNodeStable> nodes;
+  final int layoutRevision;
   final String rendererId;
   final Color textColor;
   final Color backgroundColor;
@@ -536,9 +535,17 @@ class _MarkdownNodeColumnState extends State<_MarkdownNodeColumn> {
   final Map<String, _CachedMarkdownGroup> _groupCache =
       <String, _CachedMarkdownGroup>{};
 
+  List<MarkdownGroupedItem>? _groupedItems;
+
   @override
   void didUpdateWidget(covariant _MarkdownNodeColumn oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.layoutRevision != widget.layoutRevision ||
+        oldWidget.nodeGrouper != widget.nodeGrouper ||
+        oldWidget.rendererId != widget.rendererId ||
+        !identical(oldWidget.nodes, widget.nodes)) {
+      _groupedItems = null;
+    }
     if (oldWidget.rendererId != widget.rendererId ||
         oldWidget.textColor != widget.textColor ||
         oldWidget.backgroundColor != widget.backgroundColor ||
@@ -556,7 +563,7 @@ class _MarkdownNodeColumnState extends State<_MarkdownNodeColumn> {
 
   @override
   Widget build(BuildContext context) {
-    final groupedItems = widget.nodeGrouper.group(
+    final groupedItems = _groupedItems ??= widget.nodeGrouper.group(
       widget.nodes,
       widget.rendererId,
     );

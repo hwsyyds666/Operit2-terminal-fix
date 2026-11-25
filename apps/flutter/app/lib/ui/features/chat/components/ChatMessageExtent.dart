@@ -281,8 +281,10 @@ class RenderChatMessageSliverList extends RenderSliverList {
         geometry!.scrollOffsetCorrection != null) {
       return;
     }
+    final newAnchorOffset = childScrollOffset(anchor);
+    if (newAnchorOffset == null) return;
     final correction = math.max(
-      childScrollOffset(anchor)! - oldAnchorOffset!,
+      newAnchorOffset - oldAnchorOffset!,
       -constraints.scrollOffset,
     );
     if (correction.abs() > precisionErrorTolerance) {

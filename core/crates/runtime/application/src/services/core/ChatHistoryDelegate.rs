@@ -8,7 +8,7 @@ use crate::plugins::toolpkg::ToolPkgChatViewHookBridge::{
 };
 use crate::plugins::toolpkg::ToolPkgInputMenuToggleBridge::ToolPkgInputMenuToggleBridge;
 use crate::services::ProviderRuntimeSupportService::ChatConfigurationApi;
-use super::ChatTranscript::{ChatTranscriptChange, TranscriptEvents, compact};
+use super::ChatTranscript::{ChatTranscriptChange, TranscriptEvents};
 use operit_host_api::TimeUtils::currentTimeMillis;
 use operit_model::ChatDisplayWindowState::ChatDisplayWindowState;
 use operit_model::ChatHistory::ChatHistory;
@@ -245,8 +245,9 @@ impl ChatHistoryDelegate {
         {
             return flow;
         }
-        let messages =
+        let mut messages =
             self.collectNewestDisplayPages(chatId.clone(), self.displayWindowQueryLimit(), None);
+        preserveLiveMessageStreams(&self.transcriptEvents.live(&chatId), &mut messages, None);
         AppLogger::trace(
             "ChatFlowTrace",
             &format!(
@@ -262,6 +263,12 @@ impl ChatHistoryDelegate {
             .expect("chat message flow registry mutex must not be poisoned");
         let flow = flows.entry(chatId).or_insert_with(|| flow).clone();
         flow
+    }
+
+    fn hasLegacyMessageWindow(&self, chatId: &str) -> bool {
+        self.chatMessageFlowsByChatId.lock()
+            .expect("chat message flow registry mutex must not be poisoned")
+            .contains_key(chatId)
     }
 
     /// Returns the independently addressable message-window flow for one chat id.
@@ -297,27 +304,12 @@ impl ChatHistoryDelegate {
         {
             return flow.asStateFlow();
         }
-        let messages =
-            self.collectNewestDisplayPages(chatId.clone(), self.displayWindowQueryLimit(), None);
-        let hasOlder = messages
-            .first()
-            .map(|message| {
-                self.chatHistoryManager
-                    .hasMessagesBefore(chatId.clone(), message.timestamp)
-                    .expect("ChatHistoryManager.hasMessagesBefore must succeed")
-            })
-            .unwrap_or(false);
-        let hasNewer = messages
-            .last()
-            .map(|message| {
-                self.chatHistoryManager
-                    .hasMessagesAfter(chatId.clone(), message.timestamp)
-                    .expect("ChatHistoryManager.hasMessagesAfter must succeed")
-            })
+        let hasOlder = self.chatHistoryManager
+            .legacyDisplayHasOlder(&chatId, self.displayWindowQueryLimit())
             .unwrap_or(false);
         let flow = mutableStateFlow(ChatDisplayWindowState {
             hasOlderDisplayHistory: hasOlder,
-            hasNewerDisplayHistory: hasNewer,
+            hasNewerDisplayHistory: false,
             isLoadingDisplayWindow: false,
         });
         let mut flows = self
@@ -393,9 +385,7 @@ impl ChatHistoryDelegate {
     }
 
     pub(crate) fn liveTranscriptMessages(&self, chatId: &str) -> Vec<ChatMessage> {
-        self.openedChatMessageFlowSnapshot(chatId).unwrap_or_default().iter()
-            .filter(|message| message.contentStream.is_some())
-            .map(compact).collect()
+        self.transcriptEvents.live(chatId)
     }
 
     /// Publishes one message replacement to an already opened chat-scoped flow.
@@ -535,6 +525,7 @@ impl ChatHistoryDelegate {
 
     /// Clears one chat-scoped flow after the chat itself is deleted.
     pub fn clearChatFlow(&self, chatId: &str) {
+        self.transcriptEvents.clearLive(chatId);
         self.transcriptEvents.record(chatId, "reset", None, None);
         let flow = self
             .chatMessageFlowsByChatId
@@ -1562,7 +1553,20 @@ impl ChatHistoryDelegate {
                 self.dispatchChatViewEvent(ChatViewEvent::ViewClosed, &previousChatId);
             }
         }
-        self.loadChatMessages(chatId);
+        if self.hasLegacyMessageWindow(&chatId) {
+            self.loadChatMessages(chatId);
+        } else {
+            self.currentChatWindow.reset();
+            self.hasOlderDisplayHistory = self.chatHistoryManager
+                .legacyDisplayHasOlder(&chatId, self.displayWindowQueryLimit())
+                .map_err(|error| error.to_string())?;
+            self.currentChatWindow.hasOlderDisplayHistory = self.hasOlderDisplayHistory;
+            self.hasNewerDisplayHistory = false;
+            self.isLoadingDisplayWindow = false;
+            self.currentChatIdFlow.set_value(Some(chatId.clone()));
+            self.dispatchChatViewEvent(ChatViewEvent::ViewOpened, &chatId);
+            self.emitDisplayWindowState();
+        }
         self.isInitialized = true;
         Ok(())
     }
@@ -2015,11 +2019,16 @@ impl ChatHistoryDelegate {
 
     #[allow(non_snake_case)]
     /// Removes the workspace binding from a chat.
-    pub fn unbindChatFromWorkspace(&mut self, chatId: String) {
+    pub fn unbindChatFromWorkspace(&mut self, chatId: String) -> Result<(), String> {
+        self.chatHistoryManager
+            .loadChatHistory(chatId.clone())
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("Chat does not exist: {chatId}"))?;
         self.chatHistoryManager
             .updateChatWorkspaceId(chatId.clone(), None)
-            .expect("ChatHistoryManager.updateChatWorkspaceId must succeed");
+            .map_err(|error| error.to_string())?;
         self.notifyChatWorkspaceChanged(&chatId);
+        Ok(())
     }
 
     #[allow(non_snake_case)]
@@ -2059,6 +2068,9 @@ impl ChatHistoryDelegate {
             return false;
         };
         self.transcriptEvents.record(&chatId, "upsert", Some(message.timestamp), Some(&message));
+        if !self.hasLegacyMessageWindow(&chatId) {
+            return true;
+        }
         let messageSummary = chat_message_trace_summary(&message);
         let flow = self.mutableChatMessageFlowForChat(chatId.clone());
         let mut messages = flow.value();

@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import '../../../../../util/ChatMarkupRegex.dart';
 import '../../../../common/markdown/MarkdownNodeGrouper.dart';
 import 'ToolDisplayComponents.dart';
+import 'TranscriptToolOutput.dart';
 
 /// Merges ordered tool calls with any results that have arrived so far.
 class ToolCallResultMergeRender extends MarkdownNodeMergeRender {
@@ -105,6 +106,9 @@ class ToolCallResultMergeRender extends MarkdownNodeMergeRender {
             resultData: index < results.length
                 ? results[index].node.resultData
                 : null,
+            deferredResultId: index < results.length
+                ? results[index].node.deferredResultId
+                : null,
             parameterMarkup: calls[index].node.parameterMarkup,
             resultText: index < results.length
                 ? results[index].node.resultText
@@ -136,6 +140,7 @@ class _ToolMergeNode {
     this.callId,
     this.display,
     this.resultData,
+    this.deferredResultId,
   });
 
   final _ToolMergeNodeKind kind;
@@ -147,6 +152,7 @@ class _ToolMergeNode {
   final String? callId;
   final ToolDisplayDeclaration? display;
   final Map<String, dynamic>? resultData;
+  final String? deferredResultId;
 }
 
 class _IndexedToolMergeNode {
@@ -169,12 +175,14 @@ class MergedToolCallResultRow extends StatelessWidget {
     this.callId,
     this.display,
     this.resultData,
+    this.deferredResultId,
   });
 
   final String toolName;
   final String? callId;
   final ToolDisplayDeclaration? display;
   final Map<String, dynamic>? resultData;
+  final String? deferredResultId;
   final String parameterMarkup;
   final String resultText;
   final bool? isSuccess;
@@ -194,6 +202,7 @@ class MergedToolCallResultRow extends StatelessWidget {
         resultData: resultData,
       ),
       isStreaming: isStreaming,
+      deferredResultId: deferredResultId,
     );
   }
 }
@@ -260,6 +269,7 @@ _ToolMergeNode? _parseToolMergeNode(MarkdownNodeStable node) {
     parameterMarkup: '',
     display: toolDisplayFromAttributes(node.xmlAttributes),
     resultData: decodeToolMetadata(node.xmlAttributes?['result_data']),
+    deferredResultId: node.xmlAttributes?[deferredToolOutputAttribute],
     resultText: _resultText(node),
     isSuccess: status == null || status.isEmpty || status == 'success',
   );

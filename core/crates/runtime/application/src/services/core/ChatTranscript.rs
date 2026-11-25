@@ -24,11 +24,14 @@ type Journal = MutableStateFlow<Vec<ChatTranscriptChange>>;
 /// A short replay buffer survives coalescing in StateFlow. The client reloads
 /// around its current anchor if it falls behind the oldest retained change.
 #[derive(Clone, Default)]
-pub(crate) struct TranscriptEvents(Arc<Mutex<HashMap<String, Weak<Journal>>>>);
+pub(crate) struct TranscriptEvents {
+    topics: Arc<Mutex<HashMap<String, Weak<Journal>>>>,
+    live: Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>,
+}
 
 impl TranscriptEvents {
     pub fn watch(&self, chat_id: String) -> StateFlow<Vec<ChatTranscriptChange>> {
-        let mut topics = self.0.lock().expect("transcript registry");
+        let mut topics = self.topics.lock().expect("transcript registry");
         topics.retain(|_, topic| topic.strong_count() > 0);
         let topic = topics.get(&chat_id).and_then(Weak::upgrade).unwrap_or_else(|| {
             let topic = Arc::new(MutableStateFlow::new(Vec::new()));
@@ -41,8 +44,30 @@ impl TranscriptEvents {
         })
     }
 
+    pub fn live(&self, chat_id: &str) -> Vec<ChatMessage> {
+        self.live.lock().expect("live transcript registry").get(chat_id).cloned().unwrap_or_default()
+    }
+
+    pub fn clearLive(&self, chat_id: &str) {
+        self.live.lock().expect("live transcript registry").remove(chat_id);
+    }
+
     pub fn record(&self, chat_id: &str, kind: &str, timestamp: Option<i64>, message: Option<&ChatMessage>) {
-        let topic = self.0.lock().expect("transcript registry").get(chat_id).and_then(Weak::upgrade);
+        {
+            let mut live = self.live.lock().expect("live transcript registry");
+            if let Some(rows) = live.get_mut(chat_id) {
+                rows.retain(|row| match kind {
+                    "upsert" | "remove" => Some(row.timestamp) != timestamp,
+                    "removeFrom" => timestamp.is_none_or(|start| row.timestamp < start),
+                    _ => true,
+                });
+                if rows.is_empty() { live.remove(chat_id); }
+            }
+            if let Some(message) = message.filter(|message| message.contentStream.is_some()) {
+                live.entry(chat_id.into()).or_default().push(compact(message));
+            }
+        }
+        let topic = self.topics.lock().expect("transcript registry").get(chat_id).and_then(Weak::upgrade);
         let Some(topic) = topic else { return };
         let message = message.map(compact);
         topic.update(|journal| {

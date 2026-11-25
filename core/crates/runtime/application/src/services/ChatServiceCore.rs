@@ -1904,8 +1904,8 @@ impl ChatServiceCore {
 
     /// Removes the workspace binding from a chat without deleting workspace files.
     #[allow(non_snake_case)]
-    pub fn unbindChatFromWorkspace(&mut self, chatId: String) {
-        self.chatHistoryDelegate.unbindChatFromWorkspace(chatId);
+    pub fn unbindChatFromWorkspace(&mut self, chatId: String) -> Result<(), String> {
+        self.chatHistoryDelegate.unbindChatFromWorkspace(chatId)
     }
 
     /// Renames the workspace binding and chat title together.
@@ -2774,13 +2774,15 @@ impl ChatServiceCore {
         let live = self.chatHistoryDelegate.liveTranscriptMessages(&chatId);
         async move {
             run_transcript_read(move || {
-                let mut messages = manager.loadTranscriptMessages(&chatId, &direction, timestamp)
+                let mut messages = manager.loadTranscriptHeaders(&chatId, &direction, timestamp)
                     .map_err(|error| error.to_string())?;
                 let lower = messages.first().map(|row| row.timestamp);
                 let upper = messages.last().map(|row| row.timestamp);
                 for message in live {
-                    if let Ok(index) = messages.binary_search_by_key(&message.timestamp, |row| row.timestamp) {
-                        messages[index] = message;
+                    if let Some(row) = messages.iter_mut().find(|row| row.timestamp == message.timestamp) {
+                        if row.completedAt == 0 && row.selectedVariantIndex == message.selectedVariantIndex {
+                            *row = message;
+                        }
                     } else if direction == "latest" && upper.is_none_or(|bound| message.timestamp > bound) {
                         messages.push(message);
                     }
@@ -2799,6 +2801,41 @@ impl ChatServiceCore {
                 };
                 Ok(ChatTranscriptPage { messages, hasOlder, hasNewer })
             }).await
+        }
+    }
+
+    /// Hydrates one batch of visible messages without a round trip per row.
+    pub fn loadTranscriptBodies(
+        &self, chatId: String, timestamps: Vec<i64>,
+    ) -> impl std::future::Future<Output = Result<Vec<ChatMessage>, String>> + 'static {
+        let manager = self.chatHistoryDelegate.chatHistoryManager.clone();
+        async move {
+            let defer = !ToolPkgMessageTransformBridge::hasDisplayHooks()
+                && !ToolPkgXmlRenderBridge::hasHookForTag("tool_result");
+            run_transcript_read(move || manager.loadTranscriptBodies(&chatId, &timestamps, defer)
+                .map_err(|error| error.to_string())).await
+        }
+    }
+
+    /// Resolves one tool result only when its disclosure is opened.
+    pub fn loadTranscriptToolOutput(
+        &self, chatId: String, timestamp: i64, selectedVariantIndex: i32, partId: String,
+    ) -> impl std::future::Future<Output = Result<Option<String>, String>> + 'static {
+        let manager = self.chatHistoryDelegate.chatHistoryManager.clone();
+        async move {
+            run_transcript_read(move || manager.loadTranscriptToolOutput(&chatId, timestamp, selectedVariantIndex, &partId)
+                .map_err(|error| error.to_string())).await
+        }
+    }
+
+    /// Reads message-map metadata independently of preview text and search.
+    pub fn loadTranscriptLocator(
+        &self, chatId: String,
+    ) -> impl std::future::Future<Output = Result<Vec<ChatMessageLocatorPreview>, String>> + 'static {
+        let manager = self.chatHistoryDelegate.chatHistoryManager.clone();
+        async move {
+            run_transcript_read(move || manager.loadTranscriptLocator(&chatId)
+                .map_err(|error| error.to_string())).await
         }
     }
 

@@ -27,6 +27,7 @@ import 'DialogComponents.dart';
 import 'FontTagRenderer.dart';
 import 'ThinkingPreviewBuffer.dart';
 import 'ToolDisplayComponents.dart';
+import 'TranscriptToolOutput.dart';
 import 'XmlCanvasBlockComponents.dart';
 
 class CustomXmlRenderer extends StatelessWidget {
@@ -144,6 +145,7 @@ class CustomXmlRenderer extends StatelessWidget {
       case 'tool_result':
         final result = _extractToolResult(parsed, xmlContent);
         return ToolCallRow(
+          deferredResultId: parsed.attributes[deferredToolOutputAttribute],
           presentation: ToolPresentation.fromResult(
             result.toolName,
             result.resultContent,

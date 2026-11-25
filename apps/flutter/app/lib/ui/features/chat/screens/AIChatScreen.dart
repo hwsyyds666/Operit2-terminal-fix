@@ -1,5 +1,6 @@
 // ignore_for_file: file_names
 
+import '../../../../core/link/CoreLinkProtocol.dart' show CoreLinkError;
 import 'dart:async';
 import 'dart:convert';
 
@@ -438,6 +439,7 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
     _topBarController = TopBarScope.of(context);
     _mainLayoutController = MainLayoutScope.of(context);
     _isCurrentMainScreen = MainScreenActivityScope.isCurrentScreenOf(context);
+    _transcript?.setActive(_isCurrentMainScreen);
     _updateIncomingAttachmentReceiver();
     if (_isCurrentMainScreen) {
       _scheduleTopBarActionsUpdate();
@@ -1837,6 +1839,7 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
         return;
       }
       final chat = _viewModel.transcriptCore;
+      var supportsBodyBatch = true;
       final transcript = ChatTranscriptController(
         readPage: (direction, timestamp) => chat.loadTranscriptPage(
           chatId: chatId,
@@ -1845,6 +1848,36 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
         ),
         readMessage: (timestamp) =>
             chat.loadTranscriptMessage(chatId: chatId, timestamp: timestamp),
+        readToolOutput: (timestamp, variant, partId) =>
+            chat.loadTranscriptToolOutput(
+              chatId: chatId,
+              timestamp: timestamp,
+              selectedVariantIndex: variant,
+              partId: partId,
+            ),
+        readBodies: (timestamps) async {
+          if (supportsBodyBatch) {
+            try {
+              return await chat.loadTranscriptBodies(
+                chatId: chatId,
+                timestamps: timestamps,
+              );
+            } catch (error) {
+              if (!_unsupportedTranscriptMethod(error, 'loadTranscriptBodies'))
+                rethrow;
+              supportsBodyBatch = false;
+            }
+          }
+          final rows = <ChatUiMessage>[];
+          for (final timestamp in timestamps) {
+            final row = await chat.loadTranscriptMessage(
+              chatId: chatId,
+              timestamp: timestamp,
+            );
+            if (row != null) rows.add(row);
+          }
+          return rows;
+        },
         visibleTimestamp: () => _messageNavigation.visibleTimestamp,
         followLatest: () => _autoScrollToBottom,
         onChanged: () {
@@ -1860,6 +1893,7 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
         },
       );
       _transcript = transcript;
+      transcript.setActive(widget.embedded || _isCurrentMainScreen);
       void fallBack() {
         if (!isCurrent() || !identical(_transcript, transcript)) return;
         transcript.dispose();
@@ -1956,7 +1990,7 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
             rows.add(
               _transcriptBodyDeferred(row)
                   ? await transcript
-                            .hydrate(row)
+                            .readMessage(row.timestamp)
                             .catchError((Object _) => null) ??
                         row
                   : row,
@@ -2464,7 +2498,35 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
     _autoScrollToBottomNotifier.value = value;
   }
 
-  /// Reads the complete lightweight message index independently of the transcript window.
+  bool _unsupportedTranscriptMethod(Object error, String method) {
+    if (error is CoreLinkError && error.code == 'METHOD_NOT_FOUND') return true;
+    final message = error.toString().toLowerCase();
+    return message.contains(method.toLowerCase()) &&
+        (message.contains('unknown') ||
+            message.contains('not found') ||
+            message.contains('unsupported') ||
+            message.contains('no such method'));
+  }
+
+  /// Reads the rail without assembling previews for every message.
+  Future<List<ChatMessageLocatorPreview>> _loadMessageRail(
+    String chatId,
+    String query,
+  ) async {
+    if (_transcript != null && query.isEmpty) {
+      try {
+        return await _viewModel.transcriptCore.loadTranscriptLocator(
+          chatId: chatId,
+        );
+      } catch (error) {
+        if (!_unsupportedTranscriptMethod(error, 'loadTranscriptLocator'))
+          rethrow;
+      }
+    }
+    return _loadMessageLocatorEntries(chatId, query);
+  }
+
+  /// Searches all persisted messages and returns matching previews.
   Future<List<ChatMessageLocatorPreview>> _loadMessageLocatorEntries(
     String chatId,
     String query,
@@ -3052,7 +3114,7 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
           hasNewerDisplayHistory: data.hasNewerDisplayHistory,
           isLoadingDisplayWindow: data.isLoadingDisplayWindow,
           messageNavigation: _messageNavigation,
-          loadLocatorEntries: _loadMessageLocatorEntries,
+          loadLocatorEntries: _loadMessageRail,
           onRevealMessageForLocator: _revealTranscriptMessage,
           onAutoScrollToBottomChanged: _setAutoScrollToBottom,
           onLoadOlderDisplayWindow: _loadOlderDisplayWindow,

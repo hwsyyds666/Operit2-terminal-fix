@@ -10,6 +10,7 @@ import 'MarkdownNodeGrouper.dart';
 import 'MarkdownSelectionArea.dart';
 import 'StreamMarkdownRenderer.dart';
 import 'StreamMarkdownRendererState.dart';
+import 'TranscriptMarkdownViewport.dart';
 
 const double tableMinColumnWidth = 80;
 const double tableMaxColumnWidth = 320;
@@ -21,7 +22,7 @@ const double tableBorderWidth = 1;
 const double tableGridWidth = 0.5;
 const double tableLineHeight = markdownLineHeight;
 
-class EnhancedTableBlock extends StatelessWidget {
+class EnhancedTableBlock extends StatefulWidget {
   const EnhancedTableBlock({
     super.key,
     required this.tableText,
@@ -34,14 +35,87 @@ class EnhancedTableBlock extends StatelessWidget {
   final MarkdownContentSplitter splitMarkdownContent;
 
   @override
-  Widget build(BuildContext context) {
-    return LayoutBuilder(
-      builder: (context, constraints) => _buildTable(context),
-    );
+  State<EnhancedTableBlock> createState() => _EnhancedTableBlockState();
+}
+
+class _EnhancedTableBlockState extends State<EnhancedTableBlock> {
+  late var _parsed = _parseTable(widget.tableText);
+  final _plans = <String, Future<List<MarkdownNodeStable>>>{};
+  (TextStyle?, TextStyle?, TextScaler, TextDirection)? _widthContext;
+  Map<int, TableColumnWidth>? _widths;
+
+  @override
+  void didUpdateWidget(EnhancedTableBlock oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.tableText != widget.tableText) {
+      _parsed = _parseTable(widget.tableText);
+      _widths = null;
+    }
+    if (oldWidget.splitMarkdownContent != widget.splitMarkdownContent) {
+      _plans.clear();
+    }
   }
 
-  Widget _buildTable(BuildContext context) {
-    final parsed = _parseTable(tableText);
+  Future<List<MarkdownNodeStable>> _cellPlan(String text) {
+    final cached = _plans.remove(text);
+    final plan =
+        cached ??
+        widget.splitMarkdownContent(text).then(markdownNodesFromEvents);
+    _plans[text] = plan;
+    if (_plans.length > 256) _plans.remove(_plans.keys.first);
+    return plan;
+  }
+
+  Map<int, TableColumnWidth> _measureColumns(
+    BuildContext context,
+    int count,
+    TextStyle? body,
+    TextStyle? header,
+  ) {
+    final settings = (
+      body,
+      header,
+      MediaQuery.textScalerOf(context),
+      Directionality.of(context),
+    );
+    if (_widths != null && _widthContext == settings) return _widths!;
+    final widths = List<double>.filled(count, tableMinColumnWidth);
+    final candidates = List<(String, bool)>.filled(count, ('', false));
+    for (final entry in _parsed.rows.indexed) {
+      for (final cell in entry.$2.indexed) {
+        final text = cell.$2;
+        if (text.length > candidates[cell.$1].$1.length) {
+          candidates[cell.$1] = (text, entry.$1 == 0);
+        }
+      }
+    }
+    final painter = TextPainter(
+      textScaler: settings.$3,
+      textDirection: settings.$4,
+    );
+    for (final entry in candidates.indexed) {
+      final (text, isHeader) = entry.$2;
+      painter.text = TextSpan(text: text, style: isHeader ? header : body);
+      painter.layout();
+      final width = math.max(
+        painter.minIntrinsicWidth + tableCellHorizontalPadding * 2,
+        math.min(
+          tableMaxColumnWidth,
+          painter.maxIntrinsicWidth + tableCellHorizontalPadding * 2,
+        ),
+      );
+      widths[entry.$1] = width.clamp(tableMinColumnWidth, 2400).ceilToDouble();
+    }
+    painter.dispose();
+    _widthContext = settings;
+    return _widths = {
+      for (final entry in widths.indexed) entry.$1: FixedColumnWidth(entry.$2),
+    };
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final parsed = _parsed;
     final rows = parsed.rows;
     final alignments = parsed.alignments;
     if (rows.isEmpty) {
@@ -69,7 +143,7 @@ class EnhancedTableBlock extends StatelessWidget {
         ? Colors.transparent
         : theme.colorScheme.surface;
     final bodyTextStyle = theme.textTheme.bodySmall?.copyWith(
-      color: textColor,
+      color: widget.textColor,
       height: tableLineHeight,
     );
     final headerTextStyle = bodyTextStyle?.copyWith(
@@ -79,6 +153,59 @@ class EnhancedTableBlock extends StatelessWidget {
       0,
       (value, row) => row.length > value ? row.length : value,
     );
+    final virtual =
+        rows.length >= 24 && TranscriptMarkdownScope.enabledOf(context);
+    final widths = virtual
+        ? _measureColumns(context, maxColumns, bodyTextStyle, headerTextStyle)
+        : null;
+    TableRow tableRow(int rowIndex) => TableRow(
+      decoration: BoxDecoration(
+        color: rowIndex == 0 ? headerColor : bodyColor,
+        border: virtual && rowIndex != rows.length - 1
+            ? Border(
+                bottom: BorderSide(color: grid, width: tableGridWidth),
+              )
+            : null,
+      ),
+      children: [
+        for (var column = 0; column < maxColumns; column++)
+          ConstrainedBox(
+            constraints: const BoxConstraints(minWidth: tableMinColumnWidth),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(
+                horizontal: tableCellHorizontalPadding,
+                vertical: tableCellVerticalPadding,
+              ),
+              child: _MarkdownTableCellText(
+                text: column < rows[rowIndex].length
+                    ? rows[rowIndex][column]
+                    : '',
+                textColor: widget.textColor,
+                style: rowIndex == 0 ? headerTextStyle : bodyTextStyle,
+                textAlign: column < alignments.length
+                    ? alignments[column]
+                    : TextAlign.left,
+                load: _cellPlan,
+              ),
+            ),
+          ),
+      ],
+    );
+    Widget table(List<TableRow> tableRows) => Table(
+      defaultColumnWidth: const _MarkdownTableColumnWidth(),
+      columnWidths: widths,
+      border: TableBorder(
+        horizontalInside: BorderSide(color: grid, width: tableGridWidth),
+        verticalInside: BorderSide(color: grid, width: tableGridWidth),
+      ),
+      children: tableRows,
+    );
+    final tableContent = virtual
+        ? TranscriptMarkdownViewport(
+            blockCount: rows.length,
+            builder: (context, index) => table([tableRow(index)]),
+          )
+        : table([for (var i = 0; i < rows.length; i++) tableRow(i)]);
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: tableOuterVerticalPadding),
       child: ClipRRect(
@@ -95,59 +222,7 @@ class EnhancedTableBlock extends StatelessWidget {
               child: SingleChildScrollView(
                 scrollDirection: Axis.horizontal,
                 physics: const BouncingScrollPhysics(),
-                child: Table(
-                  key: ValueKey(maxColumns),
-                  defaultColumnWidth: const _MarkdownTableColumnWidth(),
-                  border: TableBorder(
-                    horizontalInside: BorderSide(
-                      color: grid,
-                      width: tableGridWidth,
-                    ),
-                    verticalInside: BorderSide(
-                      color: grid,
-                      width: tableGridWidth,
-                    ),
-                  ),
-                  children: <TableRow>[
-                    for (var rowIndex = 0; rowIndex < rows.length; rowIndex++)
-                      TableRow(
-                        decoration: BoxDecoration(
-                          color: rowIndex == 0 ? headerColor : bodyColor,
-                        ),
-                        children: <Widget>[
-                          for (
-                            var columnIndex = 0;
-                            columnIndex < maxColumns;
-                            columnIndex++
-                          )
-                            ConstrainedBox(
-                              constraints: const BoxConstraints(
-                                minWidth: tableMinColumnWidth,
-                              ),
-                              child: Padding(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: tableCellHorizontalPadding,
-                                  vertical: tableCellVerticalPadding,
-                                ),
-                                child: _MarkdownTableCellText(
-                                  splitMarkdownContent: splitMarkdownContent,
-                                  text: columnIndex < rows[rowIndex].length
-                                      ? rows[rowIndex][columnIndex]
-                                      : '',
-                                  textColor: textColor,
-                                  style: rowIndex == 0
-                                      ? headerTextStyle
-                                      : bodyTextStyle,
-                                  textAlign: columnIndex < alignments.length
-                                      ? alignments[columnIndex]
-                                      : TextAlign.left,
-                                ),
-                              ),
-                            ),
-                        ],
-                      ),
-                  ],
-                ),
+                child: tableContent,
               ),
             ),
           ),
@@ -220,14 +295,14 @@ class _MarkdownTableCellText extends StatefulWidget {
     required this.textColor,
     required this.style,
     required this.textAlign,
-    required this.splitMarkdownContent,
+    required this.load,
   });
 
   final String text;
   final Color textColor;
   final TextStyle? style;
   final TextAlign textAlign;
-  final MarkdownContentSplitter splitMarkdownContent;
+  final Future<List<MarkdownNodeStable>> Function(String) load;
 
   @override
   State<_MarkdownTableCellText> createState() => _MarkdownTableCellTextState();
@@ -252,9 +327,7 @@ class _MarkdownTableCellTextState extends State<_MarkdownTableCellText> {
   void _load() {
     _nodes = widget.text.isEmpty
         ? Future.value(const [])
-        : widget
-              .splitMarkdownContent(widget.text)
-              .then(markdownNodesFromEvents);
+        : widget.load(widget.text);
   }
 
   @override

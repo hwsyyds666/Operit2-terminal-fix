@@ -1,3 +1,4 @@
+use crate::dao::MessageDao::TranscriptParts;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -405,6 +406,19 @@ impl ChatHistoryManager {
     pub fn loadTranscriptMessages(
         &self, chatId: &str, direction: &str, timestamp: Option<i64>,
     ) -> ChatHistoryManagerResult<Vec<ChatMessage>> {
+        self.readTranscriptPage(chatId, direction, timestamp, TranscriptParts::Small)
+    }
+
+    /// Loads the selected variant's metadata without touching message_parts.
+    pub fn loadTranscriptHeaders(
+        &self, chatId: &str, direction: &str, timestamp: Option<i64>,
+    ) -> ChatHistoryManagerResult<Vec<ChatMessage>> {
+        self.readTranscriptPage(chatId, direction, timestamp, TranscriptParts::Headers)
+    }
+
+    fn readTranscriptPage(
+        &self, chatId: &str, direction: &str, timestamp: Option<i64>, parts: TranscriptParts,
+    ) -> ChatHistoryManagerResult<Vec<ChatMessage>> {
         const PAGE: i32 = 20;
         let read = |predicate, order, limit, cursor| {
             let sql = format!("SELECT * FROM messages WHERE chatId = ?1 {predicate} ORDER BY timestamp {order} LIMIT ?2");
@@ -412,7 +426,7 @@ impl ChatHistoryManager {
             if let Some(timestamp) = cursor {
                 params.push(crate::SqliteStore::toSqliteValue(&timestamp));
             }
-            self.readTranscriptMessages(chatId, &sql, params, true)
+            self.readTranscriptMessages(chatId, &sql, params, parts)
         };
         match (direction, timestamp) {
             ("latest", None) => {
@@ -444,14 +458,45 @@ impl ChatHistoryManager {
     ) -> ChatHistoryManagerResult<Option<ChatMessage>> {
         Ok(self.readTranscriptMessages(
             chatId, "SELECT * FROM messages WHERE chatId = ?1 AND timestamp = ?2",
-            sqliteParams![chatId, timestamp], false,
+            sqliteParams![chatId, timestamp], TranscriptParts::Selected,
         )?.into_iter().next())
     }
 
+    /// Hydrates one small viewport batch in a consistent snapshot.
+    pub fn loadTranscriptBodies(&self, chatId: &str, timestamps: &[i64], deferToolDetails: bool) -> ChatHistoryManagerResult<Vec<ChatMessage>> {
+        if timestamps.is_empty() {
+            return Ok(Vec::new());
+        }
+        if timestamps.len() > 8 {
+            return Err(ChatHistoryManagerError::IllegalArgument("Transcript batch exceeds eight messages".into()));
+        }
+        let placeholders = vec!["?"; timestamps.len()].join(",");
+        let sql = format!("SELECT * FROM messages WHERE chatId = ? AND timestamp IN ({placeholders}) ORDER BY timestamp");
+        let mut params = sqliteParams![chatId];
+        params.extend(timestamps.iter().map(crate::SqliteStore::toSqliteValue));
+        let mode = if deferToolDetails { TranscriptParts::Display } else { TranscriptParts::Selected };
+        self.readTranscriptMessages(chatId, &sql, params, mode)
+    }
+
+    pub fn loadTranscriptToolOutput(
+        &self, chatId: &str, timestamp: i64, selectedVariantIndex: i32, partId: &str,
+    ) -> ChatHistoryManagerResult<Option<String>> {
+        Ok(self.messageDao.transcriptToolOutput(chatId, timestamp, selectedVariantIndex, partId)?)
+    }
+
+    pub fn loadTranscriptLocator(&self, chatId: &str) -> ChatHistoryManagerResult<Vec<ChatMessageLocatorPreview>> {
+        Ok(self.messageDao.transcriptLocator(chatId)?)
+    }
+
+    /// Reports whether the legacy first page has a predecessor, using only the timestamp index.
+    pub fn legacyDisplayHasOlder(&self, chatId: &str, pageSize: i32) -> ChatHistoryManagerResult<bool> {
+        self.messageDao.legacyDisplayHasOlder(chatId, pageSize).map_err(Into::into)
+    }
+
     fn readTranscriptMessages(
-        &self, chatId: &str, sql: &str, params: Vec<SqliteValue>, deferLargeBodies: bool,
+        &self, chatId: &str, sql: &str, params: Vec<SqliteValue>, parts: TranscriptParts,
     ) -> ChatHistoryManagerResult<Vec<ChatMessage>> {
-        let snapshot = self.messageDao.getTranscriptSnapshot(chatId, sql, params, deferLargeBodies)?;
+        let snapshot = self.messageDao.getTranscriptSnapshot(chatId, sql, params, parts)?;
         let mut selectedParts = HashMap::<(i64, i32), Vec<MessagePart>>::new();
         for part in snapshot.parts {
             selectedParts.entry((part.messageTimestamp, part.variantIndex))
@@ -1627,6 +1672,35 @@ impl ChatHistoryManager {
             .validate()
             .map_err(ChatHistoryManagerError::IllegalArgument)?;
         Ok(self.workspaceStore.upsert(workspace)?)
+    }
+
+    /// Selects the first working directory without changing folder identities or mounts.
+    pub fn setPrimaryWorkspaceFolder(
+        &self,
+        workspaceId: String,
+        folderName: String,
+    ) -> ChatHistoryManagerResult<Workspace> {
+        let mut workspace = self.workspaceStore.getById(&workspaceId)?.ok_or_else(|| {
+            ChatHistoryManagerError::IllegalArgument(format!(
+                "workspace does not exist: {workspaceId}"
+            ))
+        })?;
+        let index = workspace
+            .folders
+            .iter()
+            .position(|folder| folder.name == folderName)
+            .ok_or_else(|| {
+                ChatHistoryManagerError::IllegalArgument(format!(
+                    "workspace folder not found: {folderName}"
+                ))
+            })?;
+        if index == 0 {
+            return Ok(workspace);
+        }
+        let folder = workspace.folders.remove(index);
+        workspace.folders.insert(0, folder);
+        workspace.updatedAt = currentTimeMillis();
+        self.upsertWorkspace(workspace)
     }
 
     /// Deletes a workspace that is not bound to any chat.

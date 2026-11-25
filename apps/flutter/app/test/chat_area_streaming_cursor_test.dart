@@ -51,6 +51,51 @@ class _PositionPeakController extends ScrollController {
 
 /// Verifies transcript rendering and scroll ownership across asynchronous updates.
 void main() {
+  testWidgets('single transcript list keeps its visible row during history paging', (tester) async {
+    final scroll = ScrollController();
+    final follow = ValueNotifier(false);
+    addTearDown(scroll.dispose);
+    addTearDown(follow.dispose);
+
+    final rows = List.generate(38, (i) => _heightTestMessage(50000 + i, lines: 3));
+    Widget view(List<ChatUiMessage> messages) => _chatArea(
+      messages: messages,
+      isLoading: false,
+      scrollController: scroll,
+      autoScrollToBottom: follow,
+    );
+
+    await tester.pumpWidget(view(rows));
+    await tester.pumpAndSettle();
+    final viewport = find.byType(CustomScrollView);
+    final bounds = tester.getRect(viewport);
+    final slivers = find.byWidgetPredicate((widget) => widget is SliverList);
+    expect(slivers, findsOneWidget);
+    expect(tester.widget<CustomScrollView>(viewport).reverse, isTrue);
+    expect(scroll.position.extentBefore, closeTo(0, 1));
+    scroll.jumpTo(380);
+    await tester.pumpAndSettle();
+
+    final anchor = find.byWidgetPredicate((widget) => widget is CursorStyleChatMessage)
+        .evaluate().firstWhere((element) {
+          final box = element.renderObject! as RenderBox;
+          final top = box.localToGlobal(Offset.zero).dy;
+          return top > bounds.top + 5 && top < bounds.bottom - 80;
+        }).widget as CursorStyleChatMessage;
+    final target = find.byWidgetPredicate((widget) =>
+        widget is CursorStyleChatMessage && widget.message.timestamp == anchor.message.timestamp);
+    final top = tester.getTopLeft(target).dy;
+    await tester.pumpWidget(view([
+      ...List.generate(20, (i) => _heightTestMessage(49980 + i, lines: 5)),
+      ...rows,
+    ]));
+    await tester.pumpAndSettle();
+
+    expect(tester.getTopLeft(target).dy, closeTo(top, 1));
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox());
+  });
+
   testWidgets('keeps the previous body while a compact final row hydrates', (
     tester,
   ) async {

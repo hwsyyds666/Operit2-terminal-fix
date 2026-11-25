@@ -1026,3 +1026,36 @@ fn incomplete_import_cannot_commit_a_message_without_parts() {
     assert_eq!(manager.loadChatMessagesRange("older".to_string(), "asc".to_string(), 0, 79).unwrap(), before);
     assert_eq!(manager.syncClock().unwrap(), clockBefore);
 }
+
+#[test]
+fn transcript_window_reads_headers_and_defers_the_exact_tool_output() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (manager, _) = chatOrderFixture("transcript-viewport");
+    let mut base = ChatMessage::new_with_markdown_timestamp("ai".into(), "answer".into(), 100);
+    base.parts.push(MessagePart::toolResult(
+        "result".into(), 1, Some("call".into()), "read".into(), "success".into(), "日志".repeat(8000),
+    ));
+    manager.addMessage("older".into(), base).unwrap();
+    let headers = manager.loadTranscriptHeaders("older", "latest", None).unwrap();
+    assert_eq!(headers[0].timestamp, 100);
+    assert!(headers[0].parts.is_empty());
+
+    let display = manager.loadTranscriptBodies("older", &[100], true).unwrap();
+    assert_eq!(display[0].displayText(), "answer");
+    assert!(display[0].parts[1].content.is_empty());
+    assert_eq!(display[0].parts[1].attributes["operit_deferred_output"], "result");
+    assert_eq!(manager.loadTranscriptBodies("older", &[100], false).unwrap()[0].parts[1].content, "日志".repeat(8000));
+    assert_eq!(manager.loadTranscriptToolOutput("older", 100, 0, "result").unwrap().unwrap(), "日志".repeat(8000));
+
+    let rail = manager.loadTranscriptLocator("older").unwrap();
+    assert_eq!(rail[0].timestamp, 100);
+    assert!(rail[0].previewContent.is_empty());
+    assert!(manager.loadChatMessageLocatorPreviews("older".into(), "answer".into()).unwrap()[0].previewContent.contains("answer"));
+
+    let variant = ChatMessage::new_with_markdown_timestamp("ai".into(), "alternate".into(), 100);
+    manager.addMessageVariant("older".into(), 100, variant).unwrap();
+    assert!(manager.loadTranscriptToolOutput("older", 100, 0, "result").unwrap().is_none());
+    let display = manager.loadTranscriptBodies("older", &[100], true).unwrap();
+    assert_eq!(display[0].selectedVariantIndex, 1);
+    assert_eq!(display[0].displayText(), "alternate");
+}

@@ -16,6 +16,14 @@ pub(crate) struct MessageSnapshot {
     pub parts: Vec<MessagePartEntity>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum TranscriptParts {
+    Headers,
+    Small,
+    Selected,
+    Display,
+}
+
 #[derive(Clone)]
 pub struct MessageDao {
     store: SqliteStore,
@@ -43,9 +51,9 @@ impl MessageDao {
         chatId: &str,
         sql: &str,
         params: Vec<SqliteValue>,
-        deferLargeBodies: bool,
+        parts: TranscriptParts,
     ) -> Result<MessageSnapshot, SqliteStoreError> {
-        self.readSnapshot(chatId, sql, params, Some(deferLargeBodies))
+        self.readSnapshot(chatId, sql, params, Some(parts))
     }
 
     fn readSnapshot(
@@ -53,7 +61,7 @@ impl MessageDao {
         chatId: &str,
         sql: &str,
         params: Vec<SqliteValue>,
-        transcriptRead: Option<bool>,
+        transcriptRead: Option<TranscriptParts>,
     ) -> Result<MessageSnapshot, SqliteStoreError> {
         self.store.transaction(|transaction| {
             let messages = transaction.queryRows(sql, params)?
@@ -68,8 +76,11 @@ impl MessageDao {
                 &format!("SELECT * FROM message_variants WHERE chatId = ? AND messageTimestamp IN ({placeholders}) ORDER BY messageTimestamp, variantIndex"),
                 params.clone(),
             )?.iter().map(mapMessageVariantEntity).collect::<Result<_, _>>()?;
+            if matches!(transcriptRead, Some(TranscriptParts::Headers)) {
+                return Ok(MessageSnapshot { messages, variants, parts: Vec::new() });
+            }
             let partsSql = match transcriptRead {
-                Some(true) => format!(
+                Some(TranscriptParts::Small) => format!(
                     "WITH small AS (
                         SELECT p.chatId, p.messageTimestamp, p.variantIndex
                         FROM message_parts p JOIN messages m
@@ -82,7 +93,28 @@ impl MessageDao {
                     SELECT p.* FROM small JOIN message_parts p USING (chatId, messageTimestamp, variantIndex)
                     ORDER BY p.messageTimestamp, p.sequence"
                 ),
-                Some(false) => format!(
+                Some(TranscriptParts::Headers) => unreachable!("headers returned above"),
+                Some(TranscriptParts::Display) => format!(
+                    "WITH selected AS (
+                        SELECT p.*, CASE WHEN p.kind = 'tool_result'
+                            AND json_extract(p.attributesJson, '$.result_data') IS NULL
+                            AND json_extract(CASE WHEN m.selectedVariantIndex = 0
+                                THEN m.pluginExtensions ELSE v.pluginExtensions END,
+                                '$.\"host.response.presentation\"') IS NULL
+                            THEN 1 ELSE 0 END AS defer_output
+                        FROM message_parts p JOIN messages m
+                            ON m.chatId=p.chatId AND m.timestamp=p.messageTimestamp AND m.selectedVariantIndex=p.variantIndex
+                        LEFT JOIN message_variants v ON v.chatId=p.chatId
+                            AND v.messageTimestamp=p.messageTimestamp AND v.variantIndex=p.variantIndex
+                        WHERE p.chatId = ? AND p.messageTimestamp IN ({placeholders})
+                    )
+                    SELECT chatId, messageTimestamp, variantIndex, partId, sequence, kind, toolCallId, toolName,
+                        CASE WHEN defer_output THEN '' ELSE content END AS content,
+                        CASE WHEN defer_output THEN json_set(attributesJson, '$.operit_deferred_output', partId)
+                            ELSE attributesJson END AS attributesJson
+                    FROM selected ORDER BY messageTimestamp, sequence"
+                ),
+                Some(TranscriptParts::Selected) => format!(
                     "SELECT p.* FROM message_parts p JOIN messages m
                         ON m.chatId = p.chatId AND m.timestamp = p.messageTimestamp
                         AND m.selectedVariantIndex = p.variantIndex
@@ -138,6 +170,34 @@ impl MessageDao {
             "SELECT (SELECT COUNT(*) FROM messages AS earlier WHERE earlier.chatId = messages.chatId AND earlier.timestamp < messages.timestamp) FROM messages WHERE chatId = ?1 AND timestamp = ?2",
             sqliteParams![chatId, timestamp],
         )?.map(|row| row.get(0)).transpose()
+    }
+
+    pub(crate) fn transcriptToolOutput(
+        &self, chatId: &str, timestamp: i64, selectedVariantIndex: i32, partId: &str,
+    ) -> Result<Option<String>, SqliteStoreError> {
+        self.store.queryScalar(
+            "SELECT (SELECT p.content FROM message_parts p JOIN messages m
+                ON m.chatId=p.chatId AND m.timestamp=p.messageTimestamp AND m.selectedVariantIndex=p.variantIndex
+                WHERE p.chatId=?1 AND p.messageTimestamp=?2 AND p.variantIndex=?3
+                AND p.partId=?4 AND p.kind='tool_result')",
+            sqliteParams![chatId, timestamp, selectedVariantIndex, partId],
+        )
+    }
+
+    pub(crate) fn legacyDisplayHasOlder(&self, chatId: &str, pageSize: i32) -> Result<bool, SqliteStoreError> {
+        self.store.queryScalar("SELECT EXISTS(SELECT 1 FROM messages WHERE chatId = ?1 ORDER BY timestamp DESC LIMIT 1 OFFSET ?2)",
+            sqliteParams![chatId, pageSize])
+    }
+
+    /// Reads the rail without looking at any message part or decoding plugin payloads.
+    pub(crate) fn transcriptLocator(&self, chatId: &str) -> Result<Vec<ChatMessageLocatorPreview>, SqliteStoreError> {
+        self.store.queryRows(
+            "SELECT ROW_NUMBER() OVER (ORDER BY timestamp) - 1 AS messageIndex,
+                    timestamp, sender, '' AS previewContent, 0 AS contentLength,
+                    displayMode, isFavorite, '' AS displayName
+             FROM messages WHERE chatId = ? ORDER BY timestamp",
+            sqliteParams![chatId],
+        )?.iter().map(mapLocatorPreview).collect()
     }
 
     /// Reads every matching index entry while returning only metadata and a bounded text preview.

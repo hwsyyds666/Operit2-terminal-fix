@@ -214,6 +214,7 @@ class UserPreferencesManager {
     'bubbleUserContentPaddingRight': 'bubble_content_padding_right',
     'bubbleAiContentPaddingLeft': 'bubble_ai_content_padding_left',
     'bubbleAiContentPaddingRight': 'bubble_ai_content_padding_right',
+    'chatContentHorizontalPadding': 'chat_content_horizontal_padding',
     'customUserAvatarUri': 'custom_user_avatar_uri',
     'avatarShape': 'avatar_shape',
     'avatarCornerRadius': 'avatar_corner_radius',
