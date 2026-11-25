@@ -8,6 +8,7 @@ use crate::plugins::toolpkg::ToolPkgChatViewHookBridge::{
 };
 use crate::plugins::toolpkg::ToolPkgInputMenuToggleBridge::ToolPkgInputMenuToggleBridge;
 use crate::services::ProviderRuntimeSupportService::ChatConfigurationApi;
+use super::ChatTranscript::{ChatTranscriptChange, TranscriptEvents, compact};
 use operit_host_api::TimeUtils::currentTimeMillis;
 use operit_model::ChatDisplayWindowState::ChatDisplayWindowState;
 use operit_model::ChatHistory::ChatHistory;
@@ -139,6 +140,7 @@ fn preserveLiveMessageStreams(
 
 /// Coordinates chat history persistence, current-chat state, and display-window updates.
 pub struct ChatHistoryDelegate {
+    transcriptEvents: TranscriptEvents,
     pub chatHistoryManager: ChatHistoryManager,
     pub selectionMode: ChatSelectionMode,
     pub chatMessageFlowsByChatId: Arc<Mutex<HashMap<String, MutableStateFlow<Vec<ChatMessage>>>>>,
@@ -180,6 +182,7 @@ impl ChatHistoryDelegate {
         let displayWindowStateFlowsByChatId = Arc::new(Mutex::new(HashMap::new()));
         let currentChatIdFlow = mutableStateFlow(None);
         let mut delegate = Self {
+            transcriptEvents: TranscriptEvents::default(),
             chatHistoryManager,
             selectionMode,
             chatMessageFlowsByChatId,
@@ -208,6 +211,7 @@ impl ChatHistoryDelegate {
     /// Clones the delegate while reusing live state-flow handles for core services.
     pub fn clone_for_core(&self) -> Self {
         Self {
+            transcriptEvents: self.transcriptEvents.clone(),
             chatHistoryManager: self.chatHistoryManager.clone(),
             selectionMode: self.selectionMode.clone(),
             chatMessageFlowsByChatId: self.chatMessageFlowsByChatId.clone(),
@@ -384,8 +388,19 @@ impl ChatHistoryDelegate {
             .map(|flow| flow.value())
     }
 
+    pub(crate) fn watchTranscript(&self, chatId: String) -> StateFlow<Vec<ChatTranscriptChange>> {
+        self.transcriptEvents.watch(chatId)
+    }
+
+    pub(crate) fn liveTranscriptMessages(&self, chatId: &str) -> Vec<ChatMessage> {
+        self.openedChatMessageFlowSnapshot(chatId).unwrap_or_default().iter()
+            .filter(|message| message.contentStream.is_some())
+            .map(compact).collect()
+    }
+
     /// Publishes one message replacement to an already opened chat-scoped flow.
     pub fn publishChatMessage(&self, chatId: &str, message: ChatMessage) {
+        self.transcriptEvents.record(chatId, "upsert", Some(message.timestamp), Some(&message));
         let messageSummary = chat_message_trace_summary(&message);
         let flow = self
             .chatMessageFlowsByChatId
@@ -459,6 +474,7 @@ impl ChatHistoryDelegate {
             .get(chatId)
             .cloned();
         let Some(flow) = flow else {
+            self.transcriptEvents.record(chatId, "reloadRow", Some(timestamp), None);
             return;
         };
         let mut messages = flow.value();
@@ -467,17 +483,22 @@ impl ChatHistoryDelegate {
             .find(|message| message.timestamp == timestamp)
         {
             update(message);
+            self.transcriptEvents.record(chatId, "upsert", Some(timestamp), Some(message));
             flow.set_value(messages);
+        } else {
+            self.transcriptEvents.record(chatId, "reloadRow", Some(timestamp), None);
         }
     }
 
     /// Removes one message from an already opened chat-scoped flow.
     pub fn removeChatMessage(&self, chatId: &str, timestamp: i64) {
+        self.transcriptEvents.record(chatId, "remove", Some(timestamp), None);
         self.retainChatFlowMessages(chatId, |message| message.timestamp != timestamp);
     }
 
     /// Removes every opened chat-scoped message at or after one timestamp.
     pub fn removeChatMessagesFrom(&self, chatId: &str, timestamp: i64) {
+        self.transcriptEvents.record(chatId, "removeFrom", Some(timestamp), None);
         self.retainChatFlowMessages(chatId, |message| message.timestamp < timestamp);
     }
 
@@ -514,6 +535,7 @@ impl ChatHistoryDelegate {
 
     /// Clears one chat-scoped flow after the chat itself is deleted.
     pub fn clearChatFlow(&self, chatId: &str) {
+        self.transcriptEvents.record(chatId, "reset", None, None);
         let flow = self
             .chatMessageFlowsByChatId
             .lock()
@@ -796,6 +818,11 @@ impl ChatHistoryDelegate {
         chatId: String,
         invalidatedMessageTimestamp: Option<i64>,
     ) -> Vec<ChatMessage> {
+        self.transcriptEvents.record(
+            &chatId,
+            if invalidatedMessageTimestamp.is_some() { "reloadRow" } else { "reset" },
+            invalidatedMessageTimestamp, None,
+        );
         let previousMessages = self
             .openedChatMessageFlowSnapshot(&chatId)
             .unwrap_or_default();
@@ -1209,6 +1236,7 @@ impl ChatHistoryDelegate {
             self.reloadCurrentChatDisplayHistory(chatId);
             return;
         }
+        self.transcriptEvents.record(&chatId, "reset", None, None);
         let flow = self
             .chatMessageFlowsByChatId
             .lock()
@@ -1406,6 +1434,11 @@ impl ChatHistoryDelegate {
                         .map_err(|error| error.to_string())?
                         .ok_or_else(|| format!("Current chat does not exist: {currentId}"))?;
                     if current.workspaceId == draft.workspaceId
+                        && crate::services::ChatModelBindingService::ChatModelBindingService::read(
+                            &self.chatHistoryManager,
+                            &crate::data::preferences::ModelConfigManager::ModelConfigManager::default(),
+                            &currentId,
+                        )?.is_none()
                         && !self
                             .chatHistoryManager
                             .hasUserMessage(currentId.clone())
@@ -2025,6 +2058,7 @@ impl ChatHistoryDelegate {
             );
             return false;
         };
+        self.transcriptEvents.record(&chatId, "upsert", Some(message.timestamp), Some(&message));
         let messageSummary = chat_message_trace_summary(&message);
         let flow = self.mutableChatMessageFlowForChat(chatId.clone());
         let mut messages = flow.value();
@@ -2060,6 +2094,9 @@ impl ChatHistoryDelegate {
         let mut message = ChatMessage::new_with_markdown_timestamp("ai".into(), text.into(), timestamp);
         message.sentAt = timestamp;
         message.completedAt = operit_host_api::TimeUtils::currentTimeMillis();
+        // Tag plain-text deliveries exactly like generated scheduled replies so the host
+        // identifies every delivery uniformly; the snapshot path keeps existing tags intact.
+        message.pluginExtensions.insert("host.chat.scheduled".into(), serde_json::json!({ "preparedAt": message.completedAt }));
         self.commitPreparedAssistantMessageSnapshot(chatId, message)
     }
 

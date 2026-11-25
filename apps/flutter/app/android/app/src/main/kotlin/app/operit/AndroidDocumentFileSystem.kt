@@ -28,6 +28,28 @@ class AndroidDocumentFileSystem(
     fun execute(encoded: String): String = try {
         val request = JSONObject(encoded)
         val value: Any? = when (request.getString("operation")) {
+            "verifyWritableDirectory" -> {
+                val root = node(request.getString("path"))
+                val name = request.getString("name")
+                require(root.tree != null && root.stat().getBoolean("isDirectory")) { "Not a document directory" }
+                require(relativeParts(name).size == 1) { "Invalid probe name" }
+                val tree = root.tree
+                if (!documents.hasWriteGrant(tree)) throw SecurityException("Selected document tree is read-only")
+                val parent = root.documentId()
+                require(findChild(tree, parent, name) == null) { "Probe already exists" }
+                val id = documents.create(tree, parent, name, false)
+                try {
+                    require(documents.describe(tree, id).name == name) { "Provider changed the probe filename" }
+                    documents.output(tree, id, false).use { it.write(name.toByteArray(Charsets.UTF_8)) }
+                    require(findChild(tree, parent, name) == id) { "Created file is not visible under its original name" }
+                    require(documents.input(tree, id).use { it.readBytes().toString(Charsets.UTF_8) } == name) {
+                        "Backup directory write verification failed"
+                    }
+                } finally {
+                    check(documents.delete(tree, id)) { "Could not remove the backup probe" }
+                }
+                JSONObject.NULL
+            }
             "resolveNativeDirectory" -> node(request.getString("path")).nativeDirectory()
             "listFiles" -> JSONArray(node(request.getString("path")).children().map { it.entry() })
             "readFileBytes", "readFileWithLimit" -> {
@@ -220,8 +242,18 @@ class AndroidDocumentFileSystem(
                     current = existing
                 } else {
                     if (index < parts.lastIndex && !parents) throw Missing("Parent directory does not exist")
-                    require(documents.describe(tree, current).writable) { "Provider does not support creating children in this directory" }
-                    current = documents.create(tree, current, part, isDirectory)
+                    val created = documents.create(tree, current, part, isDirectory)
+                    val actualName = try {
+                        documents.describe(tree, created).name
+                    } catch (error: Exception) {
+                        runCatching { documents.delete(tree!!, created) }
+                        throw error
+                    }
+                    if (actualName != part) {
+                        runCatching { documents.delete(tree!!, created) }
+                        throw IllegalStateException("Document provider changed the requested name: $part → $actualName")
+                    }
+                    current = created
                 }
             }
             return current
@@ -269,7 +301,6 @@ class AndroidDocumentFileSystem(
         fun output(append: Boolean): OutputStream {
             writable()
             val created = ensure(false, true)
-            if (tree != null) require(documents.describe(tree, created!!).writable) { "Provider reports this document as read-only" }
             return file?.outputStreamFor(append) ?: documents.output(tree!!, created!!, append)
         }
         fun isNativeSymlink(): Boolean = file?.parentFile?.let { parent ->
@@ -279,7 +310,6 @@ class AndroidDocumentFileSystem(
             require(depth <= 128 && seen.add(identity())) { "Deletion encountered a cycle or excessive depth" }
             writable()
             require(file != null || relative.isNotEmpty()) { "Cannot delete a document mount root" }
-            if (tree != null) require(documents.describe(tree, documentId()).deletable) { "Provider does not support deleting this document" }
             if (!isNativeSymlink() && stat().getBoolean("isDirectory")) {
                 val children = children()
                 require(recursive || children.isEmpty()) { "Directory is not empty; recursive deletion is required" }

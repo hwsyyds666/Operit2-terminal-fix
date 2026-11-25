@@ -483,14 +483,17 @@ pub struct ToolPkgJsonObject {
 pub enum ToolPkgAppLifecycleEvent {
     #[serde(rename = "application_on_create")]
     ApplicationOnCreate,
+    /// The main UI is shown. Replayed at registration when this is the current state.
     #[serde(rename = "application_on_foreground")]
     ApplicationOnForeground,
+    /// The main UI is hidden/minimized or its scene/tab is backgrounded; never mere focus loss.
     #[serde(rename = "application_on_background")]
     ApplicationOnBackground,
     #[serde(rename = "application_on_low_memory")]
     ApplicationOnLowMemory,
     #[serde(rename = "application_on_trim_memory")]
     ApplicationOnTrimMemory,
+    /// An orderly runtime termination notification, when available. UI detach is not termination.
     #[serde(rename = "application_on_terminate")]
     ApplicationOnTerminate,
     #[serde(rename = "activity_on_create")]
@@ -1610,6 +1613,10 @@ pub struct ToolPkgChatRuntimeEventPayload {
     pub base_json_object: ToolPkgJsonObject,
     /// Identifies the conversation whose state changed.
     pub chatId: String,
+    /// Title of the real work item owned by this execution, when available.
+    pub taskTitle: Option<String>,
+    /// Actual model response rounds in the current execution; not tool invocation count.
+    pub currentRound: f64,
     /// Identifies the runtime slot that owns the chat.
     pub slot: ToolPkgChatRuntimeSlotName,
     /// Identifies the current observable processing state.
@@ -2209,7 +2216,12 @@ pub struct ToolPkgDesktopWidgetRegistration {
     /// Controls relative placement in the host UI.
     pub order: Option<f64>,
 }
-/// Binds an application lifecycle event to a plugin callback.
+/// Binds an application lifecycle event to a durable plugin callback.
+/// Application foreground/background describe the main UI, across all platforms:
+/// minimized/hidden desktop windows, background mobile scenes and hidden Web tabs
+/// are background. Focus loss, occlusion and plugin windows never change this state.
+/// New registrations receive application creation and the latest known foreground
+/// or background state. No raw host-event subscription or visibility query is needed.
 pub struct ToolPkgAppLifecycleHookRegistration {
     /// Uniquely identifies this app lifecycle hook registration within the package.
     pub id: String,
@@ -2874,6 +2886,15 @@ pub struct ToolPkgSummaryGenerateHookRegistration {
     /// Provides the callback invoked for this summary generate hook registration.
     pub function: ToolPkgSummaryGenerateHookHandler,
 }
+/// Describes one declared argument of a ToolPkg slash command.
+pub struct ToolPkgCoreCommandArgDeclaration {
+    /// Names the argument as shown by command completion surfaces.
+    pub name: String,
+    /// Marks whether the command cannot run without this argument; defaults to true when omitted.
+    pub required: Option<bool>,
+    /// Lists the known literal values offered by command completion surfaces.
+    pub options: Option<Vec<String>>,
+}
 /// Describes a slash command implemented by a ToolPkg callback.
 pub struct ToolPkgCoreCommandRegistration {
     /// Uniquely identifies this command registration within the package.
@@ -2886,6 +2907,8 @@ pub struct ToolPkgCoreCommandRegistration {
     pub description: ToolPkgLocalizedText,
     /// Documents the command usage displayed by command discovery surfaces.
     pub usage: String,
+    /// Declares structured argument metadata for command completion; omitted for legacy commands.
+    pub args: Option<Vec<ToolPkgCoreCommandArgDeclaration>>,
     /// Provides the callback invoked when this command is executed.
     pub function: ToolPkgCoreCommandHandler,
 }
@@ -3096,6 +3119,8 @@ pub struct ToolPkgFloatingWindowOptions {
 }
 /// Opens a transparent live UI surface owned by the executing plugin.
 pub struct ToolPkgFloatingWindowOpenOptions {
+    /// Explicitly limits this window to the application view; defaults to false.
+    pub applicationOnly: Option<bool>,
     /// Identifies the window within this plugin; opening an existing ID fails.
     pub id: String,
     /// Selects one of this plugin's registered Compose UI routes.
@@ -3109,6 +3134,8 @@ pub struct ToolPkgFloatingWindowOpenOptions {
 }
 /// Declares the content of one managed window; route and fill stay fixed while it exists.
 pub struct ToolPkgFloatingWindowContent {
+    /// Explicitly limits this window to the application view; defaults to false.
+    pub applicationOnly: Option<bool>,
     pub route: String,
     /// Shallow-merges supplied JSON state into the live UI session.
     pub state: Option<JsObject>,
@@ -3131,6 +3158,10 @@ pub enum ToolPkgFloatingWindowSetResult {
 /// Reports the actual presentation scope and host capabilities.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolPkgFloatingWindowCapabilities {
+    /// Reports camera support independently of system overlay support.
+    pub cameraSupported: bool,
+    /// Requires an application window for camera preview on this host.
+    pub cameraRequiresApplicationWindow: bool,
     /// "system", "application", or "unsupported". Application scope stays inside Operit.
     pub scope: String,
     pub systemOverlay: bool,
@@ -3141,6 +3172,8 @@ pub struct ToolPkgFloatingWindowCapabilities {
     pub alwaysOnTop: bool,
     pub clickThrough: bool,
     pub focusable: bool,
+    /// Indicates support for echo cancellation in microphone capture.
+    pub recordingEchoCancellation: Option<bool>,
 }
 /// Describes a live window owned by the executing plugin.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3156,12 +3189,26 @@ pub struct ToolPkgFloatingWindowRecordingOptions {
     pub maxDurationMs: Option<u32>,
     /// Stops after this much trailing silence (300–3000 ms) once speech is detected.
     pub silenceMs: Option<u32>,
+    /// Requests echo cancellation and keeps a short lead-in before detected speech.
+    pub echoCancellation: Option<bool>,
 }
 /// Carries a complete speech recording ready for STT.
 pub struct ToolPkgFloatingWindowRecording {
     pub audio: Vec<u8>,
     pub fileName: String,
     pub contentType: String,
+}
+/// Selects the presentation scope queried without opening a window.
+pub struct ToolPkgFloatingWindowCapabilityOptions {
+    pub applicationOnly: Option<bool>,
+}
+/// Describes a temporary camera selection; plugins persist files needed after app exit.
+pub struct ToolPkgFloatingWindowCameraFrame {
+    /// Temporary VFS path; copy to persistent storage before retaining in chat history.
+    pub path: String,
+    pub name: String,
+    pub mimeType: String,
+    pub size: i64,
 }
 /// Controls general floating windows independently of launcher widgets.
 pub struct ToolPkgFloatingWindowApi;
@@ -3170,7 +3217,7 @@ pub trait ToolPkgFloatingWindowApiMethods: Send + Sync {
     /// The host serializes lifecycle changes. Unavailable hosts return an explicit status; other errors reject.
     fn set(&self, id: String, content: JsNullable<ToolPkgFloatingWindowContent>) -> JsFuture<ToolPkgFloatingWindowSetResult>;
     /// Queries capabilities without opening a window or displaying a permission prompt.
-    fn capabilities(&self) -> JsFuture<ToolPkgFloatingWindowCapabilities>;
+    fn capabilities(&self, options: Option<ToolPkgFloatingWindowCapabilityOptions>) -> JsFuture<ToolPkgFloatingWindowCapabilities>;
     /// Opens the host's overlay permission settings when required; query capabilities again afterwards.
     fn requestPermission(&self) -> JsFuture<bool>;
     /// Creates a transparent live route session. IDs are local to the executing plugin.
@@ -3189,10 +3236,16 @@ pub trait ToolPkgFloatingWindowApiMethods: Send + Sync {
     fn record(&self, id: String, options: Option<ToolPkgFloatingWindowRecordingOptions>) -> JsFuture<JsNullable<ToolPkgFloatingWindowRecording>>;
     /// Reads the normalized microphone level (0 to 1) for this owned window; zero while idle.
     fn recordingLevel(&self, id: String) -> JsFuture<f64>;
+    /// Reports whether the current recording has detected speech.
+    fn recordingHasSpeech(&self, id: String) -> JsFuture<bool>;
     /// Ends active capture and delivers its WAV to the pending record call.
     fn finishRecording(&self, id: String) -> JsFuture<()>;
     /// Discards active capture without returning audio.
     fn cancelRecording(&self, id: String) -> JsFuture<()>;
+    /// Changes the window geometry without resetting the live UI or camera.
+    fn setFullscreen(&self, id: String, fullscreen: bool) -> JsFuture<()>;
+    /// Captures a temporary file from a user-enabled camera; null while off, hidden or unsupported.
+    fn captureCameraFrame(&self, id: String) -> JsFuture<JsNullable<ToolPkgFloatingWindowCameraFrame>>;
 }
 /// Groups runtime presentation services for plugin-owned user interfaces.
 pub struct ToolPkgUiApi {
@@ -3296,7 +3349,9 @@ pub trait ToolPkgRegistryMethods: Send + Sync {
     fn registerNavigationEntry(&self, definition: ToolPkgNavigationEntryRegistration) -> ();
     /// Registers a plugin widget on the desktop surface.
     fn registerDesktopWidget(&self, definition: ToolPkgDesktopWidgetRegistration) -> ();
-    /// Registers a callback for an application or activity lifecycle event.
+    /// Registers a durable callback for an application or activity lifecycle event.
+    /// Application foreground/background use host-normalized main UI visibility,
+    /// independent of focus and plugin windows; activation replays the latest state.
     fn registerAppLifecycleHook(&self, definition: ToolPkgAppLifecycleHookRegistration) -> ();
     /// Registers a callback that inspects or transforms messages.
     fn registerMessageProcessingPlugin(

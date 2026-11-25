@@ -12,6 +12,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
 import 'package:desktop_widgets/desktop_widgets.dart';
+import 'package:floating_windows/floating_windows.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:operit2/core/bridge/OperitRuntimeBridge.dart';
 import 'package:operit2/core/link/CoreLinkCodec.dart';
@@ -28,6 +29,8 @@ import 'package:operit2/ui/main/TopBarController.dart';
 import 'package:operit2/ui/main/components/AppContent.dart';
 import 'package:operit2/ui/main/layout/DrawerMotionScope.dart';
 import 'package:operit2/ui/main/screens/OperitScreens.dart';
+import 'package:operit2/ui/window/FloatingWindowApp.dart';
+import 'package:operit2/ui/window/MediaStage.dart';
 
 /// Verifies plugin rendering and message-menu integration through the Core bridge.
 void main() {
@@ -665,6 +668,205 @@ void main() {
       await tester.pumpWidget(const SizedBox());
     },
   );
+
+  testWidgets('floating plugin UI follows committed app themes and language', (
+    tester,
+  ) async {
+    final preferences = StreamController<Map<String, Object?>>();
+    addTearDown(preferences.close);
+    final languagePreferences = StreamController<Map<String, Object?>>();
+    addTearDown(languagePreferences.close);
+    final bridge = _ToolPkgDslTestBridge(
+      preferences: preferences.stream,
+      languagePreferences: languagePreferences.stream,
+    );
+    tester.platformDispatcher.platformBrightnessTestValue = Brightness.light;
+    addTearDown(tester.platformDispatcher.clearPlatformBrightnessTestValue);
+    tester.platformDispatcher.localesTestValue = const [Locale('en')];
+    addTearDown(tester.platformDispatcher.clearLocalesTestValue);
+
+    await tester.pumpWidget(
+      FloatingWindowApp(
+        clients: GeneratedCoreProxyClients(bridge),
+        launch: FloatingWindowLaunch(
+          options: const FloatingWindowOptions(),
+          fill: true,
+          payload: {
+            'plugin': _pluginRuntime().toJson(),
+            'locale': 'en',
+            'route': 'main',
+            'state': <String, Object?>{},
+          },
+        ),
+      ),
+    );
+    expect(bridge.calls, isEmpty);
+
+    const primary = 0xFFE44966;
+    preferences.add({
+      'theme_mode': 'dark',
+      'use_custom_colors': true,
+      'custom_primary_color': primary,
+    });
+    languagePreferences.add({});
+    await tester.pumpAndSettle();
+    final launcherFinder = find.byType(ToolPkgUiLauncherScreen);
+    final launcher = tester.state(launcherFinder);
+    final theme = Theme.of(tester.element(launcherFinder));
+    expect(theme.scaffoldBackgroundColor, Colors.transparent);
+    final render = bridge.calls.singleWhere(
+      (call) => call.methodName == 'render',
+    );
+    final renderOptions = (render.args as Map)['runtimeOptions'] as Map;
+    final initialTheme = renderOptions['theme'] as Map;
+    expect(initialTheme['brightness'], 'dark');
+    expect(initialTheme['colors'], containsPair('primary', '#e44966ff'));
+
+    preferences.add({'theme_mode': 'light'});
+    await tester.pumpAndSettle();
+    tester.platformDispatcher.platformBrightnessTestValue = Brightness.dark;
+    preferences.add({'theme_mode': 'system'});
+    await tester.pumpAndSettle();
+    tester.platformDispatcher.platformBrightnessTestValue = Brightness.light;
+    await tester.pumpAndSettle();
+
+    final changes = bridge.calls
+        .where((call) => call.methodName == 'action')
+        .map((call) => call.args as Map)
+        .where((args) => args['actionId'] == '__operit_theme_changed')
+        .map((args) => (args['payload'] as Map)['brightness']);
+    expect(changes, ['light', 'dark', 'light']);
+    expect(tester.state(launcherFinder), same(launcher));
+    expect(
+      bridge.calls.where((call) => call.methodName == 'render'),
+      hasLength(1),
+    );
+    languagePreferences.add({'app_language': 'fr'});
+    await tester.pumpAndSettle();
+    expect(
+      Localizations.localeOf(tester.element(launcherFinder)),
+      const Locale('fr'),
+    );
+    expect(tester.state(launcherFinder), same(launcher));
+    final languageRender = bridge.calls.lastWhere(
+      (call) => call.methodName == 'render',
+    );
+    expect(
+      ((languageRender.args as Map)['runtimeOptions']
+          as Map)['__operit_package_lang'],
+      'fr',
+    );
+    tester.platformDispatcher.localesTestValue = const [Locale('zh')];
+    await tester.pumpAndSettle();
+    expect(
+      Localizations.localeOf(tester.element(launcherFinder)),
+      const Locale('fr'),
+    );
+    languagePreferences.add({'app_language': 'system'});
+    await tester.pumpAndSettle();
+    expect(
+      Localizations.localeOf(tester.element(launcherFinder)),
+      const Locale('zh'),
+    );
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('an unrelated plugin declares MediaStage without host package rules', (tester) async {
+    final preferences = StreamController<Map<String, Object?>>();
+    addTearDown(preferences.close);
+    final bridge = _ToolPkgDslTestBridge(
+      preferences: preferences.stream,
+      renderResult: (_) => jsonEncode({
+        'success': true,
+        'tree': _node('MediaStage', props: {'camera': false, 'imageTitle': 'Camera monitor'}, children: [
+          _node('Text', props: {'text': 'Plugin media controls'}),
+        ]),
+        'state': <String, Object?>{}, 'memo': <String, Object?>{},
+      }),
+    );
+    await tester.pumpWidget(FloatingWindowApp(
+      clients: GeneratedCoreProxyClients(bridge),
+      launch: FloatingWindowLaunch(
+        options: const FloatingWindowOptions(), fill: true,
+        payload: {'plugin': _pluginRuntime().toJson(), 'route': 'main', 'state': <String, Object?>{}},
+      ),
+    ));
+    preferences.add({'theme_mode': 'light'});
+    await tester.pumpAndSettle();
+    expect(find.byType(MediaStage), findsOneWidget);
+    expect(find.text('Plugin media controls'), findsOneWidget);
+    expect(find.byIcon(Icons.videocam_off_outlined), findsNothing);
+    final render = bridge.calls.singleWhere((call) => call.methodName == 'render');
+    final state = ((render.args as Map)['runtimeOptions'] as Map)['state'] as Map;
+    expect(state, isNot(contains('voiceCallNativeLayout')));
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('voice call follows committed custom colors and dark mode', (
+    tester,
+  ) async {
+    final preferences = StreamController<Map<String, Object?>>();
+    addTearDown(preferences.close);
+    final bridge = _ToolPkgDslTestBridge(preferences: preferences.stream);
+    const route = 'toolpkg:com.operit.voice_call:ui:call';
+    final plugin = _pluginRuntime().toJson();
+    plugin['packageName'] = 'com.operit.voice_call';
+    plugin['uiRoutes'] = [
+      for (final item in plugin['uiRoutes'] as List)
+        {...(item as Map).cast<String, Object?>(), 'routeId': route},
+    ];
+    await tester.pumpWidget(
+      FloatingWindowApp(
+        clients: GeneratedCoreProxyClients(bridge),
+        launch: FloatingWindowLaunch(
+          options: const FloatingWindowOptions(),
+          fill: true,
+          payload: {
+            'plugin': plugin,
+            'route': route,
+            'state': <String, Object?>{},
+          },
+        ),
+      ),
+    );
+    const primary = 0xff108640;
+    preferences.add({
+      'theme_mode': 'dark',
+      'use_custom_colors': true,
+      'custom_primary_color': primary,
+    });
+    await tester.pumpAndSettle();
+    final launcher = find.byType(ToolPkgUiLauncherScreen);
+    final state = tester.state(launcher);
+    expect(
+      Theme.of(tester.element(launcher)).colorScheme.primary.toARGB32(),
+      primary,
+    );
+    expect(Theme.of(tester.element(launcher)).brightness, Brightness.dark);
+    final render = bridge.calls.singleWhere(
+      (call) => call.methodName == 'render',
+    );
+    final options = (render.args as Map)['runtimeOptions'] as Map;
+    expect(
+      (options['theme'] as Map)['colors'],
+      containsPair('primary', '#108640ff'),
+    );
+    preferences.add({
+      'theme_mode': 'light',
+      'use_custom_colors': true,
+      'custom_primary_color': 0xffcc3344,
+    });
+    await tester.pumpAndSettle();
+    expect(
+      Theme.of(tester.element(launcher)).colorScheme.primary.toARGB32(),
+      0xffcc3344,
+    );
+    expect(Theme.of(tester.element(launcher)).brightness, Brightness.light);
+    expect(tester.state(launcher), same(state));
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
 
   testWidgets('one DSL frame builds both window content and published pixels', (
     tester,
@@ -2795,6 +2997,7 @@ core_proxy.ToolPkgContainerRuntime _pluginRuntime() {
     messageStreamTransforms: [],
     messageTransformHooks: [],
     chatLifecycleHooks: [],
+    toolPermissionHooks: [],
     packageName: 'demo_toolpkg',
     displayName: core_proxy.LocalizedText(
       values: <String, String>{'default': 'Demo ToolPkg'},
@@ -2884,6 +3087,7 @@ core_proxy.ToolPkgContainerRuntime _moduleOnlyPluginRuntime() {
     messageStreamTransforms: [],
     messageTransformHooks: [],
     chatLifecycleHooks: [],
+    toolPermissionHooks: [],
     packageName: 'module_only_toolpkg',
     displayName: core_proxy.LocalizedText(
       values: <String, String>{'default': 'Module ToolPkg'},
@@ -2997,6 +3201,8 @@ core_proxy.ChatMessage _translationMessage(String sender) {
 class _ToolPkgDslTestBridge extends OperitRuntimeBridge {
   _ToolPkgDslTestBridge({
     String Function(int count)? renderResult,
+    this.preferences,
+    this.languagePreferences,
     this.holdActionCompletion = false,
     this.closeBeforeActionComplete = false,
     this.attachmentError,
@@ -3004,6 +3210,8 @@ class _ToolPkgDslTestBridge extends OperitRuntimeBridge {
   }) : _renderResult = renderResult ?? _counterRenderResult;
 
   final List<CoreCallRequest> calls = <CoreCallRequest>[];
+  final Stream<Map<String, Object?>>? preferences;
+  final Stream<Map<String, Object?>>? languagePreferences;
   final String Function(int count) _renderResult;
   final bool holdActionCompletion;
   final bool closeBeforeActionComplete;
@@ -3238,9 +3446,26 @@ class _ToolPkgDslTestBridge extends OperitRuntimeBridge {
     );
   }
 
-  /// Exposes the sole typed downstream session stream through the existing Core watch protocol.
+  /// Exposes plugin session events and any configured application preferences.
   @override
   Stream<CoreEvent> watchStream(CoreWatchRequest request) {
+    if (request.propertyName == 'preferencesFlow' && preferences != null) {
+      final stream = switch ((request.args as Map)['fileName']) {
+        'user_preferences.preferences.json' => preferences!,
+        'app_language.preferences.json' => languagePreferences!,
+        final file => throw StateError('Unexpected preference file: $file'),
+      };
+      return stream.map(
+        (values) => CoreEvent.raw(
+          requestId: request.requestId,
+          target: request.target,
+          propertyName: request.propertyName,
+          kind: 'Snapshot',
+          decodeValue: decodeCoreLink<Object?>,
+          valueBytes: encodeCoreLink(values),
+        ),
+      );
+    }
     if (request.propertyName != 'updates')
       throw StateError('unexpected watch: ${request.propertyName}');
     final session = _sessions[(request.args as Map)['sessionId']]!;

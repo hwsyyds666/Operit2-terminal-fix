@@ -401,6 +401,77 @@ impl ChatHistoryManager {
         self.hydrateMessages(snapshot.messages, snapshot.variants, snapshot.parts)
     }
 
+    /// Reads one transcript page without loading unselected variants or large bodies.
+    pub fn loadTranscriptMessages(
+        &self, chatId: &str, direction: &str, timestamp: Option<i64>,
+    ) -> ChatHistoryManagerResult<Vec<ChatMessage>> {
+        const PAGE: i32 = 20;
+        let read = |predicate, order, limit, cursor| {
+            let sql = format!("SELECT * FROM messages WHERE chatId = ?1 {predicate} ORDER BY timestamp {order} LIMIT ?2");
+            let mut params = sqliteParams![chatId, limit];
+            if let Some(timestamp) = cursor {
+                params.push(crate::SqliteStore::toSqliteValue(&timestamp));
+            }
+            self.readTranscriptMessages(chatId, &sql, params, true)
+        };
+        match (direction, timestamp) {
+            ("latest", None) => {
+                let mut rows = read("", "DESC", PAGE, None)?;
+                rows.reverse();
+                Ok(rows)
+            }
+            ("older", Some(timestamp)) => {
+                let mut rows = read("AND timestamp < ?3", "DESC", PAGE, Some(timestamp))?;
+                rows.reverse();
+                Ok(rows)
+            }
+            ("newer", Some(timestamp)) => {
+                read("AND timestamp > ?3", "ASC", PAGE, Some(timestamp))
+            }
+            ("around", Some(timestamp)) => {
+                let mut rows = read("AND timestamp <= ?3", "DESC", PAGE / 2, Some(timestamp))?;
+                rows.reverse();
+                rows.extend(read("AND timestamp > ?3", "ASC", PAGE / 2, Some(timestamp))?);
+                Ok(rows)
+            }
+            _ => Err(ChatHistoryManagerError::IllegalArgument("Invalid transcript page cursor".into())),
+        }
+    }
+
+    /// Hydrates the current selected revision of one message when it approaches the viewport.
+    pub fn loadTranscriptMessage(
+        &self, chatId: &str, timestamp: i64,
+    ) -> ChatHistoryManagerResult<Option<ChatMessage>> {
+        Ok(self.readTranscriptMessages(
+            chatId, "SELECT * FROM messages WHERE chatId = ?1 AND timestamp = ?2",
+            sqliteParams![chatId, timestamp], false,
+        )?.into_iter().next())
+    }
+
+    fn readTranscriptMessages(
+        &self, chatId: &str, sql: &str, params: Vec<SqliteValue>, deferLargeBodies: bool,
+    ) -> ChatHistoryManagerResult<Vec<ChatMessage>> {
+        let snapshot = self.messageDao.getTranscriptSnapshot(chatId, sql, params, deferLargeBodies)?;
+        let mut selectedParts = HashMap::<(i64, i32), Vec<MessagePart>>::new();
+        for part in snapshot.parts {
+            selectedParts.entry((part.messageTimestamp, part.variantIndex))
+                .or_default().push(part.toMessagePart());
+        }
+        snapshot.messages.into_iter().map(|row| {
+            let parts = selectedParts.remove(&(row.timestamp, row.selectedVariantIndex)).unwrap_or_default();
+            let mut variants = snapshot.variants.iter().filter(|variant| variant.messageTimestamp == row.timestamp);
+            let variantCount = variants.clone().count() as i32 + 1;
+            if row.selectedVariantIndex == 0 {
+                return Ok(ChatMessage { variantCount, ..row.toChatMessage(parts) });
+            }
+            let selected = variants.find(|variant| variant.variantIndex == row.selectedVariantIndex)
+                .ok_or_else(|| ChatHistoryManagerError::IllegalState(format!(
+                    "Missing selected variant for message {}", row.timestamp
+                )))?;
+            Ok(selected.applyTo(row.toChatMessage(Vec::new()), parts, variantCount))
+        }).collect()
+    }
+
     /// Converts one chat and its messages into an archive entry.
     fn buildOperitArchivedChat(
         &self,

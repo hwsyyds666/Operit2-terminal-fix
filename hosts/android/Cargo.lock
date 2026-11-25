@@ -594,6 +594,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fnv"
+version = "1.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
+
+[[package]]
 name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -814,6 +820,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "h2"
+version = "0.4.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef8e5e5a340588f4452631496976cf8636d4a7ecf600239fdc27615d2530bc16"
+dependencies = [
+ "atomic-waker",
+ "bytes",
+ "fnv",
+ "futures-core",
+ "futures-sink",
+ "http",
+ "indexmap",
+ "slab",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -922,6 +947,7 @@ dependencies = [
  "bytes",
  "futures-channel",
  "futures-core",
+ "h2",
  "http",
  "http-body",
  "httparse",
@@ -1542,6 +1568,7 @@ name = "operit-host-contract"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "bytes",
  "chrono",
  "http",
@@ -1569,6 +1596,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "flume",
+ "fs2",
  "if-addrs",
  "libc",
  "lzma-rust2",
@@ -1578,6 +1606,7 @@ dependencies = [
  "operit-host-native-http",
  "operit-host-native-scheduler",
  "operit-host-native-storage",
+ "operit-util",
  "serial2",
  "sha2",
  "tar",
@@ -1628,6 +1657,7 @@ name = "operit-host-native-scheduler"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "libc",
  "operit-host-api",
  "serde_json",
  "tokio",
@@ -1970,6 +2000,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-util",
+ "h2",
  "http",
  "http-body",
  "http-body-util",
@@ -2560,6 +2591,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "libc",
  "pin-project-lite",
  "tokio",
 ]

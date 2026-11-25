@@ -34,6 +34,27 @@ impl MessageDao {
         sql: &str,
         params: Vec<SqliteValue>,
     ) -> Result<MessageSnapshot, SqliteStoreError> {
+        self.readSnapshot(chatId, sql, params, None)
+    }
+
+    /// Reads only the selected revision's parts, deferring bodies larger than 8 KiB.
+    pub(crate) fn getTranscriptSnapshot(
+        &self,
+        chatId: &str,
+        sql: &str,
+        params: Vec<SqliteValue>,
+        deferLargeBodies: bool,
+    ) -> Result<MessageSnapshot, SqliteStoreError> {
+        self.readSnapshot(chatId, sql, params, Some(deferLargeBodies))
+    }
+
+    fn readSnapshot(
+        &self,
+        chatId: &str,
+        sql: &str,
+        params: Vec<SqliteValue>,
+        transcriptRead: Option<bool>,
+    ) -> Result<MessageSnapshot, SqliteStoreError> {
         self.store.transaction(|transaction| {
             let messages = transaction.queryRows(sql, params)?
                 .iter().map(mapMessageEntity).collect::<Result<Vec<_>, _>>()?;
@@ -47,8 +68,34 @@ impl MessageDao {
                 &format!("SELECT * FROM message_variants WHERE chatId = ? AND messageTimestamp IN ({placeholders}) ORDER BY messageTimestamp, variantIndex"),
                 params.clone(),
             )?.iter().map(mapMessageVariantEntity).collect::<Result<_, _>>()?;
+            let partsSql = match transcriptRead {
+                Some(true) => format!(
+                    "WITH small AS (
+                        SELECT p.chatId, p.messageTimestamp, p.variantIndex
+                        FROM message_parts p JOIN messages m
+                            ON m.chatId = p.chatId AND m.timestamp = p.messageTimestamp
+                            AND m.selectedVariantIndex = p.variantIndex
+                        WHERE p.chatId = ? AND p.messageTimestamp IN ({placeholders})
+                        GROUP BY p.chatId, p.messageTimestamp, p.variantIndex
+                        HAVING SUM(length(CAST(p.content AS BLOB)) + length(CAST(p.attributesJson AS BLOB))) <= 8192
+                    )
+                    SELECT p.* FROM small JOIN message_parts p USING (chatId, messageTimestamp, variantIndex)
+                    ORDER BY p.messageTimestamp, p.sequence"
+                ),
+                Some(false) => format!(
+                    "SELECT p.* FROM message_parts p JOIN messages m
+                        ON m.chatId = p.chatId AND m.timestamp = p.messageTimestamp
+                        AND m.selectedVariantIndex = p.variantIndex
+                    WHERE p.chatId = ? AND p.messageTimestamp IN ({placeholders})
+                    ORDER BY p.messageTimestamp, p.sequence"
+                ),
+                None => format!(
+                    "SELECT * FROM message_parts WHERE chatId = ? AND messageTimestamp IN ({placeholders})
+                    ORDER BY messageTimestamp, variantIndex, sequence"
+                ),
+            };
             let parts = transaction.queryRows(
-                &format!("SELECT * FROM message_parts WHERE chatId = ? AND messageTimestamp IN ({placeholders}) ORDER BY messageTimestamp, variantIndex, sequence"),
+                &partsSql,
                 params,
             )?.iter().map(mapMessagePartEntity).collect::<Result<_, _>>()?;
             Ok(MessageSnapshot { messages, variants, parts })

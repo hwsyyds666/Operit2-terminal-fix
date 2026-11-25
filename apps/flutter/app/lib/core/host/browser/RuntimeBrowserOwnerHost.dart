@@ -116,6 +116,9 @@ class _RuntimeBrowserOwnerHostState extends State<RuntimeBrowserOwnerHost> {
       return;
     }
     unawaited(_browserSessionStore.ensureLoaded());
+    RuntimeWebVisitRegistry.instance.attachHost(
+      WebViewPlatform.instance?.webVisitHost,
+    );
     _attachOwnerUi();
     _disposeBridgeHandler = widget.bridge.registerHandler(_handleRequest);
     _disposeWebVisitHandler = const WebVisitBridge().registerHandler((
@@ -320,8 +323,15 @@ class _RuntimeBrowserOwnerHostState extends State<RuntimeBrowserOwnerHost> {
       case 'browser_file_upload':
         await _controller(request).fileUpload(_required(params, 'files'));
         return 'OK';
-      case 'browser_handle_dialog':
       case 'browser_resize':
+        final width = double.parse(_required(params, 'width'));
+        final height = double.parse(_required(params, 'height'));
+        if (width <= 0 || height <= 0) {
+          throw StateError('browser_resize width and height must be positive');
+        }
+        await _controller(request).resizeViewport(Size(width, height));
+        return 'OK';
+      case 'browser_handle_dialog':
       case 'browser_take_screenshot':
         throw StateError(
           '${request.toolName} is not supported by Workspace Browser',
@@ -337,7 +347,7 @@ class _RuntimeBrowserOwnerHostState extends State<RuntimeBrowserOwnerHost> {
       case 'list':
         return jsonEncode(_registry.listTabs());
       case 'create':
-        final url = _required(params, 'url');
+        final url = _optional(params, 'url');
         await _registry.openBrowserTab(url: url);
         await _registry.waitForSession(timeout: const Duration(seconds: 30));
         return jsonEncode(_registry.listTabs());

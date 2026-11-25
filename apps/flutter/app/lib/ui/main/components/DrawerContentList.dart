@@ -81,9 +81,7 @@ extension _LazyWorkspaceContent on _DrawerContentState {
               SidebarDirectory.workspace(section.workspaceId),
             ),
           ),
-          onDelete: section.workspaceId == null
-              ? null
-              : () => unawaited(_deleteWorkspace(section)),
+          onDelete: null,
         ),
       ),
     );
@@ -97,46 +95,15 @@ extension _LazyWorkspaceContent on _DrawerContentState {
       }
       return;
     }
-    final groups = _nativeGroups(section);
-    for (var index = 0; index < groups.length; index++) {
-      final group = groups[index];
-      final open =
-          searching && widget.conversationsOnly ||
-          !_collapsedGroups.contains(group.key);
-      final top = widget.conversationsOnly && index > 0 ? 4.0 : 0.0;
-      yield _SidebarRow(
-        'group:${group.key}',
-        () => Padding(
-          padding: EdgeInsets.only(top: top),
-          child: _GroupSectionHeader(
-            key: ValueKey('workspace-group:${group.key}'),
-            group: group,
-            pinned: _pinnedDirectories.contains(group.directory),
-            expanded: open,
-            compact: widget.conversationsOnly,
-            appearance: widget.appearance,
-            canCreate: section.canCreate,
-            onToggleExpanded: () => _toggleGroup(group.key),
-            onCreateChat: () => unawaited(
-              _runGroupMutation(
-                () => _createGroupedConversation(section, group.name),
-              ),
-            ),
-            onCreateGroup: () => unawaited(_createWorkspaceGroup(section)),
-            onRename: () => unawaited(_renameWorkspaceGroup(section, group)),
-            onTogglePinned: () =>
-                unawaited(_toggleDirectoryPinned(group.directory)),
-            onDissolve: () =>
-                unawaited(_dissolveWorkspaceGroup(section, group)),
-            canAcceptDrop: (chat) => _workspaceKey(chat) == section.key,
-            onMoveToGroup: (chat) => unawaited(
-              _runGroupMutation(() => _moveWorkspaceGroup(chat, group.name)),
-            ),
-          ),
-        ),
-      );
-      if (open) yield* _workspaceGroupRows(group, searching);
-    }
+    yield* _workspaceGroupRows(
+      _NativeWorkspaceGroup(
+        key: section.key,
+        workspaceId: section.workspaceId,
+        name: null,
+        histories: section.histories,
+      ),
+      searching,
+    );
   }
 
   /// Keeps expansion in the drawer owner while offscreen conversation widgets are disposed.

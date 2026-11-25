@@ -11,10 +11,13 @@ import '../../../common/markdown/StreamMarkdownRenderer.dart';
 /// Retains one row's layout distance independently of its mounted render tree.
 class ChatMessageExtent extends ChangeNotifier {
   /// Creates the distance record for one stable transcript row identity.
-  ChatMessageExtent();
+  ChatMessageExtent({this.onLayoutHeightChanged});
 
   double? _width;
   double _height = 0;
+  double? lastLayoutHeight;
+  RenderChatMessageExtentBox? mountedBox;
+  final VoidCallback? onLayoutHeightChanged;
   bool _hasMeasuredHeight = false;
   double _trailingSpacing = 0;
   final Set<Object> _pendingContent = <Object>{};
@@ -38,6 +41,8 @@ class ChatMessageExtent extends ChangeNotifier {
 
   /// Records real layouts and retains their distance during pending rendering.
   void recordHeight(double width, double height) {
+    if (lastLayoutHeight != height) onLayoutHeightChanged?.call();
+    lastLayoutHeight = height;
     final retainsMeasurement = _width == width && _hasMeasuredHeight;
     _height = hasPendingContent
         ? math.max(height, reservedHeight(width))
@@ -115,10 +120,12 @@ class RenderChatMessageExtentBox extends RenderProxyBox {
     }
     if (attached) {
       _extent.removeListener(markNeedsLayout);
+      if (identical(_extent.mountedBox, this)) _extent.mountedBox = null;
     }
     _extent = value;
     if (attached) {
       _extent.addListener(markNeedsLayout);
+      _extent.mountedBox = this;
     }
     markNeedsLayout();
   }
@@ -128,12 +135,14 @@ class RenderChatMessageExtentBox extends RenderProxyBox {
   void attach(PipelineOwner owner) {
     super.attach(owner);
     _extent.addListener(markNeedsLayout);
+    _extent.mountedBox = this;
   }
 
   /// Removes the layout listener when a virtualized row leaves the viewport.
   @override
   void detach() {
     _extent.removeListener(markNeedsLayout);
+    if (identical(_extent.mountedBox, this)) _extent.mountedBox = null;
     super.detach();
   }
 

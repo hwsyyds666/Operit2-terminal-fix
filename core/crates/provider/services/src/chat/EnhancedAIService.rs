@@ -99,6 +99,8 @@ pub struct EnhancedAIService {
 
 #[derive(Clone, Debug, Default)]
 pub struct EnhancedAISharedState {
+    /// Actual model response rounds in the current main send.
+    pub responseRound: i32,
     pub turn_token_usage: TurnTokenUsage,
     pub request_window_estimate: Option<i64>,
     pub active_execution_contexts: BTreeMap<i32, MessageExecutionContext>,
@@ -170,14 +172,19 @@ impl EnhancedAISharedState {
 
     /// Publishes the selected model before the background response task starts.
     fn beginTurn(&mut self, config: &ResolvedModelConfig, providerModel: String) {
+        self.setRequestModel(config, providerModel);
+        self.last_reply_content = None;
+        self.turn_token_usage = TurnTokenUsage::default();
+        self.last_turn_context_window = None;
+    }
+
+    /// Updates model identity between requests without resetting the turn's token totals.
+    fn setRequestModel(&mut self, config: &ResolvedModelConfig, providerModel: String) {
         self.last_provider_model = Some(providerModel);
         self.last_turn_model_identity = Some(TurnModelIdentity {
             providerName: config.providerName.clone(),
             modelName: config.modelId.clone(),
         });
-        self.last_reply_content = None;
-        self.turn_token_usage = TurnTokenUsage::default();
-        self.last_turn_context_window = None;
     }
 }
 
@@ -1511,8 +1518,7 @@ impl EnhancedAIService {
                 }
             }
             (None, None) => support
-                .modelBindingForFunction(options.functionType.clone(),
-                )
+                .modelBindingForChat(options.chatId.as_deref(), options.functionType.clone())
                 .map_err(AiServiceError::RequestFailed)?,
             _ => {
                 return Err(AiServiceError::RequestFailed(
@@ -1544,6 +1550,22 @@ impl EnhancedAIService {
             .resolveChatConfiguration(self.chatConfigurationRequestForOptions(options)?)
             .await
             .map_err(AiServiceError::RequestFailed)
+    }
+
+    /// Selects the next request's model without changing an in-flight provider request.
+    async fn refreshRequestModel(
+        &mut self,
+        options: &SendMessageOptions,
+        runtime: &mut SendMessageRuntime,
+    ) -> Result<(), AiServiceError> {
+        let configuration = self.resolveChatConfigurationForOptions(options).await?;
+        if configuration.profile.modelBinding != runtime.chatConfiguration.profile.modelBinding {
+            let mut next = self.createSendMessageRuntime(options, configuration)?;
+            next.promptMetadata = std::mem::take(&mut runtime.promptMetadata);
+            next.useEnglish = runtime.useEnglish;
+            *runtime = next;
+        }
+        Ok(())
     }
 
     /// Resumes model processing with history already synchronized on the target CoreNode.
@@ -1784,6 +1806,7 @@ impl EnhancedAIService {
 
         let mut lifecycle = Vec::new();
         if !isSubTask {
+            self.shared_state().responseRound = 0;
             lifecycle.push(SendMessageLifecycleStage::SetProcessingState);
             self.setInputProcessingState(InputProcessingState::Processing {
                 message: "enhanced_processing_message".to_string(),
@@ -2053,6 +2076,7 @@ impl EnhancedAIService {
         });
         lifecycle.push(SendMessageLifecycleStage::StartAssistantResponseRound);
         self.startAssistantResponseRound(&mut execContext);
+        if !isSubTask { self.shared_state().responseRound = execContext.roundManager.roundIndex; }
 
         lifecycle.push(SendMessageLifecycleStage::CollectResponseStream);
         let mut totalChars = 0;
@@ -2432,6 +2456,7 @@ impl EnhancedAIService {
             return Ok(false);
         }
         self.startAssistantResponseRound(context);
+        if !isSubTask { self.shared_state().responseRound = context.roundManager.roundIndex; }
         AppLogger::v_with_level(
             TAG,
             &format!(
@@ -2440,6 +2465,20 @@ impl EnhancedAIService {
             ),
             operit_util::AppLogger::VERBOSE_LEVEL_2,
         );
+
+        self.refreshRequestModel(
+            &SendMessageOptions {
+                chatId: chatId.clone(),
+                functionType: functionType.clone(),
+                promptFunctionType: promptFunctionType.clone(),
+                executionParticipantId: Some(runtime.chatConfiguration.profile.id.clone()),
+                chatProviderIdOverride: chatProviderIdOverride.clone(),
+                chatModelIdOverride: chatModelIdOverride.clone(),
+                textOnly: runtime.textOnly,
+                ..SendMessageOptions::new()
+            },
+            runtime,
+        ).await?;
 
         let modelParameters = self.getModelParametersForFunction(
             functionType.clone(),
@@ -2520,6 +2559,7 @@ impl EnhancedAIService {
             if !self.isExecutionContextActive(context) {
                 return Ok(false);
             }
+            self.shared_state().setRequestModel(&runtime.modelConfig, service.provider_model());
             service.reset_token_counts();
             (turnUsage, tokenRequest) = self.beginRequestTokenUsage(
                 context, runtime.aiService.clone(), functionType.clone(),
@@ -2979,7 +3019,7 @@ impl EnhancedAIService {
         let toolBatch = context.awaitExecution(
             ToolExecutionManager::executeInvocations(
                 &toolInvocations,
-                &mut self.tool_handler,
+                &self.tool_handler,
                 participantName.clone(),
                 chatId.clone(),
                 participantId.clone(),
@@ -3284,7 +3324,7 @@ fn resolveToolDisplayName(tool: &RuntimeAITool) -> String {
 fn buildPackageProxyToolPrompt() -> ToolPrompt {
     ToolPrompt {
         name: "package_proxy".to_string(),
-        description: "Proxy tool for package tools activated by use_package.".to_string(),
+        description: "Execute an activated package tool. Every call returns execution_id and waits up to 20 seconds. A running execution continues in the background; collect further output and final results with package_wait instead of re-running the tool.".to_string(),
         parameters: buildToolParametersJson(&[
             crate::chat::config::SystemToolPrompts::ToolParameterSchema {
                 name: "tool_name".to_string(),
@@ -3301,6 +3341,11 @@ fn buildPackageProxyToolPrompt() -> ToolPrompt {
                 description: "JSON object of parameters to forward to the target tool".to_string(),
                 required: true,
                 default: None,
+            },
+            crate::chat::config::SystemToolPrompts::ToolParameterSchema {
+                name: "timeout_ms".to_string(), value_type: "integer".to_string(),
+                description: "Foreground wait from 0 to 20000 milliseconds, default 20000. Expiry keeps the execution running; 0 returns immediately.".to_string(),
+                required: false, default: Some("20000".to_string()),
             },
         ]),
         parametersStructured: Some(vec![
@@ -3319,6 +3364,11 @@ fn buildPackageProxyToolPrompt() -> ToolPrompt {
                 description: "JSON object of parameters to forward to the target tool".to_string(),
                 required: true,
                 default: None,
+            },
+            ToolParameterSchema {
+                name: "timeout_ms".to_string(), r#type: "integer".to_string(),
+                description: "Foreground wait from 0 to 20000 milliseconds, default 20000; expiry keeps execution running.".to_string(),
+                required: false, default: Some("20000".to_string()),
             },
         ]),
         details: String::new(),
@@ -3888,6 +3938,23 @@ mod workspace_path_tests {
 mod model_identity_tests {
     use super::{EnhancedAISharedState, TurnModelIdentity, TurnTokenSnapshot};
     use operit_model::ModelConfigData::{ApiProviderType, ResolvedModelConfig};
+
+    /// Keeps earlier request accounting when a continuation uses a different model.
+    #[test]
+    fn switching_request_model_preserves_turn_accounting() {
+        let mut state = EnhancedAISharedState::default();
+        let initial = model_config("Provider A", "model-a");
+        state.beginTurn(&initial, initial.providerModelLabel());
+        let tokens = TurnTokenSnapshot { inputTokens: 100, outputTokens: 20, cachedInputTokens: 30 };
+        state.turn_token_usage.setSnapshot(tokens.clone());
+        state.last_turn_context_window = Some(120);
+        let next = model_config("Provider B", "model-b");
+        state.setRequestModel(&next, next.providerModelLabel());
+        assert_eq!(state.last_turn_model_identity.unwrap().modelName, "model-b");
+        assert_eq!(state.last_provider_model.as_deref(), Some("OPENAI_CODEX:model-b"));
+        assert_eq!(state.turn_token_usage.snapshot(), tokens);
+        assert_eq!(state.last_turn_context_window, Some(120));
+    }
 
     fn model_config(provider_name: &str, model_id: &str) -> ResolvedModelConfig {
         ResolvedModelConfig {

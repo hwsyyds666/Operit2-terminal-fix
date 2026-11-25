@@ -13,6 +13,79 @@ import 'package:operit2/ui/features/chat/viewmodel/ChatViewModel.dart'
 
 /// Exercises the production rail geometry and real pointer gesture boundaries.
 void main() {
+  for (final onLeft in <bool>[false, true]) {
+    testWidgets('rail mirrors placement and gestures with onLeft=$onLeft', (
+      tester,
+    ) async {
+      final jumps = <int>[];
+      var transcriptTaps = 0;
+      await _pumpNavigator(
+        tester,
+        onLeft: onLeft,
+        jumps: jumps,
+        onTranscriptTap: () => transcriptTaps++,
+      );
+      final navigator = tester.getRect(find.byType(ChatScrollNavigator));
+      final target = tester.getRect(
+        find.byKey(const ValueKey('chat-scroll-rail-hit-target')),
+      );
+      expect(target.width, ChatScrollRailGeometry.interactionWidth);
+      expect(
+        onLeft ? target.left : target.right,
+        onLeft ? navigator.left : navigator.right,
+      );
+      final transform = tester.widget<Transform>(
+        find
+            .ancestor(
+              of: find.byKey(const ValueKey('chat-scroll-rail-paint')),
+              matching: find.byType(Transform),
+            )
+            .first,
+      );
+      expect(transform.transform.entry(0, 0), onLeft ? -1 : 1);
+
+      const geometry = ChatScrollRailGeometry(
+        entryCount: 20,
+        viewportHeight: 500,
+      );
+      final contact = Offset(
+        onLeft ? target.left + 8 : target.right - 8,
+        target.top + geometry.entryCenter(7),
+      );
+      final press = await tester.startGesture(contact);
+      await tester.pump();
+      final preview = tester.getRect(find.text('message 7'));
+      expect(
+        onLeft ? preview.left > target.right : preview.right < target.left,
+        isTrue,
+      );
+      final dynamic painter = tester
+          .widget<CustomPaint>(
+            find.byKey(const ValueKey('chat-scroll-rail-paint')),
+          )
+          .painter;
+      expect(painter.pointer.value.dx, closeTo(24, 0.001));
+      expect(jumps, isEmpty);
+      await press.moveBy(const Offset(0, ChatScrollRailGeometry.tickSpacing));
+      await tester.pump();
+      expect(find.text('message 8'), findsOneWidget);
+      await press.up();
+      await tester.pumpAndSettle();
+      expect(jumps, [8]);
+      expect(transcriptTaps, 0);
+
+      await tester.tapAt(
+        Offset(onLeft ? target.right + 1 : target.left - 1, contact.dy),
+      );
+      await tester.tapAt(
+        Offset(onLeft ? navigator.right - 8 : navigator.left + 8, contact.dy),
+      );
+      await tester.pumpAndSettle();
+      expect(transcriptTaps, 2);
+      expect(jumps, [8]);
+    });
+  }
+
   testWidgets('global index navigates outside the mounted body window', (
     tester,
   ) async {
@@ -800,6 +873,50 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets('adding an indexed history page does not reload the rail', (
+    tester,
+  ) async {
+    final messages = List<ChatMessage>.generate(40, _message);
+    final scroll = ScrollController();
+    addTearDown(scroll.dispose);
+    var loads = 0;
+
+    Future<List<ChatMessageLocatorPreview>> load(
+      String chatId,
+      String query,
+    ) async {
+      loads++;
+      return [
+        for (final row in messages)
+          ChatMessageLocatorPreview(
+            messageIndex: row.timestamp,
+            timestamp: row.timestamp,
+            sender: row.sender,
+            displayName: '',
+            previewContent: row.displayText,
+            contentLength: row.displayText.length,
+            displayMode: 'NORMAL',
+            isFavorite: row.isFavorite,
+          ),
+      ];
+    }
+
+    Future<void> render(List<ChatMessage> rows) => _pumpNavigator(
+      tester,
+      messages: rows,
+      loadLocatorEntries: load,
+      scrollController: scroll,
+      jumps: [],
+    );
+
+    await render(messages.sublist(20));
+    expect(loads, 1);
+    await render(messages);
+    expect(loads, 1);
+    await render([...messages, _message(40)]);
+    expect(loads, 2);
+  });
+
   testWidgets('locator searches unloaded messages without changing the rail', (
     tester,
   ) async {
@@ -1043,6 +1160,7 @@ int? _activeRailIndex(WidgetTester tester) {
 Future<void> _pumpNavigator(
   WidgetTester tester, {
   int count = 20,
+  bool onLeft = false,
   bool withLocatorHost = false,
   ChatMessageNavigationController? navigation,
   String chatId = 'rail-test',
@@ -1114,6 +1232,7 @@ Future<void> _pumpNavigator(
                 AnimatedBuilder(
                   animation: scroll,
                   builder: (context, _) => ChatScrollNavigator(
+                    onLeft: onLeft,
                     messages: visibleMessages,
                     currentChatId: chatId,
                     scrollController: scroll,

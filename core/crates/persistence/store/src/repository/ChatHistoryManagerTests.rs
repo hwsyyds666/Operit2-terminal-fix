@@ -901,6 +901,43 @@ fn failed_message_deletions_preserve_parts_and_variants() {
     }
 }
 
+
+/// Reads transcript pages against the real SQLite schema and hydrates deferred bodies.
+#[test]
+fn transcript_pages_use_persisted_attributes_and_selected_variants() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (manager, database) = chatOrderFixture("transcript-real-schema");
+    let first = ChatMessage::new_with_markdown_timestamp("ai".into(), "short".into(), 100);
+    manager.addMessage("older".into(), first).unwrap();
+    let attributes = database.messagePartDao().getPartsForMessage("older", 100, 0).unwrap();
+    let attributeBytes = serde_json::to_string(&attributes[0].attributes).unwrap().len();
+    let nearLimit = (8192 - attributeBytes) / "中".len();
+    for (timestamp, text) in [(200, "中".repeat(nearLimit)), (300, "中".repeat(nearLimit + 1))] {
+        let message = ChatMessage::new_with_markdown_timestamp("ai".into(), text, timestamp);
+        manager.addMessage("older".into(), message).unwrap();
+    }
+    let mut tool = ChatMessage::new_with_markdown_timestamp("ai".into(), "tool".into(), 400);
+    tool.parts[0].attributes.insert("payload".into(), "x".repeat(8192));
+    manager.addMessage("older".into(), tool).unwrap();
+
+    let page = manager.loadTranscriptMessages("older", "latest", None).unwrap();
+    assert_eq!(page.len(), 4);
+    assert_eq!(page[0].displayText(), "short");
+    assert_eq!(page[1].displayText(), "中".repeat(nearLimit));
+    assert!(page[2].parts.is_empty());
+    assert!(page[3].parts.is_empty());
+    assert_eq!(manager.loadTranscriptMessage("older", 300).unwrap().unwrap().displayText(), "中".repeat(nearLimit + 1));
+    assert_eq!(manager.loadTranscriptMessage("older", 400).unwrap().unwrap().parts[0].attributes["payload"].len(), 8192);
+
+    let alternate = ChatMessage::new_with_markdown_timestamp("ai".into(), "alternate".into(), 100);
+    manager.addMessageVariant("older".into(), 100, alternate).unwrap();
+    assert_eq!(manager.loadTranscriptMessages("older", "around", Some(100)).unwrap()[0].displayText(), "alternate");
+    manager.selectMessageVariant("older".into(), 100, 0).unwrap();
+    assert_eq!(manager.loadTranscriptMessage("older", 100).unwrap().unwrap().displayText(), "short");
+    assert_eq!(manager.loadTranscriptMessages("older", "older", Some(300)).unwrap().len(), 2);
+    assert_eq!(manager.loadTranscriptMessages("older", "newer", Some(200)).unwrap().len(), 2);
+}
+
 /// Preserves page boundaries and summary context selection when loading transaction snapshots.
 #[test]
 fn message_snapshots_preserve_paging_and_summary_boundaries() {

@@ -401,6 +401,8 @@ impl ChatRuntime {
 /// Stores the authoritative lifecycle shared by execution queries and observable projections.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChatExecutionState {
+    pub taskTitle: Option<String>,
+    pub currentRound: i32,
     pub isLoading: bool,
     pub inputProcessingState: InputProcessingState,
 }
@@ -409,6 +411,8 @@ impl ChatExecutionState {
     /// Creates an idle logical execution state.
     pub fn idle() -> Self {
         Self {
+            taskTitle: None,
+            currentRound: 0,
             isLoading: false,
             inputProcessingState: InputProcessingState::Idle,
         }
@@ -1154,6 +1158,8 @@ impl MessageProcessingDelegate {
             statistics.currentTurnToolInvocationCount,
             statistics.activeConversationCount,
             statistics.currentSessionToolCount,
+            executionStates.get(chatId).map_or(0, |execution| execution.currentRound),
+            executionStates.get(chatId).and_then(|execution| execution.taskTitle.clone()),
         );
     }
 
@@ -1200,6 +1206,12 @@ impl MessageProcessingDelegate {
         chatId: Option<String>,
         state: InputProcessingState,
     ) {
+        self.applyChatInputProcessingState(chatId, state, None);
+    }
+
+    fn applyChatInputProcessingState(
+        &mut self, chatId: Option<String>, state: InputProcessingState, currentRound: Option<i32>,
+    ) {
         if let Some(chatId) = chatId.as_ref() {
             if self.isChatLoading(chatId.clone())
                 && Self::isProviderCompletionState(&state)
@@ -1222,7 +1234,10 @@ impl MessageProcessingDelegate {
             ToolProgressBus::clear();
         }
         let key = Self::chatKey(chatId);
-        self.updateChatExecutionState(key, |execution| execution.inputProcessingState = state.clone());
+        self.updateChatExecutionState(key, |execution| {
+            execution.inputProcessingState = state.clone();
+            if let Some(round) = currentRound { execution.currentRound = round; }
+        });
     }
 
     /// Publishes processing changes to the exact work item owned by this runtime.
@@ -1328,9 +1343,10 @@ impl MessageProcessingDelegate {
         chatId: String,
         turnId: u64,
         state: InputProcessingState,
+        currentRound: i32,
     ) {
         if self.isCurrentChatTurn(&chatId, turnId) {
-            self.setInputProcessingStateForChat(chatId, state);
+            self.applyChatInputProcessingState(Some(chatId), state, Some(currentRound));
         }
     }
 
@@ -1350,7 +1366,7 @@ impl MessageProcessingDelegate {
         crate::services::WorkActivityService::beginWork(
             workId.clone(),
             chatId.clone(),
-            title,
+            title.clone(),
             turnId,
             startedAtMillis,
             self.clone_for_core(),
@@ -1359,6 +1375,8 @@ impl MessageProcessingDelegate {
         ToolProgressBus::clear();
         self.updateChatExecutionState(chatId, |state| {
             state.isLoading = true;
+            state.currentRound = 0;
+            state.taskTitle = Some(title.clone());
             state.inputProcessingState = InputProcessingState::Processing {
                 message: "message_processing".to_string(),
             };
@@ -1493,8 +1511,6 @@ impl MessageProcessingDelegate {
         executionLease: &ChatExecutionLease,
         configuration: &ChatConfigurationResult,
         workspacePath: Option<String>,
-        chatProviderIdOverride: Option<String>,
-        chatModelIdOverride: Option<String>,
     ) -> Result<Option<i64>, String> {
         let mut pending = inbox.drainOrClose();
         if pending.is_empty() {
@@ -1515,8 +1531,8 @@ impl MessageProcessingDelegate {
                         replyToMessage: None,
                         chatId: chatId.to_string(),
                         participantId: configuration.profile.id.clone(),
-                        chatProviderIdOverride: chatProviderIdOverride.clone(),
-                        chatModelIdOverride: chatModelIdOverride.clone(),
+                        chatProviderIdOverride: Some(configuration.profile.modelBinding.providerId.clone()),
+                        chatModelIdOverride: Some(configuration.profile.modelBinding.modelId.clone()),
                     })
                     .await
                     .map_err(|error| error.to_string())?;
@@ -1833,7 +1849,7 @@ impl MessageProcessingDelegate {
     #[allow(non_snake_case)]
     pub async fn sendUserMessage(
         &mut self,
-        mut request: SendUserMessageProcessingRequest<'_>,
+        request: SendUserMessageProcessingRequest<'_>,
     ) -> Result<
         SendUserMessageProcessingResult,
         operit_providers::chat::llmprovider::AIService::AiServiceError,
@@ -1847,9 +1863,6 @@ impl MessageProcessingDelegate {
         configuration.validate().map_err(
             operit_providers::chat::llmprovider::AIService::AiServiceError::RequestFailed,
         )?;
-        request.chatProviderIdOverride =
-            Some(configuration.profile.modelBinding.providerId.clone());
-        request.chatModelIdOverride = Some(configuration.profile.modelBinding.modelId.clone());
         let originalMessageText = request.messageText.trim().to_string();
         ChainLogger::verbose_with_level(
             SEND_CHAIN,
@@ -1913,8 +1926,8 @@ impl MessageProcessingDelegate {
                 replyToMessage: request.replyToMessage.clone(),
                 chatId: chatId.clone(),
                 participantId: configuration.profile.id.clone(),
-                chatProviderIdOverride: request.chatProviderIdOverride.clone(),
-                chatModelIdOverride: request.chatModelIdOverride.clone(),
+                chatProviderIdOverride: Some(configuration.profile.modelBinding.providerId.clone()),
+                chatModelIdOverride: Some(configuration.profile.modelBinding.modelId.clone()),
             })
             .await
         {
@@ -2052,11 +2065,15 @@ impl MessageProcessingDelegate {
             let activeTurnId = turnId;
             let mut stateDelegate = self.clone_for_core();
             let stateFlow = request.enhancedAiService.inputProcessingState();
+            let roundSource = request.enhancedAiService.shared_state.clone();
+            roundSource.lock().expect("AI round state mutex poisoned").responseRound = 0;
             stateFlow.subscribe(move |state| {
+                let round = roundSource.lock().expect("AI round state mutex poisoned").responseRound;
                 stateDelegate.setInputProcessingStateForChatIfCurrent(
                     activeChatId.clone(),
                     activeTurnId,
                     state,
+                    round,
                 );
             });
         }
@@ -2654,8 +2671,6 @@ impl MessageProcessingDelegate {
                                     &executionLease,
                                     &completionContextConfiguration,
                                     completionContextWorkspacePath.clone(),
-                                    completionContextProviderIdOverride.clone(),
-                                    completionContextModelIdOverride.clone(),
                                 )
                                 .await
                             {
@@ -2828,6 +2843,8 @@ impl MessageProcessingDelegate {
                                     history,
                                     completionContextConfiguration.clone(),
                                     completionContextPromptFunctionType.clone(),
+                                    completionContextProviderIdOverride.clone(),
+                                    completionContextModelIdOverride.clone(),
                                     options,
                                     completionChatId.clone(),
                                     completionTurnId,
@@ -3034,6 +3051,8 @@ impl MessageProcessingDelegate {
         history: ChatHistoryDelegate,
         configuration: ChatConfigurationResult,
         promptFunctionType: PromptFunctionType,
+        chatProviderIdOverride: Option<String>,
+        chatModelIdOverride: Option<String>,
         turnOptions: ChatTurnOptions,
         chatId: String,
         turnId: u64,
@@ -3050,8 +3069,8 @@ impl MessageProcessingDelegate {
                     turnId,
                     participantId: Some(configuration.profile.id.clone()),
                     promptFunctionType,
-                    chatProviderIdOverride: Some(configuration.profile.modelBinding.providerId),
-                    chatModelIdOverride: Some(configuration.profile.modelBinding.modelId),
+                    chatProviderIdOverride,
+                    chatModelIdOverride,
                     turnOptions,
                     executionLease,
                 },
@@ -3222,12 +3241,14 @@ mod tests {
             InputProcessingState::Completed,
             InputProcessingState::Error { message: "failed".into() },
         ] {
-            let mut state = ChatExecutionState { isLoading: false, inputProcessingState: phase };
+            let mut state = ChatExecutionState { taskTitle: None, currentRound: 0, isLoading: false, inputProcessingState: phase };
             assert!(!state.isProcessing());
             state.isLoading = true;
             assert!(state.isProcessing(), "provider completion cannot end an active execution");
         }
         let summary = ChatExecutionState {
+            taskTitle: None,
+            currentRound: 0,
             isLoading: false,
             inputProcessingState: InputProcessingState::Summarizing { message: "summarizing".into() },
         };
@@ -3708,6 +3729,8 @@ mod tests {
     /// Builds an active chat execution state for runtime statistic tests.
     fn activeExecutionState() -> ChatExecutionState {
         ChatExecutionState {
+            taskTitle: None,
+            currentRound: 0,
             isLoading: true,
             inputProcessingState: InputProcessingState::Receiving {
                 message: "receiving".to_string(),

@@ -14,6 +14,7 @@ import '../../../theme/OperitThemeAssets.dart';
 import '../../../common/interactions/DrawerGestureExclusion.dart';
 import '../../../theme/OperitTheme.dart';
 import '../viewmodel/ChatViewModel.dart';
+import '../viewmodel/ChatTranscriptController.dart';
 import '../tts/TtsPlaybackController.dart';
 import 'ChatArea.dart';
 import 'NewChatIntro.dart';
@@ -35,6 +36,7 @@ class ChatScreenContent extends StatelessWidget {
   const ChatScreenContent({
     super.key,
     required this.messages,
+    this.transcript,
     required this.loading,
     required this.errorMessage,
     required this.messageController,
@@ -118,6 +120,7 @@ class ChatScreenContent extends StatelessWidget {
   /// Keeps the shared transcript available when another workflow owns submission.
   final bool showInput;
   final List<ChatUiMessage> messages;
+  final ChatTranscriptController? transcript;
   final bool loading;
   final String? errorMessage;
   final TextEditingController messageController;
@@ -485,6 +488,7 @@ class ChatScreenContent extends StatelessWidget {
     required double bottomContentInset,
   }) {
     return ChatArea(
+      transcript: transcript,
       messages: messages,
       isLoading: loading,
       errorMessage: errorMessage,
@@ -569,6 +573,7 @@ class ChatScreenContent extends StatelessWidget {
 
   /// Captures the displayed transcript and message variant before any asynchronous voice work.
   Future<void> _playVoice(BuildContext context, ChatUiMessage message) async {
+    final l10n = AppLocalizations.of(context)!;
     try {
       final chatId = currentChatId;
       if (chatId == null || chatId.trim().isEmpty) {
@@ -589,7 +594,7 @@ class ChatScreenContent extends StatelessWidget {
       if (!context.mounted) {
         return;
       }
-      _showTtsSnack(context, '生成/播放语音失败：$error');
+      _showTtsSnack(context, l10n.chatPlaySpeechFailed(error.toString()));
     }
   }
 
@@ -623,37 +628,55 @@ class ChatScreenContent extends StatelessWidget {
         .toList(growable: false);
   }
 
+  Future<List<ChatUiMessage>> _selectedMessagesWithBodies() async {
+    final controller = transcript;
+    final selected = _selectedVisibleMessages;
+    if (controller == null) return selected;
+    return [
+      for (final message in selected)
+        if (message.parts.isNotEmpty || message.contentStream != null)
+          message
+        else if (await controller.hydrate(message) case final body?)
+          body,
+    ];
+  }
+
   /// Copies the selected messages into the system clipboard.
   Future<void> _copySelectedMessages(BuildContext context) async {
-    final text = buildMessagesCopyText(_selectedVisibleMessages);
+    final l10n = AppLocalizations.of(context)!;
     try {
+      final text = buildMessagesCopyText(await _selectedMessagesWithBodies());
+      if (!context.mounted) return;
       await Clipboard.setData(ClipboardData(text: text));
-    } on PlatformException catch (error) {
+    } catch (error) {
       if (!context.mounted) {
         return;
       }
       ScaffoldMessenger.maybeOf(context)?.showSnackBar(
-        SnackBar(content: Text('复制失败：${error.message ?? error.code}')),
+        SnackBar(content: Text(l10n.chatCopyFailed(error.toString()))),
       );
     }
   }
 
   /// Confirms deletion of the selected messages.
   Future<void> _confirmDeleteSelected(BuildContext context) async {
+    final l10n = AppLocalizations.of(context)!;
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) {
         return AlertDialog(
-          title: const Text('确认删除'),
-          content: Text('确定删除已选的 ${selectedMessageTimestamps.length} 条消息？'),
+          title: Text(l10n.chatMessageDeleteConfirmTitle),
+          content: Text(
+            l10n.chatSelectionDeleteConfirm(selectedMessageTimestamps.length),
+          ),
           actions: <Widget>[
             TextButton(
               onPressed: () => Navigator.of(context).pop(false),
-              child: const Text('取消'),
+              child: Text(l10n.cancel),
             ),
             FilledButton(
               onPressed: () => Navigator.of(context).pop(true),
-              child: const Text('删除'),
+              child: Text(l10n.delete),
             ),
           ],
         );
@@ -666,20 +689,21 @@ class ChatScreenContent extends StatelessWidget {
 
   /// Generates and previews a share image for the selected messages.
   Future<void> _generateShareImage(BuildContext context) async {
+    final l10n = AppLocalizations.of(context)!;
     showDialog<void>(
       context: context,
       barrierDismissible: false,
       builder: (context) {
-        return const AlertDialog(
+        return AlertDialog(
           content: Row(
             children: <Widget>[
-              SizedBox(
+              const SizedBox(
                 width: 22,
                 height: 22,
                 child: CircularProgressIndicator(strokeWidth: 2.5),
               ),
-              SizedBox(width: 14),
-              Text('正在生成长图...'),
+              const SizedBox(width: 14),
+              Flexible(child: Text(l10n.chatShareImageGenerating)),
             ],
           ),
         );
@@ -687,9 +711,11 @@ class ChatScreenContent extends StatelessWidget {
     );
 
     try {
+      final selected = await _selectedMessagesWithBodies();
+      if (!context.mounted) return;
       final image = await ChatShareImageGenerator.generate(
         context: context,
-        messages: _selectedVisibleMessages,
+        messages: selected,
         splitMarkdownContent: viewModel.splitMarkdownContent,
       );
       if (!context.mounted) {
@@ -711,9 +737,9 @@ class ChatScreenContent extends StatelessWidget {
         return;
       }
       Navigator.of(context).pop();
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('生成长图失败：$error')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(l10n.chatShareImageFailed(error.toString()))),
+      );
     }
   }
 }

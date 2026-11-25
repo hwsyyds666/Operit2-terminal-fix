@@ -369,11 +369,9 @@ impl MessageCoordinationDelegate {
             .iter()
             .position(|message| message.timestamp == targetMessage.timestamp)
             .ok_or_else(|| format!("Runtime message timestamp not found: {messageTimestamp}"))?;
-        let executionLease = self
-            .chatHistoryDelegate
-            .chatHistoryManager
-            .beginChatExecution(&chatId)
-            .map_err(|error| error.to_string())?;
+        let executionLease = crate::services::ChatModelBindingService::ChatModelBindingService::beginExecution(
+            &self.chatHistoryDelegate.chatHistoryManager, &chatId,
+        )?;
         executionLease
             .protectRevision(targetMessage.timestamp, targetMessage.variantCount)
             .map_err(|error| error.to_string())?;
@@ -394,8 +392,6 @@ impl MessageCoordinationDelegate {
             })
             .await
             .map_err(|error| error.to_string())?;
-        let chatProviderIdOverride = Some(configuration.profile.modelBinding.providerId.clone());
-        let chatModelIdOverride = Some(configuration.profile.modelBinding.modelId.clone());
         let requestHistory = runtimeHistory[..targetRuntimeIndex].to_vec();
         let requestMessageContent = requestHistory
             .last()
@@ -439,8 +435,8 @@ impl MessageCoordinationDelegate {
                 enableThinking: true,
                 maxTokens,
                 tokenUsageThreshold: chatContextSettings.summary.tokenThresholdRatio(),
-                chatProviderIdOverride,
-                chatModelIdOverride,
+                chatProviderIdOverride: None,
+                chatModelIdOverride: None,
             })
             .await
             .map_err(|error| error.to_string())?;
@@ -662,7 +658,9 @@ impl MessageCoordinationDelegate {
             .and_then(|chat| self.chatHistoryDelegate.primaryWorkspacePathForChat(chat));
         let executionLease = match match admittedLease {
             Some(lease) => Ok(lease),
-            None => self.chatHistoryDelegate.chatHistoryManager.beginChatExecution(&chatId),
+            None => crate::services::ChatModelBindingService::ChatModelBindingService::beginExecution(
+                &self.chatHistoryDelegate.chatHistoryManager, &chatId,
+            ),
         } {
             Ok(lease) => lease,
             Err(error) => {
@@ -810,23 +808,23 @@ impl MessageCoordinationDelegate {
                 .summaryTaskForChat(chatId)
                 .is_none()
         {
-            let messages = self
-                .chatHistoryDelegate
-                .getRuntimeChatHistory(chatId.to_string());
             let chat = self
                 .chatHistoryDelegate
                 .chatHistoryManager
                 .loadChatHistory(chatId.to_string())
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| format!("Chat does not exist: {chatId}"))?;
-            if !messages.is_empty()
-                && AIMessageManager::shouldGenerateSummary(
+            if AIMessageManager::shouldGenerateSummary(
                     chat.currentWindowSize,
                     maxTokens,
                     policy.tokenUsageThreshold,
                     true,
                 )
             {
+                let messages = self.chatHistoryDelegate.getRuntimeChatHistory(chatId.to_string());
+                if messages.is_empty() {
+                    return Ok((maxTokens, policy.tokenUsageThreshold));
+                }
                 let _summaryCompletion = self.launchSummary(
                     enhancedAiService,
                     messages,
@@ -947,6 +945,11 @@ impl MessageCoordinationDelegate {
             "chat-summary",
             Box::new(move || {
                 Box::pin(async move {
+                    AppLogger::v_with_level(
+                        "MessageCoordinationDelegate",
+                        &format!("chat.summary.started chatId={workerChatId}"),
+                        operit_util::AppLogger::VERBOSE_LEVEL_2,
+                    );
                     let progressDelegate = std::sync::Mutex::new(worker.messageProcessingDelegate.clone_for_core());
                     let progressChatId = workerChatId.clone();
                     let progressTaskId = workerTaskId.clone();
@@ -1003,6 +1006,11 @@ impl MessageCoordinationDelegate {
                             Err("Conversation summary cancelled".to_string())
                         }
                     };
+                    AppLogger::v_with_level(
+                        "MessageCoordinationDelegate",
+                        &format!("chat.summary.finished chatId={workerChatId} result={result:?}"),
+                        operit_util::AppLogger::VERBOSE_LEVEL_2,
+                    );
                     worker
                         .messageProcessingDelegate
                         .finishSummaryTask(&workerChatId, &workerTaskId);
@@ -1189,6 +1197,18 @@ impl MessageCoordinationDelegate {
         {
             return Err("Summary continuation no longer owns the chat turn".to_string());
         }
+        AppLogger::v_with_level(
+            "MessageCoordinationDelegate",
+            &format!("chat.summary.resume chatId={} turnId={}", request.chatId, request.turnId),
+            operit_util::AppLogger::VERBOSE_LEVEL_2,
+        );
+        let history = self.chatHistoryDelegate.getRuntimeChatHistory(request.chatId.clone());
+        let source = if let Some(continuation) = &request.turnOptions.continuation {
+            Some(self.chatHistoryDelegate.chatHistoryManager
+                .loadChatMessageVariant(&request.chatId, continuation.userMessageTimestamp, 0)
+                .map_err(|error| error.to_string())?)
+        } else { None };
+        let history = summaryContinuationHistory(history, source);
         Box::pin(self.sendMessageInternal(
             enhancedAiService,
             request.promptFunctionType,
@@ -1204,7 +1224,7 @@ impl MessageCoordinationDelegate {
             Vec::new(),
             None,
             true,
-            None,
+            Some(history),
             request.turnOptions,
             Some(request.executionLease),
         ))
@@ -1236,11 +1256,42 @@ impl MessageCoordinationDelegate {
     }
 }
 
+/// Creates a model-only continuation without changing persisted history.
+fn summaryContinuationHistory(mut history: Vec<ChatMessage>, source: Option<ChatMessage>) -> Vec<ChatMessage> {
+    if let Some(summary) = history.iter_mut().find(|message| message.sender == "summary") {
+        let text = format!("以下是先前对话的历史检查点：\n\n{}", summary.displayText());
+        summary.parts = vec![MessagePart::markdown("part-0".to_string(), 0, text)];
+    }
+    if let Some(source) = source {
+        if source.displayMode != ChatMessageDisplayMode::HIDDEN_PLACEHOLDER
+            && !history.iter().any(|message| message.timestamp == source.timestamp)
+        {
+            let position = history.iter().position(|message| message.sender == "summary")
+                .map(|index| index + 1).unwrap_or(0);
+            history.insert(position, source);
+        }
+    }
+    history.push(ChatMessage::new_with_markdown("user".to_string(),
+        "请根据原始任务和已有工具结果，从中断处继续完成尚未完成的工作。".to_string()));
+    history
+}
+
 #[cfg(test)]
 mod summary_send_policy_tests {
     use super::*;
     use operit_model::ChatTurnOptions::ChatTurnContinuation;
     use operit_model::ModelConfigData::ModelContextSpec;
+
+    #[test]
+    fn compaction_restores_the_user_request_only_when_needed() {
+        let summary = ChatMessage::new_with_markdown("summary".into(), "检查点".into());
+        let source = ChatMessage::new_with_markdown("user".into(), "调查界面问题".into());
+        let restored = summaryContinuationHistory(vec![summary.clone()], Some(source.clone()));
+        assert_eq!(restored[1].displayText(), "调查界面问题");
+        assert!(restored.last().unwrap().displayText().contains("继续完成"));
+        let present = summaryContinuationHistory(vec![summary, source.clone()], Some(source.clone()));
+        assert_eq!(present.iter().filter(|message| message.timestamp == source.timestamp).count(), 1);
+    }
 
     /// A continued or background tool loop must still compact at 98% with the default 85% threshold.
     #[test]

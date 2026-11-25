@@ -673,47 +673,10 @@ impl OperitApplication {
         assetId: String,
         fileName: String,
         expectedSha256: String,
-    ) -> Result<String, String> {
-        let fileName = fileName.trim().to_string();
-        if fileName.is_empty()
-            || fileName.contains(['/', '\\'])
-            || std::path::Path::new(&fileName)
-                .file_name()
-                .and_then(|name| name.to_str())
-                != Some(fileName.as_str())
-        {
-            return Err("Market artifact file name is invalid".to_string());
-        }
-        let normalizedSha256 = expectedSha256.trim().to_ascii_lowercase();
-        if normalizedSha256.len() != 64
-            || !normalizedSha256
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err("Market artifact SHA-256 is invalid".to_string());
-        }
-
-        let packageManager = self.packageManager();
-        let targetPath = packageManager
-            .lock()
-            .map_err(|error| error.to_string())?
-            .prepareMarketArtifactDownload(&fileName)?;
-        let vfs = (&self.hostManager).vfs()?;
-        let directory = std::path::Path::new(&targetPath)
-            .parent()
-            .map(|path| path.to_string_lossy().to_string());
-        let result = (|| {
-            operit_providers::market::MarketStatsApiService::MarketStatsApiService::new()
-                .download_asset_to_file(&assetId, &targetPath, &vfs)?;
-            Ok(packageManager
-                .lock()
-                .map_err(|error| error.to_string())?
-                .addMarketArtifactFile(targetPath.clone(), normalizedSha256))
-        })();
-        if let Some(directory) = directory {
-            let _ = vfs.deleteFile(&directory, true);
-        }
-        result
+    ) -> impl std::future::Future<Output = Result<String, String>> + 'static {
+        let tools = self.toolHandler.clone();
+        let host = self.hostManager.clone();
+        async move { super::MarketInstallSupport::install_artifact(&host, &tools, assetId, fileName, expectedSha256).await }
     }
 
     /// Returns marketplace entry/version markers for plugins that are still installed.
@@ -728,8 +691,10 @@ impl OperitApplication {
         &self,
         entryId: String,
         versionId: Option<String>,
-    ) -> Result<String, String> {
-        super::MarketInstallSupport::install_entry(self, &entryId, versionId.as_deref())
+    ) -> impl std::future::Future<Output = Result<String, String>> + 'static {
+        let tools = self.toolHandler.clone();
+        let host = self.hostManager.clone();
+        async move { super::MarketInstallSupport::install_entry(&host, &tools, &entryId, versionId.as_deref()).await }
     }
 
     /// Returns package names enabled in this application runtime.
@@ -945,7 +910,7 @@ impl OperitApplication {
         let managedFiles = self.runtimeWorkspaceFileSyncStore()?;
         for reference in managedFiles.deferredBlobs()? {
             operit_util::AppLogger::AppLogger::trace("CoreSyncTrace", &format!(
-                "sync_clock.blob hash={} bytes={} source=deferred", &reference.contentHash[..12], reference.size));
+                "sync_clock.blob hash={} bytes={} source=deferred", syncTraceHashPrefix(&reference.contentHash), reference.size));
             blobs.insert(reference.contentHash.clone(), reference);
         }
         for operation in states.into_values() {
@@ -955,7 +920,7 @@ impl OperitApplication {
                 Ok(Some(reference)) => {
                     operit_util::AppLogger::AppLogger::trace("CoreSyncTrace", &format!(
                         "sync_clock.blob hash={} bytes={} source=pending-op op={} entity={}",
-                        &reference.contentHash[..12], reference.size, operation.opId, operation.entityId));
+                        syncTraceHashPrefix(&reference.contentHash), reference.size, operation.opId, operation.entityId));
                     blobs.insert(reference.contentHash.clone(), reference);
                 }
                 Ok(None) => {}
@@ -1362,6 +1327,33 @@ fn synchronizedChatId(operation: &SyncOperation) -> Option<String> {
 impl Default for OperitApplication {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Returns a short log prefix without panicking on malformed or multibyte content hashes.
+fn syncTraceHashPrefix(contentHash: &str) -> &str {
+    contentHash.get(..12).unwrap_or(contentHash)
+}
+
+#[cfg(test)]
+mod sync_trace_hash_prefix_tests {
+    use super::syncTraceHashPrefix;
+
+    #[test]
+    fn long_hash_uses_first_twelve_bytes() {
+        assert_eq!(syncTraceHashPrefix("0123456789abcdef0123"), "0123456789ab");
+    }
+
+    #[test]
+    fn short_or_empty_hash_is_returned_whole() {
+        assert_eq!(syncTraceHashPrefix("abc"), "abc");
+        assert_eq!(syncTraceHashPrefix(""), "");
+    }
+
+    #[test]
+    fn multibyte_hash_falls_back_to_whole_value() {
+        let hash = "a".repeat(11) + "中";
+        assert_eq!(syncTraceHashPrefix(&hash), hash);
     }
 }
 

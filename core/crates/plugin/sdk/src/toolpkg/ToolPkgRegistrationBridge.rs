@@ -545,7 +545,7 @@ pub fn buildToolPkgRegistrationBridgeScript(restrictHostCapabilities: bool) -> S
                     }
                     return windowCommand('set', Object.assign({}, content, {id:id, visible:content !== null}));
                 },
-                capabilities: function() { return windowCommand('capabilities', {}); },
+                capabilities: function(options) { return windowCommand('capabilities', options); },
                 requestPermission: function() { return windowCommand('requestPermission', {}); },
                 open: function(options) { return windowCommand('open', options); },
                 update: function(id, options, state) { var request = {id:id, options:options}; if (state !== undefined) request.state = state; return windowCommand('update', request); },
@@ -557,8 +557,11 @@ pub fn buildToolPkgRegistrationBridgeScript(restrictHostCapabilities: bool) -> S
                     return windowCommand('record', Object.assign({}, options, {id:id}));
                 },
                 recordingLevel: function(id) { return windowCommand('recordingLevel', {id:id}); },
+                recordingHasSpeech: function(id) { return windowCommand('recordingHasSpeech', {id:id}); },
                 finishRecording: function(id) { return windowCommand('finishRecording', {id:id}); },
-                cancelRecording: function(id) { return windowCommand('cancelRecording', {id:id}); }
+                cancelRecording: function(id) { return windowCommand('cancelRecording', {id:id}); },
+                setFullscreen: function(id, fullscreen) { return windowCommand('setFullscreen', {id:id, fullscreen:fullscreen}); },
+                captureCameraFrame: function(id) { return windowCommand('captureCameraFrame', {id:id}); }
               }
             },
             registerToolboxUiModule: registerScreen('toolboxUiModules', 'ToolPkg.registerToolboxUiModule'),
@@ -786,6 +789,9 @@ mod tests {
                         title: { en: 'Hello' },
                         description: { en: 'Greets the user' },
                         usage: '/hello <name>',
+                        args: [
+                            { name: 'target', required: true, options: ['world'] }
+                        ],
                         function: runHello
                     });
                     "#,
@@ -801,9 +807,19 @@ mod tests {
                     "JSON.parse(globalThis.__operitToolPkgRegistrationCapture.coreCommands[0]).function",
                 )
                 .expect("captured function should be readable");
+            let args_json = context
+                .evaluateHostJavaScriptString("test",
+                    "JSON.stringify(JSON.parse(globalThis.__operitToolPkgRegistrationCapture.coreCommands[0]).args)",
+                )
+                .expect("captured command args should be readable");
 
             assert_eq!(command_name, "hello");
             assert_eq!(function_name, "runHello");
+            let args: serde_json::Value = serde_json::from_str(&args_json)
+                .expect("captured args should be a JSON array");
+            assert_eq!(args[0]["name"], "target");
+            assert_eq!(args[0]["required"], true);
+            assert_eq!(args[0]["options"][0], "world");
         }
     }
 

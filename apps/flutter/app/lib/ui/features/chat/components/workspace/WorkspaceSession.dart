@@ -18,6 +18,9 @@ class WorkspaceSession extends ChangeNotifier {
   /// Opens the side workspace when a turn review is requested.
   VoidCallback? onOpenRequested;
 
+  /// Remembers visibility for this workspace without writing preferences.
+  bool isOpen = false;
+
   final List<WorkspaceTab> tabs = <WorkspaceTab>[
     const WorkspaceTab(
       kind: WorkspaceTabKind.home,
@@ -95,12 +98,29 @@ class WorkspaceSession extends ChangeNotifier {
 
   /// Semantic conversation context forwarded opaquely to independently owned plugin pages.
   Map<String, Object?> _pluginHostState = const {};
+  Map<String, Object?> Function()? _readPluginHostState;
+  bool _pluginHostStateObserved = false;
 
   /// Exposes the latest opaque conversation context to all mounted plugin tabs.
-  Map<String, Object?> get pluginHostState => _pluginHostState;
+  Map<String, Object?> get pluginHostState {
+    _pluginHostStateObserved = true;
+    final read = _readPluginHostState;
+    if (read != null) {
+      _readPluginHostState = null;
+      _pluginHostState = Map.unmodifiable(read());
+    }
+    return _pluginHostState;
+  }
+
+  /// Defers packaging the message window until a plugin surface reads it.
+  void updatePluginHostState(Map<String, Object?> Function() read) {
+    _readPluginHostState = read;
+    if (_pluginHostStateObserved) notifyListeners();
+  }
 
   /// Updates live plugin input independently of the navigation that opened a tab.
   set pluginHostState(Map<String, Object?> value) {
+    _readPluginHostState = null;
     _pluginHostState = Map<String, Object?>.unmodifiable(value);
     notifyListeners();
   }
@@ -134,6 +154,7 @@ class WorkspaceSession extends ChangeNotifier {
         selectedIndex = tabs.length - 1;
       }
     }
+    isOpen = true;
     notifyListeners();
     onOpenRequested?.call();
   }

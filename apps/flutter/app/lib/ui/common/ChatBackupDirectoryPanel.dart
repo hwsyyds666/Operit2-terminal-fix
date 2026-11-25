@@ -38,7 +38,7 @@ class _ChatBackupDirectoryPanelState extends State<ChatBackupDirectoryPanel> {
     });
   }
 
-  /// Opens the system picker under the user's gesture and checks the selected capability.
+  /// Opens the platform directory selector and checks its selected capability.
   Future<void> _select() async {
     setState(() => _busy = true);
     try {
@@ -80,7 +80,7 @@ class _ChatBackupDirectoryPanelState extends State<ChatBackupDirectoryPanel> {
             const SizedBox(height: 8),
             SelectableText(
               _service.directorySelectionFailed || _service.needsDirectory
-                  ? l10n.chatBackupDirectoryUnavailable
+                  ? '${l10n.chatBackupDirectoryUnavailable}\n${_service.error!}'
                   : _service.error!,
               style: TextStyle(color: Theme.of(context).colorScheme.error),
             ),
@@ -178,41 +178,7 @@ class _ChatBackupHostState extends State<ChatBackupHost>
     }
   }
 
-  /// Keeps the application mounted beneath an opaque, modal directory prompt.
+  /// Keeps backup lifecycle checks independent of navigation.
   @override
-  Widget build(BuildContext context) => Stack(
-    children: [
-      widget.child,
-      if (_service.needsDirectory && !_service.promptDeferred)
-        Positioned.fill(
-          child: BlockSemantics(
-            child: Stack(
-              fit: StackFit.expand,
-              children: [
-                ModalBarrier(
-                  dismissible: false,
-                  color: Theme.of(
-                    context,
-                  ).colorScheme.scrim.withValues(alpha: 0.38),
-                ),
-                SafeArea(
-                  child: Dialog(
-                    backgroundColor: Theme.of(
-                      context,
-                    ).colorScheme.surfaceContainerHigh,
-                    child: SingleChildScrollView(
-                      padding: const EdgeInsets.all(24),
-                      child: ChatBackupDirectoryPanel(
-                        service: _service,
-                        onDeferred: _changed,
-                      ),
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-    ],
-  );
+  Widget build(BuildContext context) => widget.child;
 }

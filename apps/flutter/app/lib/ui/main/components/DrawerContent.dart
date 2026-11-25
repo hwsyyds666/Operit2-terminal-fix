@@ -3,7 +3,6 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
-import 'package:operit_folder_access/operit_folder_access.dart';
 import 'package:operit_ui/operit_ui.dart';
 
 import '../../../core/bridge/OperitRuntimeBridge.dart';
@@ -36,8 +35,6 @@ import 'SidebarChatCreation.dart';
 part 'DrawerContentGroups.dart';
 part 'DrawerContentDesktop.dart';
 part 'DrawerContentList.dart';
-
-enum _WorkspaceBindingChoice { existing, folder, create }
 
 class DrawerContent extends StatefulWidget {
   /// Receives generic chat metadata; plugin tabs own all subject-specific views.
@@ -233,72 +230,7 @@ class _DrawerContentState extends State<DrawerContent> {
       ).showSnackBar(const SnackBar(content: Text('对话 ID 无效')));
       return;
     }
-    final choice = await showDialog<_WorkspaceBindingChoice>(
-      context: context,
-      builder: (context) => SimpleDialog(
-        title: const Text('绑定对话到项目'),
-        children: <Widget>[
-          if (_workspaces.any(
-            (workspace) =>
-                workspace.id.isNotEmpty && workspace.id != history.workspaceId,
-          ))
-            SimpleDialogOption(
-              onPressed: () =>
-                  Navigator.of(context).pop(_WorkspaceBindingChoice.existing),
-              child: const ListTile(
-                contentPadding: EdgeInsets.zero,
-                leading: Icon(Icons.folder_special_outlined),
-                title: Text('选择已有项目'),
-                subtitle: Text('把当前对话移动到已有项目'),
-              ),
-            ),
-          SimpleDialogOption(
-            onPressed: () =>
-                Navigator.of(context).pop(_WorkspaceBindingChoice.folder),
-            child: const ListTile(
-              contentPadding: EdgeInsets.zero,
-              leading: Icon(Icons.folder_open_outlined),
-              title: Text('绑定本地文件夹'),
-              subtitle: Text('无项目时创建项目，有项目时追加文件夹'),
-            ),
-          ),
-          SimpleDialogOption(
-            onPressed: () =>
-                Navigator.of(context).pop(_WorkspaceBindingChoice.create),
-            child: const ListTile(
-              contentPadding: EdgeInsets.zero,
-              leading: Icon(Icons.create_new_folder_outlined),
-              title: Text('新建空白项目'),
-              subtitle: Text('创建内部项目并移动当前对话'),
-            ),
-          ),
-        ],
-      ),
-    );
-    if (!mounted || choice == null) return;
-
-    switch (choice) {
-      case _WorkspaceBindingChoice.existing:
-        await _showMoveConversationToWorkspaceDialog(history);
-      case _WorkspaceBindingChoice.folder:
-        final source = await OperitFolderAccess.pickWorkspaceDirectory();
-        if (!mounted || source == null) return;
-        await _runGroupMutation(
-          () => _chatCoreProxy.bindChatToWorkspace(
-            chatId: chatId,
-            workspace: source.encode(),
-          ),
-        );
-      case _WorkspaceBindingChoice.create:
-        final name = await _groupNameDialog('新建项目', '', labelText: '项目名称');
-        if (!mounted || name == null) return;
-        await _runGroupMutation(() async {
-          await _chatCoreProxy.createAndBindWorkspace(
-            chatId: chatId,
-            name: name,
-          );
-        });
-    }
+    await _showMoveConversationToWorkspaceDialog(history);
   }
 
   /// Opens an existing navigation entry using its exact registered host identity.
@@ -508,6 +440,12 @@ class _DrawerContentState extends State<DrawerContent> {
       ),
     );
     if (!mounted || workspaceId == null) return;
+    if (workspaceId.isEmpty) {
+      await _runGroupMutation(
+        () => _chatCoreProxy.unbindChatFromWorkspace(chatId: history.id),
+      );
+      return;
+    }
     await _runGroupMutation(
       () => _chatCoreProxy.moveChatToWorkspace(
         chatId: history.id,
@@ -677,7 +615,7 @@ class _DrawerContentState extends State<DrawerContent> {
   String _workspaceLabel(core_proxy.ChatHistoryListItem history) {
     final id = history.workspaceId?.trim();
     if (id == null || id.isEmpty) {
-      return '未关联项目';
+      return '普通聊天';
     }
     final name = history.workspaceName?.trim();
     if (name == null || name.isEmpty) {
@@ -722,7 +660,7 @@ class _DrawerContentState extends State<DrawerContent> {
     if (unbound.any((history) => matchingIds.contains(history.id))) {
       final section = _WorkspaceSection(
         key: 'workspace:unbound',
-        label: '未关联项目',
+        label: '普通聊天',
         canCreate: true,
       );
       section.histories.addAll(
@@ -1568,12 +1506,6 @@ class _WorkspaceActionsMenu extends StatelessWidget {
             value: _WorkspaceQuickAction.createChat,
             icon: Icons.add_comment_outlined,
             label: '新建对话',
-            enabled: canCreate,
-          ),
-          SidebarMenuAction(
-            value: _WorkspaceQuickAction.createGroup,
-            icon: Icons.create_new_folder_outlined,
-            label: '新建分组',
             enabled: canCreate,
           ),
           SidebarMenuAction(

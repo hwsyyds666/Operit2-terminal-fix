@@ -15,7 +15,7 @@ use operit_plugin_sdk::js_sdk::results::{
     JsNullable, TerminalCommandResultData, TerminalImplementation, TerminalObservationResultData,
     TerminalType, ToolResultData,
 };
-use operit_plugin_sdk::js_sdk::system::{TerminalExecEvent, TerminalExecRequest};
+use operit_plugin_sdk::js_sdk::system::{TerminalExecEvent, TerminalExecRequest, TerminalRunStreamRequest};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -45,6 +45,9 @@ enum Operation {
     },
     Open {
         request: TerminalExecRequest,
+    },
+    Runstream {
+        request: TerminalRunStreamRequest,
     },
     Next {
         handle: String,
@@ -120,7 +123,7 @@ impl TerminalStreamExecutor {
     ) -> Result<String, String> {
         let _admission = self.managedAdmission.lock().await;
         self.requireIdleSessionAsync(&request.sessionId).await?;
-        self.openExecution(owner, request, false)
+        self.openExecution(owner, request, false, false)
     }
 
     /// Checks the exact original session without blocking the coordination executor.
@@ -163,7 +166,7 @@ impl TerminalStreamExecutor {
         executor
     }
 
-    /// Binds terminal execution to the host-owned blocking task scheduler.
+    /// Binds terminal execution to the host-owned cooperative task scheduler.
     pub(crate) fn new(
         tools: StandardTerminalTools,
         scheduler: Option<Arc<dyn HostRuntimeTaskSchedulerHost>>,
@@ -180,7 +183,7 @@ impl TerminalStreamExecutor {
     }
     /// Validates one observation and schedules its command through the registered host.
     fn open(&self, owner: String, request: TerminalExecRequest) -> Result<String, String> {
-        self.openExecution(owner, request, false)
+        self.openExecution(owner, request, false, false)
     }
 
     /// Schedules either a disposable stream or a command whose lifetime belongs to its session.
@@ -189,6 +192,7 @@ impl TerminalStreamExecutor {
         owner: String,
         request: TerminalExecRequest,
         receiptOnly: bool,
+        continuous: bool,
     ) -> Result<String, String> {
         if request.sessionId.trim().is_empty()
             || request.sessionId.trim() != request.sessionId
@@ -223,7 +227,7 @@ impl TerminalStreamExecutor {
             sessionId: request.sessionId.clone(),
             createdAt: now,
             detached: AtomicBool::new(false),
-            deadline: if receiptOnly {
+            deadline: if receiptOnly || continuous {
                 None
             } else {
                 Some(
@@ -297,30 +301,15 @@ impl TerminalStreamExecutor {
             self.workers.fetch_add(1, Ordering::AcqRel);
             WorkerPermit(self.workers.clone())
         };
-        let outputHost = host.clone();
         let outputRequest = request.clone();
         let outputObservation = observation.clone();
-        let outputScheduler = scheduler.clone();
         let onOutput = {
             let mut decoder = OutputDecoder::default();
             let mut chunkIndex = 0;
             let mut receivedChars = 0;
-            let mut lastSessionCheck = now;
-            let host = outputHost;
             let request = outputRequest;
             let observation = outputObservation;
             Box::new(move |data: &[u8], finalFrame: bool| -> HostResult<()> {
-                let at = outputScheduler.monotonicTimeMillis()?;
-                if !nativeAndroid && at.saturating_sub(lastSessionCheck) >= 1000 {
-                    if !host
-                        .listSessions()?
-                        .iter()
-                        .any(|session| session.sessionId == request.sessionId)
-                    {
-                        return Err(HostError::new("Terminal session was closed"));
-                    }
-                    lastSessionCheck = at;
-                }
                 observation.ready.notify_waiters();
                 let text = decoder.feed(data, finalFrame)?;
                 if !text.is_empty() {
@@ -426,7 +415,7 @@ impl TerminalStreamExecutor {
         waitMs: u64,
     ) -> Result<TerminalCommandResultData, String> {
         let handle = self
-            .startNamed(owner.clone(), name, terminalType, profileId, command, waitMs, true)
+            .startNamed(owner.clone(), name, terminalType, profileId, command, waitMs, true, false)
             .await?;
         let observation = self.owned(&owner, &handle)?;
         self.waitForCommand(&observation, waitMs).await
@@ -442,6 +431,7 @@ impl TerminalStreamExecutor {
         command: String,
         waitMs: u64,
         receiptOnly: bool,
+        continuous: bool,
     ) -> Result<String, String> {
         let _admission = self.managedAdmission.lock().await;
         let mut reserved = std::collections::BTreeSet::new();
@@ -492,6 +482,7 @@ impl TerminalStreamExecutor {
                 timeoutMs: Some(waitMs),
             },
             receiptOnly,
+            continuous,
         );
         let handle = match opened {
             Ok(handle) => handle,
@@ -524,7 +515,7 @@ impl TerminalStreamExecutor {
         let _admission = self.managedAdmission.lock().await;
         self.requireIdleSessionAsync(&request.sessionId).await?;
         let waitMs = request.timeoutMs.unwrap_or(DEFAULT_WAIT_MS);
-        let handle = self.openExecution(owner.clone(), request, true)?;
+        let handle = self.openExecution(owner.clone(), request, true, false)?;
         drop(_admission);
         let observation = self.owned(&owner, &handle)?;
         self.waitForCommand(&observation, waitMs).await
@@ -577,11 +568,13 @@ impl TerminalStreamExecutor {
             .map_err(|error| error.message)?
             .checked_add(waitMs)
             .ok_or("Terminal wait deadline overflow")?;
+        let mut elapsed = scheduler.waitForHostRuntimeDelay(waitMs);
+        let mut expired = false;
         loop {
             let ready = observation.ready.notified();
             tokio::pin!(ready);
             ready.as_mut().enable();
-            let expired = {
+            let receipt = {
                 let inner = observation.inner.lock().map_err(|_| "Terminal observation is poisoned")?;
                 if let Some(Err(error)) = &inner.result {
                     return Err(error.clone());
@@ -589,7 +582,7 @@ impl TerminalStreamExecutor {
                 if let Some(result) = inner.receipt.as_ref() {
                     return Ok(result.clone());
                 }
-                if scheduler.monotonicTimeMillis().map_err(|error| error.message)? < deadline {
+                if !expired && scheduler.monotonicTimeMillis().map_err(|error| error.message)? < deadline {
                     None
                 } else {
                     let mut result = observation.metadata.clone();
@@ -598,7 +591,7 @@ impl TerminalStreamExecutor {
                     Some(result)
                 }
             };
-            if let Some(result) = expired {
+            if let Some(result) = receipt {
                 if cancelOnTimeout {
                     // Closing a session must not block the coordination executor or the deadline.
                     let host = self.host.clone().ok_or("Terminal host is unavailable")?;
@@ -626,7 +619,7 @@ impl TerminalStreamExecutor {
             }
             tokio::select! {
                 _ = ready => {},
-                result = scheduler.waitForHostRuntimeDelay(50) => { result.map_err(|error| error.message)?; }
+                result = &mut elapsed => { result.map_err(|error| error.message)?; expired = true; }
             }
         }
     }
@@ -653,6 +646,14 @@ impl TerminalStreamExecutor {
             }
         }
         let _guard = PullGuard(&observation.pulling);
+        let scheduler = self.scheduler.as_ref()
+            .ok_or("Runtime task scheduler host is unavailable")?;
+        let mut elapsed = match observation.deadline {
+            Some(deadline) => Some(scheduler.waitForHostRuntimeDelay(deadline.saturating_sub(
+                scheduler.monotonicTimeMillis().map_err(|error| error.message)?))),
+            None => None,
+        };
+        let mut deadlineReached = false;
         loop {
             let notified = observation.ready.notified();
             tokio::pin!(notified);
@@ -661,13 +662,10 @@ impl TerminalStreamExecutor {
                 .scheduler
                 .as_ref()
                 .ok_or("Runtime task scheduler host is unavailable")?;
-            let deadline = observation
-                .deadline
-                .ok_or("Terminal stream has no foreground deadline")?;
-            let expired = scheduler
-                .monotonicTimeMillis()
-                .map_err(|error| error.message)?
-                >= deadline;
+            let expired = deadlineReached || match observation.deadline {
+                Some(deadline) => scheduler.monotonicTimeMillis().map_err(|error| error.message)? >= deadline,
+                None => false,
+            };
             if expired
                 && observation
                     .inner
@@ -698,9 +696,12 @@ impl TerminalStreamExecutor {
                     return result.clone().map(|_| None);
                 }
             }
-            tokio::select! {
-                _ = notified => {},
-                result = scheduler.waitForHostRuntimeDelay(50) => { result.map_err(|error| error.message)?; }
+            match elapsed.as_mut() {
+                Some(elapsed) => tokio::select! {
+                    _ = notified => {},
+                    result = elapsed => { result.map_err(|error| error.message)?; deadlineReached = true; }
+                },
+                None => notified.await,
             }
         }
     }
@@ -751,6 +752,11 @@ impl SharedToolExecutor for TerminalStreamExecutor {
                     },
                     Operation::Open { request } => TerminalObservationResultData::Open {
                         handle: self.openStream(owner, request).await?,
+                    },
+                    Operation::Runstream { request } => TerminalObservationResultData::Open {
+                        handle: self.startNamed(owner, request.sessionName,
+                            request.terminalType.map(|value| value.as_str().to_string()),
+                            request.profileId, request.command, 0, false, true).await?,
                     },
                     Operation::Next { handle } => TerminalObservationResultData::Next {
                         event: JsNullable::from_option(self.next(&owner, &handle).await?),
@@ -1061,10 +1067,6 @@ mod tests {
         ) -> HostResult<()> {
             self.clock.scheduleDelayedHostRuntimeTask(name, delay, task)
         }
-        /// Preserves production event-loop turns.
-        fn waitForHostRuntimeTaskTurn(&self) -> operit_host_api::HostRuntimeTurnFuture {
-            self.clock.waitForHostRuntimeTaskTurn()
-        }
         /// Preserves production nonblocking delays.
         fn waitForHostRuntimeDelay(&self, delay: u64) -> operit_host_api::HostRuntimeTurnFuture {
             self.clock.waitForHostRuntimeDelay(delay)
@@ -1079,7 +1081,7 @@ mod tests {
         let second = TerminalStreamExecutor::shared(StandardTerminalTools::new(Some(host.clone())), Some(scheduler.clone()));
         assert!(Arc::ptr_eq(&first, &second));
         let name = uuid::Uuid::new_v4().to_string();
-        let handle = first.startNamed("owner".into(), name.clone(), Some("bash".into()), None, "printf queued".into(), 1000, true).await.unwrap();
+        let handle = first.startNamed("owner".into(), name.clone(), Some("bash".into()), None, "printf queued".into(), 1000, true, false).await.unwrap();
         let session = first.owned("owner", &handle).unwrap().sessionId.clone();
         drop(first);
         drop(second);
@@ -1089,13 +1091,50 @@ mod tests {
         scheduler.jobs.lock().unwrap().clear();
     }
 
+    /// A continuous package stream must survive arbitrarily late output without a foreground deadline.
+    #[tokio::test]
+    async fn continuous_named_stream_retains_session_and_delivers_late_chunks_until_completion() {
+        let host = Arc::new(NativePtyTerminalHost::default());
+        let scheduler = Arc::new(QueuedScheduler::default());
+        let tools = TerminalStreamExecutor::new(StandardTerminalTools::new(Some(host.clone())), Some(scheduler.clone()));
+        let name = uuid::Uuid::new_v4().to_string();
+        let handle = tools.startNamed("owner".into(), name.clone(), Some("bash".into()), None,
+            "printf queued".into(), 0, false, true).await.unwrap();
+        let observation = tools.owned("owner", &handle).unwrap();
+        assert_eq!(observation.deadline, None);
+        assert!(matches!(tools.next("owner", &handle).await.unwrap(), Some(TerminalExecEvent::Start { .. })));
+        {
+            let mut state = observation.inner.lock().unwrap();
+            state.events.push_back(TerminalExecEvent::Chunk {
+                sessionId: observation.sessionId.clone(), command: "printf queued".into(), platform: "linux".into(),
+                terminal: observation.metadata.terminal.clone(), terminalType: observation.metadata.terminalType.clone(),
+                chunk: "late output".into(), chunkIndex: 0, receivedChars: 11,
+            });
+            state.queuedBytes = state.events.iter().map(chunkCost).sum();
+        }
+        assert!(matches!(tools.next("owner", &handle).await.unwrap(), Some(TerminalExecEvent::Chunk { chunk, .. }) if chunk == "late output"));
+        let mut receipt = observation.metadata.clone();
+        receipt.timedOut = false;
+        receipt.exitCode = 0;
+        {
+            let mut state = observation.inner.lock().unwrap();
+            state.result = Some(Ok(()));
+            state.events.push_back(TerminalExecEvent::Completed { result: receipt });
+        }
+        assert!(matches!(tools.next("owner", &handle).await.unwrap(), Some(TerminalExecEvent::Completed { result }) if !result.timedOut));
+        tools.close("owner", &handle).unwrap();
+        assert!(host.listSessions().unwrap().iter().any(|session| session.sessionId == observation.sessionId));
+        scheduler.jobs.lock().unwrap().clear();
+        host.closeSession(&observation.sessionId).unwrap();
+    }
+
     #[tokio::test]
     async fn idle_close_rejects_queued_execution_and_preserves_force_close() {
         let host = Arc::new(NativePtyTerminalHost::default());
         let scheduler = Arc::new(QueuedScheduler::default());
         let tools = TerminalStreamExecutor::new(StandardTerminalTools::new(Some(host.clone())), Some(scheduler));
         let name = uuid::Uuid::new_v4().to_string();
-        let handle = tools.startNamed("owner".into(), name.clone(), Some("bash".into()), None, "printf queued".into(), 1000, true).await.unwrap();
+        let handle = tools.startNamed("owner".into(), name.clone(), Some("bash".into()), None, "printf queued".into(), 1000, true, false).await.unwrap();
         let session = tools.owned("owner", &handle).unwrap().sessionId.clone();
         let error = match tools.closeSession(&session, &name, true).await { Err(error) => error, Ok(_) => panic!("queued session was closed") };
         assert!(error.contains("queued or running"));

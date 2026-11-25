@@ -29,6 +29,15 @@ impl AndroidFileSystemHost {
 }
 
 impl FileSystemHost for AndroidFileSystemHost {
+    fn verifyWritableDirectory(&self, directory: &str, name: &str) -> HostResult<()> {
+        if isResource(directory)? {
+            let value = crate::document_filesystem::call(json!({
+                "operation": "verifyWritableDirectory", "path": directory, "name": name
+            }))?;
+            return if value.is_null() { Ok(()) } else { Err(HostError::new("Invalid document operation response")) };
+        }
+        self.inner.verifyWritableDirectory(directory, name)
+    }
     /// Opens an app-owned log file through the native file host.
     fn openAppendFile(&self, path: &str) -> HostResult<Box<dyn operit_host_api::FileAppendHandle>> {
         self.inner.openAppendFile(path)

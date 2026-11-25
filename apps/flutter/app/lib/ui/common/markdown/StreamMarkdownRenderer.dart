@@ -12,6 +12,7 @@ import '../interactions/MessagePressShield.dart';
 import 'EnhancedCodeBlock.dart';
 import 'EnhancedTableBlock.dart';
 import 'MarkdownNodeGrouper.dart';
+import 'MarkdownSelectionArea.dart';
 import 'MarkdownTextReveal.dart';
 import 'MarkdownBlockQuote.dart';
 import 'MarkdownFootnotes.dart';
@@ -19,6 +20,7 @@ import 'MarkdownImageRenderer.dart';
 import 'MarkdownInlineSpannable.dart';
 import 'MarkdownLatexBlock.dart';
 import 'StreamMarkdownRendererState.dart';
+import 'TranscriptMarkdownViewport.dart';
 import '../../features/chat/components/part/CustomXmlRenderer.dart';
 import 'Utf16Text.dart';
 
@@ -449,7 +451,7 @@ class _StreamMarkdownRendererState extends State<StreamMarkdownRenderer> {
     if (!widget.selectionRoot) {
       return scopedContent;
     }
-    return SelectionArea(child: scopedContent);
+    return MarkdownSelectionArea(child: scopedContent);
   }
 }
 
@@ -863,6 +865,14 @@ class _MarkdownNodeColumnState extends State<_MarkdownNodeColumn> {
         padding: widget.scrollPadding,
         itemCount: builders.length,
         itemBuilder: (context, index) => builders[index](),
+      );
+    }
+
+    if (builders.length >= 24 && TranscriptMarkdownScope.enabledOf(context)) {
+      return TranscriptMarkdownViewport(
+        key: ValueKey(widget.rendererId),
+        blockCount: builders.length,
+        builder: (context, index) => builders[index](),
       );
     }
 

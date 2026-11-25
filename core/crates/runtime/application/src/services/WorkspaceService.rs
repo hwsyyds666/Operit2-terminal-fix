@@ -233,6 +233,15 @@ impl WorkspaceService {
         self.workspaceStore.getAll().map_err(|error| error.to_string())
     }
 
+    /// Removes an unused workspace record while retaining its directories.
+    pub fn removeWorkspaceRecord(&self, workspaceId: String) -> Result<(), String> {
+        if self.chatDao.getAllChatsDirectly().map_err(|error| error.to_string())?
+            .iter().any(|chat| chat.workspaceId.as_deref() == Some(workspaceId.as_str())) {
+            return Err("请先将该工作区中的聊天移走".into());
+        }
+        self.workspaceStore.delete(&workspaceId).map_err(|error| error.to_string())
+    }
+
     /// Deletes, copies or moves an entry within the chat's workspace roots.
     #[allow(non_snake_case)]
     pub async fn mutateWorkspaceFile(
@@ -360,20 +369,8 @@ impl WorkspaceService {
             .map_err(|error| error.to_string())?;
         let workspaceRootText = VfsPath::workspaceCollectionPath().to_string();
         let mut boundWorkspaceNames = std::collections::HashSet::new();
-        let mut boundChatCount = 0i32;
-
-        for chat in &chats {
-            let Some(workspaceId) = chat.workspaceId.as_ref() else {
-                continue;
-            };
-            boundChatCount += 1;
-            let Some(workspace) = self
-                .workspaceStore
-                .getById(workspaceId)
-                .map_err(|error| error.to_string())?
-            else {
-                continue;
-            };
+        let boundChatCount = chats.iter().filter(|chat| chat.workspaceId.is_some()).count() as i32;
+        for workspace in self.workspaceStore.getAll().map_err(|error| error.to_string())? {
             for folder in &workspace.folders {
                 let path = match FileUtils::splitQualifiedVfsPath(&folder.path) {
                     Some((owner, path)) => {
@@ -389,7 +386,7 @@ impl WorkspaceService {
                     continue;
                 };
                 let components = relativePath.split('/').collect::<Vec<_>>();
-                if components.len() != 1 || components[0].is_empty() {
+                if components.is_empty() || components[0].is_empty() {
                     continue;
                 }
                 boundWorkspaceNames.insert(components[0].to_string());

@@ -2,6 +2,7 @@
 pub(crate) mod EdgeChatProjection;
 #[path = "ChatHistoryDelegate.rs"]
 pub mod ChatHistoryDelegate;
+pub mod ChatTranscript;
 #[path = "MessageCoordinationDelegate.rs"]
 pub mod MessageCoordinationDelegate;
 #[path = "MessageProcessingDelegate.rs"]

@@ -1526,9 +1526,9 @@ mod tests {
             _script: &str,
             _function_name: &str,
             _params: &BTreeMap<String, Value>,
-            _text_resources: Option<Arc<BTreeMap<String, String>>>,
-        ) -> JsExecutionResult<ToolPkgMainRegistrationCapture> {
-            Ok(ToolPkgMainRegistrationCapture::default())
+            _text_resources: Option<Arc<dyn crate::javascript::ToolPkgTextResourceHost>>,
+        ) -> crate::javascript::JsExecutionCompletion<JsExecutionResult<ToolPkgMainRegistrationCapture>> {
+            Box::pin(std::future::ready(Ok(ToolPkgMainRegistrationCapture::default())))
         }
 
         /// Rejects live-session rendering in this recording-only engine.

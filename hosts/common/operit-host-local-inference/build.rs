@@ -1,6 +1,7 @@
 /// Builds native inference engines and links the configured C++ runtime.
 fn main() {
     println!("cargo:rerun-if-changed=native");
+    println!("cargo:rerun-if-env-changed=OPERIT_LOCAL_LLM_BUILD_DIR");
     println!("cargo:rerun-if-env-changed=OPERIT_LLAMA_SOURCE");
     println!("cargo:rerun-if-env-changed=OPERIT_MNN_SOURCE");
     println!("cargo:rerun-if-env-changed=OPERIT_KLEIDIAI_SOURCE");
@@ -102,10 +103,11 @@ fn main() {
             .ancestors()
             .nth(3)
             .expect("Local models must be built from hosts/common/operit-host-local-inference");
+        let build_root = std::env::var_os("OPERIT_LOCAL_LLM_BUILD_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| repo_root.join("target/local-llm"));
         config.out_dir(
-            repo_root
-                .join("target/local-llm")
-                .join(format!("{:016x}", std::hash::Hasher::finish(&build_id))),
+            build_root.join(format!("{:016x}", std::hash::Hasher::finish(&build_id))),
         );
         let profile_dir = out_dir
             .ancestors()

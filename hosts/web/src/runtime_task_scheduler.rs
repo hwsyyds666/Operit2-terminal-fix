@@ -1,6 +1,6 @@
 use operit_host_api::{
     HostError, HostResult, HostRuntimeAsyncTask, HostRuntimeTask, HostRuntimeTaskSchedulerHost,
-    HostRuntimeTurnFuture,
+    HostRuntimeTurnFuture, HostRuntimePooledTask,
 };
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
@@ -97,6 +97,15 @@ impl HostRuntimeTaskSchedulerHost for WebHostRuntimeTaskSchedulerHost {
         Ok(())
     }
 
+    /// Admits both stream stages together on the browser's cooperative event executor.
+    fn scheduleHostRuntimePooledTask(&self, _name: &str, opening: Option<HostRuntimeAsyncTask>, task: HostRuntimePooledTask) -> HostResult<()> {
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Some(opening) = opening { wasm_bindgen_futures::spawn_local(async move { opening().await }); }
+            task.await;
+        });
+        Ok(())
+    }
+
     /// Enqueues the task through the browser timer queue after the requested delay.
     fn scheduleDelayedHostRuntimeTask(
         &self,
@@ -124,11 +133,6 @@ impl HostRuntimeTaskSchedulerHost for WebHostRuntimeTaskSchedulerHost {
                     "schedule delayed browser runtime task failed: {error:?}"
                 ))
             })
-    }
-
-    /// Waits for the browser worker to advance to a later event-loop turn.
-    fn waitForHostRuntimeTaskTurn(&self) -> HostRuntimeTurnFuture {
-        waitForBrowserRuntimeDelay(0)
     }
 
     /// Waits through the browser timer queue for one platform-owned delay.

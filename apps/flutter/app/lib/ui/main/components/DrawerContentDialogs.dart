@@ -226,18 +226,10 @@ class ConversationActionDialog extends StatelessWidget {
             ),
             _ConversationActionTile(
               icon: Icons.folder_open_outlined,
-              label: '项目绑定',
+              label: '更换工作区',
               onTap: () =>
                   Navigator.of(context).pop(ConversationAction.bindWorkspace),
             ),
-            if (canMoveToWorkspace)
-              _ConversationActionTile(
-                icon: Icons.drive_file_move_outlined,
-                label: '移动到项目',
-                onTap: () => Navigator.of(
-                  context,
-                ).pop(ConversationAction.moveToWorkspace),
-              ),
             _ConversationActionTile(
               icon: Icons.push_pin,
               label: history.pinned ? l10n.unpin : l10n.pin,
@@ -262,9 +254,8 @@ class ConversationActionDialog extends StatelessWidget {
               _ConversationActionTile(
                 icon: Icons.vertical_align_top,
                 label: l10n.chatPromoteToRoot,
-                onTap: () => Navigator.of(
-                  context,
-                ).pop(ConversationAction.promoteToRoot),
+                onTap: () =>
+                    Navigator.of(context).pop(ConversationAction.promoteToRoot),
               ),
             _ConversationActionTile(
               icon: Icons.delete_outline,
@@ -339,16 +330,23 @@ class WorkspacePickerDialog extends StatelessWidget {
         .where((workspace) => workspace.id != currentWorkspaceId)
         .toList(growable: false);
     return AlertDialog(
-      title: const Text('移动到项目'),
+      title: const Text('更换工作区'),
       content: SizedBox(
         width: 360,
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxHeight: 360),
           child: ListView.separated(
-            itemCount: choices.length,
+            itemCount: choices.length + 1,
             separatorBuilder: (_, _) => const Divider(height: 1),
             itemBuilder: (context, index) {
-              final workspace = choices[index];
+              if (index == 0) {
+                return ListTile(
+                  leading: const Icon(Icons.chat_bubble_outline),
+                  title: const Text('普通聊天'),
+                  onTap: () => Navigator.of(context).pop(''),
+                );
+              }
+              final workspace = choices[index - 1];
               final folderSummary = workspace.folders
                   .map((folder) => folder.path)
                   .join('\n');

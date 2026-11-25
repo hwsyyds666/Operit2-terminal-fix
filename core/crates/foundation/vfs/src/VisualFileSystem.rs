@@ -262,6 +262,12 @@ impl VisualFileSystem {
         crate::FileChanges::publish(&[&resolved.physicalPath])
     }
 
+    /// Validates a temporary file in the resolved directory using the owning host.
+    pub fn verifyWritableDirectory(&self, directory: &str, name: &str) -> Result<(), String> {
+        let resolved = self.resolvePath(directory)?;
+        self.host.verifyWritableDirectory(&resolved.physicalPath, name).map_err(hostErrorMessage)
+    }
+
     /// Writes raw bytes to a mapped host file.
     #[allow(non_snake_case)]
     pub fn writeFileBytes(&self, path: &str, content: &[u8]) -> Result<(), String> {

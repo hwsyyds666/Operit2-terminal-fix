@@ -4,7 +4,6 @@ import type {
   ConversationGroupRecord,
   Group,
   Memory,
-  MemoryGraph,
   MemoryLink,
   MemoryLinkUpdate,
   MemoryLinkValues,
@@ -112,6 +111,8 @@ export interface CharacterRepository {
   allocateRecordId(): Promise<string>;
   /** Reads only owner job metadata and candidates. */
   readMemoryJobState(ownerKey: string): Promise<import("./model").MemoryJobState>;
+  /** Moves a legacy device cursor out of the synchronized owner record before the next job pass. */
+  adoptLegacyScheduleCursor(ownerKey: string): Promise<boolean>;
   /** Writes job changes under their original exact record versions. */
   writeMemoryJobState(ownerKey: string, state: import("./model").MemoryJobState): Promise<void>;
   /** Retries failures on the selected producer, or clears them when explicitly passed null. */
@@ -119,7 +120,7 @@ export interface CharacterRepository {
   /** Rebuilds source vectors through bounded durable database pages. */
   rebuildMemoryEmbeddings(ownerKey: string): Promise<number>;
   /** Ranks original document chunks without constructing source vectors during queries. */
-  searchMemoryChunks(ownerKey: string, memoryId: string, query: string, count: number): Promise<{ total: number; chunks: import("./model").DocumentChunk[] }>;
+  searchMemoryChunks(ownerKey: string, memoryId: string, query: string, count: number, start?: number): Promise<{ total: number; chunks: import("./model").DocumentChunk[] }>;
   /** Writes a complete validated owner space without replacing the separate USER.md file. */
   writeMemorySpace(ownerKey: string, space: MemorySpace): Promise<void>;
   /** Reads the complete memory space for full-record exports. */
@@ -130,10 +131,8 @@ export interface CharacterRepository {
     space: MemorySpace,
     strategy: "SKIP" | "UPDATE" | "CREATE_NEW",
   ): Promise<import("./model").MemoryImportResult>;
-  /** Builds the UUID graph from full memories and relationships. */
-  readMemoryGraph(ownerKey: string): Promise<MemoryGraph>;
-  /** Lists complete memories including document nodes. */
-  listMemories(ownerKey: string): Promise<Memory[]>;
+  /** Reads a bounded database page with filters applied before hydration. */
+  readMemoryPage(ownerKey: string, options: import("./model").MemoryPageOptions): Promise<import("./model").MemoryPage>;
   /** Reads exact titles in the selected owner without scanning the corpus in TypeScript. */
   readMemoriesByTitles(ownerKey: string, titles: string[]): Promise<Memory[]>;
   /** Requires one unambiguous exact title. */
@@ -165,7 +164,7 @@ export interface CharacterRepository {
     folderPath: string,
   ): Promise<void>;
   /** Lists complete relationships, including their descriptions. */
-  listMemoryLinks(ownerKey: string): Promise<MemoryLink[]>;
+  readMemoryLinks(ownerKey: string, filter: import("./model").MemoryLinkFilter): Promise<import("./model").MemoryLinkView[]>;
   /** Requires one stored relationship. */
   readMemoryLink(ownerKey: string, id: string): Promise<MemoryLink>;
   /** Creates a relationship whose endpoints exist in this memory space. */

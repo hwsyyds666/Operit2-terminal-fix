@@ -82,6 +82,7 @@ class ThemePreferenceSnapshot {
     required this.bubbleUserContentPaddingRight,
     required this.bubbleAiContentPaddingLeft,
     required this.bubbleAiContentPaddingRight,
+    required this.chatContentHorizontalPadding,
     required this.customUserAvatarUri,
     required this.avatarShape,
     required this.avatarCornerRadius,
@@ -90,6 +91,9 @@ class ThemePreferenceSnapshot {
     required this.systemFontName,
     required this.customFontPath,
     required this.fontScale,
+    this.codeFontType = 'system',
+    this.codeFontSystemName,
+    this.codeFontPath,
     required this.bubbleUserUseCustomFont,
     required this.bubbleUserFontType,
     required this.bubbleUserSystemFontName,
@@ -188,6 +192,9 @@ class ThemePreferenceSnapshot {
   final double bubbleUserContentPaddingRight;
   final double bubbleAiContentPaddingLeft;
   final double bubbleAiContentPaddingRight;
+
+  /// 聊天正文两侧留白；0 让正文贴边，气泡内留白不受影响。
+  final double chatContentHorizontalPadding;
   final String? customUserAvatarUri;
   final String avatarShape;
   final double avatarCornerRadius;
@@ -196,6 +203,15 @@ class ThemePreferenceSnapshot {
   final String? systemFontName;
   final String? customFontPath;
   final double fontScale;
+
+  /// Font slot shared by code blocks, inline code, diffs, previews and editors.
+  ///
+  /// Uses the same type values as [fontType]: `system` selects the bundled
+  /// OperitCodeMono face, `file` and `device` select a runtime-registered
+  /// asset referenced by [codeFontPath].
+  final String codeFontType;
+  final String? codeFontSystemName;
+  final String? codeFontPath;
   final bool bubbleUserUseCustomFont;
   final String bubbleUserFontType;
   final String? bubbleUserSystemFontName;
@@ -296,6 +312,7 @@ class ThemePreferenceSnapshot {
       'bubbleUserContentPaddingRight': bubbleUserContentPaddingRight,
       'bubbleAiContentPaddingLeft': bubbleAiContentPaddingLeft,
       'bubbleAiContentPaddingRight': bubbleAiContentPaddingRight,
+      'chatContentHorizontalPadding': chatContentHorizontalPadding,
       'customUserAvatarUri': customUserAvatarUri,
       'avatarShape': avatarShape,
       'avatarCornerRadius': avatarCornerRadius,
@@ -304,6 +321,9 @@ class ThemePreferenceSnapshot {
       'systemFontName': systemFontName,
       'customFontPath': customFontPath,
       'fontScale': fontScale,
+      'codeFontType': codeFontType,
+      'codeFontSystemName': codeFontSystemName,
+      'codeFontPath': codeFontPath,
       'bubbleUserUseCustomFont': bubbleUserUseCustomFont,
       'bubbleUserFontType': bubbleUserFontType,
       'bubbleUserSystemFontName': bubbleUserSystemFontName,
@@ -448,6 +468,9 @@ class ThemePreferenceSnapshot {
       bubbleAiContentPaddingRight: requiredDouble(
         'bubbleAiContentPaddingRight',
       ),
+      chatContentHorizontalPadding: requiredDouble(
+        'chatContentHorizontalPadding',
+      ),
       customUserAvatarUri: optionalString('customUserAvatarUri'),
       avatarShape: requiredString('avatarShape'),
       avatarCornerRadius: requiredDouble('avatarCornerRadius'),
@@ -456,6 +479,9 @@ class ThemePreferenceSnapshot {
       systemFontName: optionalString('systemFontName'),
       customFontPath: optionalString('customFontPath'),
       fontScale: requiredDouble('fontScale'),
+      codeFontType: (json['codeFontType'] as String?) ?? 'system',
+      codeFontSystemName: optionalString('codeFontSystemName'),
+      codeFontPath: optionalString('codeFontPath'),
       bubbleUserUseCustomFont: requiredBool('bubbleUserUseCustomFont'),
       bubbleUserFontType: requiredString('bubbleUserFontType'),
       bubbleUserSystemFontName: optionalString('bubbleUserSystemFontName'),

@@ -166,7 +166,7 @@ export type TerminalType = "powershell" | "bash" | "zsh" | "shell";
 /**
  * Identifies the concrete terminal implementation selected by a host.
  */
-export type TerminalImplementation = "native" | "proot" | "android-system" | "adb" | "shell" | "arm64" | "qemu-vroot" | "v86";
+export type TerminalImplementation = "native" | "proot" | "termux" | "chroot" | "android-system" | "adb" | "shell" | "arm64" | "qemu-vroot" | "v86";
 
 /**
  * Reports the start or an incremental chunk of a streamed chat-message response.
@@ -854,6 +854,14 @@ export interface ChatFindResultData {
  * Reports a chat agent's current state and whether it is idle or processing.
  */
 export interface AgentStatusResultData {
+  /**
+   * Title of the current execution, when the chat has started real work.
+   */
+  taskTitle?: string;
+  /**
+   * Actual model response rounds in this execution; zero before the first response.
+   */
+  currentRound: number;
   /**
    * Target chat id
    */

@@ -176,10 +176,18 @@ class FloatingWindowLaunch {
     required this.options,
     this.fill = false,
     this.onBeforeCloseChanged,
+    this.onContentCommandChanged,
+    this.onWindowCommand,
   });
 
   /// The application host keeps one close hook per surface.
   final void Function(Future<void> Function()? callback)? onBeforeCloseChanged;
+  final void Function(Future<Object?> Function(String name)? callback)?
+  onContentCommandChanged;
+
+  /// Routes commands from content to its application surface.
+  final Future<Object?> Function(String method, Object? arguments)?
+  onWindowCommand;
   final Map<String, Object?> payload;
   final FloatingWindowOptions options;
   final bool fill;
@@ -199,6 +207,22 @@ class FloatingWindows {
         TargetPlatform.linux,
       ].contains(defaultTargetPlatform);
   static Future<void> Function()? beforeClose;
+
+  /// Receives an app command in a dedicated native window engine.
+  static Future<Object?> Function(String name)? onContentCommand;
+
+  /// Lets the application retain engine startup diagnostics in its normal log sink.
+  static void Function(String message)? onDiagnostic;
+
+  static void _diagnostic(String message) {
+    final line = 'platform=${defaultTargetPlatform.name} $message';
+    final sink = onDiagnostic;
+    if (sink != null) {
+      sink(line);
+    } else {
+      debugPrint('[FloatingWindows] $line');
+    }
+  }
 
   static FloatingWindowLaunch? parseLaunch(List<String> arguments) {
     String? text;
@@ -241,8 +265,57 @@ class FloatingWindows {
     }
   }
 
-  static Future<Map<String, Object?>> capabilities() async {
-    if (_desktop || _android) {
+  static void setContentCommandHandler(
+    FloatingWindowLaunch launch,
+    Future<Object?> Function(String name)? callback,
+  ) {
+    final register = launch.onContentCommandChanged;
+    if (register != null) {
+      register(callback);
+    } else {
+      onContentCommand = callback;
+    }
+  }
+
+  /// Changes the current surface without replacing its content or UI session.
+  /// Bounds and fill are mutually exclusive in a single update.
+  static Future<void> updateCurrent(
+    FloatingWindowLaunch launch,
+    FloatingWindowOptions options, {
+    bool? fill,
+  }) async {
+    if (fill == true && (options.hasBounds || options.draggable == true)) {
+      throw ArgumentError('A fill window cannot set bounds or enable dragging');
+    }
+    if (launch.onWindowCommand != null && options.screenBounds != null) {
+      throw UnsupportedError('Native screen bounds require a system surface');
+    }
+    final args = {...options.toMap(), if (fill != null) 'fill': fill};
+    final command = launch.onWindowCommand;
+    if (command != null) {
+      await command('update', args);
+    } else {
+      await channel.invokeMethod<void>('update', args);
+    }
+  }
+
+  /// Reads the actual geometry, including moves made by the native host.
+  static Future<FloatingWindowOptions> currentBounds(
+    FloatingWindowLaunch launch,
+  ) async {
+    final command = launch.onWindowCommand;
+    final bounds = command != null
+        ? await command('getBounds', null)
+        : await channel.invokeMethod<Object?>('getBounds');
+    return FloatingWindowOptions.fromMap(
+      Map<String, Object?>.from(bounds as Map),
+    );
+  }
+
+  static Future<Map<String, Object?>> capabilities({
+    bool applicationOnly = false,
+  }) async {
+    if (!applicationOnly && (_desktop || _android)) {
       final native = await channel.invokeMapMethod<String, Object?>(
         'capabilities',
       );
@@ -282,13 +355,19 @@ class FloatingWindows {
     FloatingWindowOptions options = const FloatingWindowOptions(),
     bool fill = false,
     Duration startupTimeout = const Duration(seconds: 30),
+    bool applicationOnly = false,
   }) async {
+    final stopwatch = Stopwatch()..start();
+    _diagnostic(
+      'open.begin route=${payload['route']} windowId=${payload['windowId']} '
+      'startupTimeoutMs=${startupTimeout.inMilliseconds}',
+    );
     if (startupTimeout <= Duration.zero)
       throw ArgumentError.value(startupTimeout, 'startupTimeout');
     if (fill && (options.hasBounds || options.draggable == true)) {
       throw ArgumentError('A fill window cannot set bounds or enable dragging');
     }
-    final support = await capabilities();
+    final support = await capabilities(applicationOnly: applicationOnly);
     if (support['supported'] != true || support['permissionGranted'] != true) {
       throw StateError(
         'Floating windows are unsupported or overlay permission is missing',
@@ -308,6 +387,9 @@ class FloatingWindows {
       }
       return _applicationHost!.open(payload, normalized, fill: fill);
     }
+    _diagnostic(
+      'open.create scope=${support['scope']} elapsedMs=${stopwatch.elapsedMilliseconds}',
+    );
     final encoded = jsonEncode({
       'kind': _kind,
       'payload': payload,
@@ -330,6 +412,17 @@ class FloatingWindows {
       );
       window = FloatingWindow._(controller.windowId, fill: fill);
     }
+    _diagnostic(
+      'open.created nativeId=${window.id} elapsedMs=${stopwatch.elapsedMilliseconds}',
+    );
+    var probes = 0;
+    var lastReply = 'pending';
+    final progress = Timer.periodic(const Duration(seconds: 5), (_) {
+      _diagnostic(
+        'open.waiting nativeId=${window.id} probes=$probes lastReply=$lastReply '
+        'elapsedMs=${stopwatch.elapsedMilliseconds}',
+      );
+    });
     try {
       final deadline = DateTime.now().add(startupTimeout);
       while (true) {
@@ -337,8 +430,11 @@ class FloatingWindows {
           final remaining = deadline.difference(DateTime.now());
           if (remaining <= Duration.zero)
             throw TimeoutException('Floating window startup timed out');
+          probes++;
           if (await window._command('ready').timeout(remaining) == true) break;
+          lastReply = 'not-ready';
         } on WindowChannelException catch (error) {
+          lastReply = error.code;
           if (![
             'CHANNEL_NOT_FOUND',
             'CHANNEL_NOT_REGISTERED',
@@ -347,20 +443,30 @@ class FloatingWindows {
           ].contains(error.code))
             rethrow;
         } on PlatformException catch (error) {
+          lastReply = error.code;
           if (!['CHANNEL_NOT_FOUND', 'NO_HANDLER'].contains(error.code))
             rethrow;
         } on MissingPluginException catch (_) {
+          lastReply = 'missing-plugin';
           /* The child has not installed its handler. */
         }
         if (DateTime.now().isAfter(deadline))
           throw TimeoutException('Floating window startup timed out');
         await Future<void>.delayed(const Duration(milliseconds: 50));
       }
+      _diagnostic(
+        'open.ready nativeId=${window.id} probes=$probes elapsedMs=${stopwatch.elapsedMilliseconds}',
+      );
       return window;
     } catch (error, stack) {
+      _diagnostic(
+        'open.failed nativeId=${window.id} probes=$probes lastReply=$lastReply '
+        'elapsedMs=${stopwatch.elapsedMilliseconds} error=$error',
+      );
       // The owner transport can destroy children that never installed a handler.
       try {
         await _destroyNative(window.id).timeout(const Duration(seconds: 5));
+        _diagnostic('open.reclaimed nativeId=${window.id}');
       } catch (cleanupError, cleanupStack) {
         FlutterError.reportError(
           FlutterErrorDetails(
@@ -372,6 +478,8 @@ class FloatingWindows {
         );
       }
       Error.throwWithStackTrace(error, stack);
+    } finally {
+      progress.cancel();
     }
   }
 
@@ -393,6 +501,10 @@ class FloatingWindows {
       await application();
       return;
     }
+    final stopwatch = Stopwatch()..start();
+    final identity =
+        'windowId=${launch.payload['windowId']} route=${launch.payload['route']}';
+    _diagnostic('child.launch $identity');
     final content = ValueNotifier<FloatingWindowLaunch>(launch);
     final dragPointers = <int>{};
     var ready = false;
@@ -437,6 +549,9 @@ class FloatingWindows {
         return null;
       }
       if (closing) throw StateError('Floating window is closing');
+      if (call.method == 'contentCommand') {
+        return onContentCommand?.call(call.arguments as String);
+      }
       if (call.method == 'update') {
         final args = (call.arguments as Map).cast<String, Object?>();
         final payload = args['payload'] as Map?;
@@ -469,8 +584,10 @@ class FloatingWindows {
       throw MissingPluginException();
     });
     if (!_android) {
-      await (await WindowController.fromCurrentEngine()).setWindowMethodHandler(
-        receive,
+      final controller = await WindowController.fromCurrentEngine();
+      await controller.setWindowMethodHandler(receive);
+      _diagnostic(
+        'child.handler $identity nativeId=${controller.windowId} elapsedMs=${stopwatch.elapsedMilliseconds}',
       );
     }
     try {
@@ -479,6 +596,9 @@ class FloatingWindows {
         ...launch.options.toMap(),
         if (launch.fill) 'fill': true,
       });
+      _diagnostic(
+        'child.configured $identity elapsedMs=${stopwatch.elapsedMilliseconds}',
+      );
       runApp(
         Listener(
           onPointerDown: (event) => dragPointers.add(event.pointer),
@@ -490,10 +610,22 @@ class FloatingWindows {
           ),
         ),
       );
-      await WidgetsBinding.instance.endOfFrame;
+      // Hidden macOS engines may suspend frames until their window is visible.
+      // Showing cannot depend on a first frame that itself depends on showing.
+      final firstFrame = WidgetsBinding.instance.endOfFrame;
       await channel.invokeMethod<void>('show');
+      _diagnostic(
+        'child.shown $identity elapsedMs=${stopwatch.elapsedMilliseconds}',
+      );
+      await firstFrame;
       ready = true;
+      _diagnostic(
+        'child.ready $identity elapsedMs=${stopwatch.elapsedMilliseconds}',
+      );
     } catch (error) {
+      _diagnostic(
+        'child.failed $identity elapsedMs=${stopwatch.elapsedMilliseconds} error=$error',
+      );
       startupError = error;
       rethrow;
     }
@@ -557,6 +689,11 @@ class FloatingWindow {
       FloatingWindowOptions.fromMap(
         Map<String, Object?>.from((await _command('getBounds')) as Map),
       );
+
+  /// Sends a command to the application content owned by this window.
+  Future<Object?> contentCommand(String name) =>
+      _command('contentCommand', name);
+
   Future<void> show() async => _command('show');
   Future<void> hide() async => _command('hide');
 

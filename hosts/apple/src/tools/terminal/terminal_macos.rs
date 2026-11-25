@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use operit_host_api::{
     HiddenTerminalCommandOutput, HostError, HostResult, TerminalCloseOutput, TerminalCommandOutput,
@@ -103,6 +104,7 @@ impl TerminalHost for AppleTerminalHost {
                 },
                 terminal: entry.terminal,
                 terminalType: entry.terminalType,
+                fieldChoices: None,
             })
             .collect())
     }
@@ -336,6 +338,22 @@ impl TerminalHost for AppleTerminalHost {
                 output.terminal = TERMINAL.to_string();
                 output
             })
+    }
+
+    /// Observes the session's actual backend without holding a worker while it runs.
+    fn beginInSessionStreaming(self: Arc<Self>, sessionId: String, command: String, timeoutMs: u64)
+        -> HostResult<Box<dyn operit_host_api::TerminalCommand::TerminalCommandExecution>> {
+        #[cfg(all(feature = "arm64-runtime", target_arch = "aarch64"))]
+        if sessionId.starts_with("macos-arm64-") {
+            return Arc::new(self.arm64.clone()).beginInSessionStreaming(sessionId, command, timeoutMs);
+        }
+        let execution = Arc::new(self.hostForSession(&sessionId)?.clone())
+            .beginInSessionStreaming(sessionId, command, timeoutMs)?;
+        Ok(operit_host_api::TerminalCommand::mapTerminalCommandExecution(execution, |mut output| {
+            output.platform = PLATFORM.to_string();
+            output.terminal = TERMINAL.to_string();
+            Ok(output)
+        }))
     }
 
     fn executeHiddenCommand(

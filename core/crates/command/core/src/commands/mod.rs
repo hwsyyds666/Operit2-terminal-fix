@@ -9,6 +9,7 @@ mod log;
 mod market;
 mod mcp;
 mod model;
+mod model_options;
 mod package;
 mod plugin;
 mod prefs;
@@ -24,6 +25,8 @@ mod update;
 mod usage;
 mod util;
 mod workspace;
+#[cfg(test)]
+mod package_tests;
 #[cfg(test)]
 mod settings_tests;
 
@@ -77,7 +80,7 @@ async fn run_core_owned_command(
         }
         BuiltinRoot::Skill => skill::run_skill_command(application, args, output),
         BuiltinRoot::Mcp => mcp::run_mcp_command(application, args, output).await,
-        BuiltinRoot::Market => market::run_market_command(application, args, output),
+        BuiltinRoot::Market => market::run_market_command(application, args, output).await,
         BuiltinRoot::Host => host::run_host_command(application.hostManager.clone(), args, output),
         BuiltinRoot::Log => log::run_log_command(args, output),
         BuiltinRoot::LocalModels => {

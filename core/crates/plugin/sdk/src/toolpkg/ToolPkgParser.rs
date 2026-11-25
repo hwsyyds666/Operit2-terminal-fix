@@ -141,6 +141,16 @@ pub struct ToolPkgFunctionHookRuntime {
     pub functionSource: Option<String>,
 }
 
+/// Describes one declared argument of a ToolPkg Core command.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToolPkgCommandArgRuntime {
+    pub name: String,
+    #[serde(default = "defaultTrue")]
+    pub required: bool,
+    #[serde(default)]
+    pub options: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ToolPkgCoreCommandRuntime {
     pub id: String,
@@ -148,6 +158,8 @@ pub struct ToolPkgCoreCommandRuntime {
     pub title: LocalizedText,
     pub description: LocalizedText,
     pub usage: String,
+    #[serde(default)]
+    pub args: Vec<ToolPkgCommandArgRuntime>,
     pub function: String,
     #[serde(rename = "functionSource", alias = "function_source")]
     pub functionSource: Option<String>,
@@ -343,6 +355,16 @@ pub struct ToolPkgRegisteredFunctionHook {
     pub functionSource: Option<String>,
 }
 
+/// Describes one declared argument of a registered Core command.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToolPkgRegisteredCommandArg {
+    pub name: String,
+    #[serde(default = "defaultTrue")]
+    pub required: bool,
+    #[serde(default)]
+    pub options: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ToolPkgRegisteredCoreCommand {
     pub id: String,
@@ -350,6 +372,8 @@ pub struct ToolPkgRegisteredCoreCommand {
     pub title: LocalizedText,
     pub description: LocalizedText,
     pub usage: String,
+    #[serde(default)]
+    pub args: Vec<ToolPkgRegisteredCommandArg>,
     pub function: String,
     #[serde(rename = "functionSource", alias = "function_source")]
     pub functionSource: Option<String>,
@@ -926,7 +950,7 @@ impl ToolPkgArchiveParser {
             manifest.extensionFields.get("market_origin")
                 .map(|value| serde_json::from_value::<ToolPkgMarketOrigin>(value.clone()))
                 .transpose().map_err(|error| error.to_string())?
-        } else if sourceType == ToolPkgSourceType::MARKET {
+        } else if matches!(sourceType, ToolPkgSourceType::MARKET | ToolPkgSourceType::EXTERNAL) {
             let source = Self::readZipEntryText(&mut archive, &index, &mainEntry)
                 .ok_or("Cannot read marketplace provenance from main entry")?;
             crate::toolpkg::ToolPkgProtection::readMainScriptMarketOrigin(&source, &manifest.toolpkgId)?
@@ -986,11 +1010,12 @@ impl ToolPkgArchiveParser {
 
     /// Parses and validates a ToolPkg container from an indexed archive source.
     #[allow(non_snake_case)]
-    pub fn parseToolPkgFromIndexedEntries<
+    pub async fn parseToolPkgFromIndexedEntries<
         FReadEntryText,
         FReadEntryProtectionHeader,
         FParseJsPackage,
         FParseMainRegistration,
+        FRegistration,
         FReportPackageLoadError,
     >(
         entryIndex: &ToolPkgEntryIndex,
@@ -1007,7 +1032,8 @@ impl ToolPkgArchiveParser {
         FReadEntryText: FnMut(&str) -> Option<String>,
         FReadEntryProtectionHeader: FnMut(&str) -> Option<Vec<u8>>,
         FParseJsPackage: FnMut(&str, &str, &mut dyn FnMut(String, String)) -> Option<ToolPackage>,
-        FParseMainRegistration: FnMut(&str, &str, &str, &str, &[String]) -> ToolPkgMainRegistrationParseResult,
+        FParseMainRegistration: FnMut(String, String, String, String, Vec<String>) -> FRegistration,
+        FRegistration: std::future::Future<Output = ToolPkgMainRegistrationParseResult>,
         FReportPackageLoadError: FnMut(String, String),
     {
         let manifestEntryName = findManifestEntry(&entryIndex.entryNames)
@@ -1333,15 +1359,15 @@ impl ToolPkgArchiveParser {
                 ToolPkgMainRegistration { marketOrigin, ..Default::default() }
             },
             Some(source) => match parseMainRegistration(
-                &source,
-                &manifest.toolpkgId,
-                &normalizedMainEntry,
-                &apiVersionText,
-                &subpackagePackages
+                source,
+                manifest.toolpkgId.clone(),
+                normalizedMainEntry.clone(),
+                apiVersionText.clone(),
+                subpackagePackages
                     .iter()
                     .flat_map(|package| package.env.iter().map(|variable| variable.name.clone()))
                     .collect::<Vec<_>>(),
-            ) {
+            ).await {
                 ToolPkgMainRegistrationParseResult::Success { registration } => registration,
                 ToolPkgMainRegistrationParseResult::Failure { message } => {
                     return Err(format!("Failed to parse main registration from '{}': {message}", manifest.main));
@@ -1953,7 +1979,7 @@ impl ToolPkgArchiveParser {
     /// Extracts normalized ToolPkg entries from embedded archive bytes.
     #[allow(non_snake_case)]
     pub fn extractZipEntriesFromAssetBytes(
-        bytes: &'static [u8],
+        bytes: &[u8],
         filesystem: &VisualFileSystem,
         destinationDir: &str,
     ) -> bool {
@@ -2130,12 +2156,31 @@ fn validateCoreCommands(
         if !names.insert(name.to_ascii_lowercase()) {
             return Err(format!("Duplicate core command name: {name}"));
         }
+        let args = command
+            .args
+            .iter()
+            .enumerate()
+            .map(|(argIndex, arg)| {
+                let argName = arg.name.trim().to_string();
+                if argName.is_empty() {
+                    return Err(format!(
+                        "{TOOLPKG_REGISTRATION_CORE_COMMAND}[{index}].args[{argIndex}].name is required"
+                    ));
+                }
+                Ok(ToolPkgCommandArgRuntime {
+                    name: argName,
+                    required: arg.required,
+                    options: arg.options.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         runtimes.push(ToolPkgCoreCommandRuntime {
             id,
             name,
             title: command.title.clone(),
             description: command.description.clone(),
             usage: command.usage.trim().to_string(),
+            args,
             function: command.function.trim().to_string(),
             functionSource: command.functionSource.clone(),
         });
@@ -2809,6 +2854,17 @@ where
     Ok(Vec::new())
 }
 
+/// Completes archive fixtures whose registration callbacks are immediately ready.
+#[cfg(test)]
+fn finishArchiveFixture<T>(future: impl std::future::Future<Output = T>) -> T {
+    let mut future = std::pin::pin!(future);
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    match future.as_mut().poll(&mut context) {
+        std::task::Poll::Ready(value) => value,
+        std::task::Poll::Pending => panic!("archive fixture unexpectedly suspended"),
+    }
+}
+
 #[cfg(test)]
 mod logo_tests {
     use super::{resolveLogoResource, ToolPkgResourceRuntime};
@@ -2863,18 +2919,18 @@ mod module_export_tests {
             entryNames: entries.keys().cloned().collect(),
             entryNamesByNormalizedLowercase: entries.keys().map(|name| (name.clone(), name.clone())).collect(),
         };
-        let loaded = ToolPkgArchiveParser::parseToolPkgFromIndexedEntries(
+        let loaded = finishArchiveFixture(ToolPkgArchiveParser::parseToolPkgFromIndexedEntries(
             &index, |name| entries.get(name).cloned(), |_| None,
             ToolPkgSourceType::EXTERNAL, "exports_fixture.toolpkg", false,
             |_, _, _| panic!("fixture does not contain subpackages"),
-            |_, _, _, _, _| ToolPkgMainRegistrationParseResult::Success {
+            |_, _, _, _, _| std::future::ready(ToolPkgMainRegistrationParseResult::Success {
                 registration: serde_json::from_value(serde_json::json!({
                     "chatComposerSlots": [{"id": "composer", "slot": "above_input", "screen": "screen.ui.js", "screenExport": "Composer"}],
                     "chatMessageMenuItems": [{"id": "menu", "function": "menu", "dialog": {"screen": "screen.ui.js", "screenExport": "Dialog"}}]
                 })).unwrap(),
-            },
+            }),
             |name, message| panic!("unexpected package error {name}: {message}"),
-        ).unwrap();
+        )).unwrap();
         let runtime = loaded.containerRuntime;
         assert_eq!(runtime.chatComposerSlots[0].screenExport.as_deref(), Some("Composer"));
         assert_eq!(runtime.chatMessageMenuItems[0].dialog.as_ref().unwrap().screenExport.as_deref(), Some("Dialog"));
@@ -2916,7 +2972,7 @@ mod api_compatibility_tests {
                 entryNames: entries.keys().cloned().collect(),
                 entryNamesByNormalizedLowercase: entries.keys().map(|name| (name.clone(), name.clone())).collect(),
             };
-            let loaded = ToolPkgArchiveParser::parseToolPkgFromIndexedEntries(
+            let loaded = finishArchiveFixture(ToolPkgArchiveParser::parseToolPkgFromIndexedEntries(
                 &index,
                 |name| entries.get(name).cloned(),
                 |_| None,
@@ -2933,12 +2989,12 @@ mod api_compatibility_tests {
                     assert_eq!(id, "compat_fixture");
                     assert_eq!(path, "main.js");
                     assert_eq!(declared, version);
-                    ToolPkgMainRegistrationParseResult::Success {
+                    std::future::ready(ToolPkgMainRegistrationParseResult::Success {
                         registration: ToolPkgMainRegistration::default(),
-                    }
+                    })
                 },
                 |name, message| panic!("unexpected package error {name}: {message}"),
-            )
+            ))
             .expect("supported manifest must load");
             assert_eq!(loaded.containerRuntime.apiVersion, version);
             assert_eq!(loaded.containerPackage.api_version, version);
@@ -3050,13 +3106,13 @@ mod api_compatibility_tests {
                 entryNames: entries.keys().cloned().collect(),
                 entryNamesByNormalizedLowercase: entries.keys().map(|name| (name.clone(), name.clone())).collect(),
             };
-            let loaded = ToolPkgArchiveParser::parseToolPkgFromIndexedEntries(
+            let loaded = finishArchiveFixture(ToolPkgArchiveParser::parseToolPkgFromIndexedEntries(
                 &index, |name| entries.get(name).cloned(), |_| None,
                 ToolPkgSourceType::EXTERNAL, "theme_fixture.toolpkg", false,
                 |_, _, _| panic!("declarative theme has no scripts"),
-                |_, _, _, _, _| panic!("declarative theme must not execute registration"),
+                |_, _, _, _, _| async { panic!("declarative theme must not execute registration") },
                 |_, _| panic!("declarative theme has no subpackages"),
-            );
+            ));
             match expected_license {
                 Ok(license) => {
                     let loaded = loaded.unwrap();
@@ -3084,12 +3140,12 @@ mod api_compatibility_tests {
             entryNames: entries.keys().cloned().collect(),
             entryNamesByNormalizedLowercase: entries.keys().map(|name| (name.clone(), name.clone())).collect(),
         };
-        let loaded = ToolPkgArchiveParser::parseToolPkgFromIndexedEntries(
+        let loaded = finishArchiveFixture(ToolPkgArchiveParser::parseToolPkgFromIndexedEntries(
             &index, |name| entries.get(name).cloned(), |_| None,
             ToolPkgSourceType::EXTERNAL, "resource_fixture.toolpkg", false,
-            |_, _, _| panic!("no executable declarations"), |_, _, _, _, _| panic!("no main entry"),
+            |_, _, _| panic!("no executable declarations"), |_, _, _, _, _| async { panic!("no main entry") },
             |_, _| panic!("resource declarations must load"),
-        ).unwrap();
+        )).unwrap();
         assert!(loaded.containerRuntime.mainEntry.is_empty());
         assert!(loaded.containerRuntime.themes.is_empty());
         assert_eq!(loaded.containerRuntime.resources[0].path, "data.txt");
@@ -3175,20 +3231,20 @@ mod public_api_tests {
             entryNames: entries.keys().cloned().collect(),
             entryNamesByNormalizedLowercase: entries.keys().map(|name| (name.clone(), name.clone())).collect(),
         };
-        ToolPkgArchiveParser::parseToolPkgFromIndexedEntries(
+        finishArchiveFixture(ToolPkgArchiveParser::parseToolPkgFromIndexedEntries(
             &index, |name| entries.get(name).cloned(), |_| None,
             ToolPkgSourceType::EXTERNAL, "public_fixture.toolpkg", false,
             |_, _, _| panic!("fixture has no subpackages"),
-            |_, _, _, _, _| ToolPkgMainRegistrationParseResult::Success {
+            |_, _, _, _, _| std::future::ready(ToolPkgMainRegistrationParseResult::Success {
                 registration: ToolPkgMainRegistration {
                     publicApis: (0..methods).map(|_| ToolPkgRegisteredFunctionHook {
                         id: "run".to_string(), function: "runExport".to_string(), ..Default::default()
                     }).collect(),
                     ..Default::default()
                 },
-            },
+            }),
             |name, message| panic!("unexpected package error {name}: {message}"),
-        )
+        ))
     }
 
     /// Verifies the distributed client and callable metadata survive archive loading.
@@ -3241,13 +3297,13 @@ mod navigation_registration_tests {
             }],
             ..Default::default()
         };
-        ToolPkgArchiveParser::parseToolPkgFromIndexedEntries(
+        finishArchiveFixture(ToolPkgArchiveParser::parseToolPkgFromIndexedEntries(
             &index, |name| sources.get(name).cloned(), |_| None,
             ToolPkgSourceType::EXTERNAL, "arbitrary_package.toolpkg", false,
             |_, _, _| panic!("navigation unit input has no subpackages"),
-            |_, _, _, _, _| ToolPkgMainRegistrationParseResult::Success { registration: registration.clone() },
+            |_, _, _, _, _| std::future::ready(ToolPkgMainRegistrationParseResult::Success { registration: registration.clone() }),
             |name, message| panic!("unexpected package error {name}: {message}"),
-        )
+        ))
     }
 
     /// Preserves the full registered attachment descriptor when validating the package's own route.
@@ -3305,13 +3361,13 @@ mod navigation_registration_tests {
             entryNamesByNormalizedLowercase: sources.keys().map(|name| (name.clone(), name.clone())).collect(),
         };
         let registration = ToolPkgMainRegistration { uiRoutes: routes, navigationEntries: vec![entry], ..Default::default() };
-        ToolPkgArchiveParser::parseToolPkgFromIndexedEntries(
+        finishArchiveFixture(ToolPkgArchiveParser::parseToolPkgFromIndexedEntries(
             &index, |name| sources.get(name).cloned(), |_| None,
             ToolPkgSourceType::EXTERNAL, "arbitrary_package.toolpkg", false,
             |_, _, _| panic!("sidebar archive input declares no subpackages"),
-            |_, _, _, _, _| ToolPkgMainRegistrationParseResult::Success { registration: registration.clone() },
+            |_, _, _, _, _| std::future::ready(ToolPkgMainRegistrationParseResult::Success { registration: registration.clone() }),
             |name, message| panic!("unexpected package error {name}: {message}"),
-        )
+        ))
     }
 
     /// Supplies one actual Compose route and sidebar descriptor while keeping all plugin params opaque.

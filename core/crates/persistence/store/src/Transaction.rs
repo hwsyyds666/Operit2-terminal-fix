@@ -1464,18 +1464,17 @@ pub(crate) struct Table {
     pub(crate) rows: Vec<Vec<Cell>>,
 }
 
-/// Projects explicitly declared local columns and identity-only rows out of SQL content comparisons.
+/// Projects explicitly declared local columns out of SQL content comparisons.
 /// Sorting after projection prevents local row IDs from leaking back through row order.
+///
+/// A table whose rows only mean something together — an alias graph — uses
+/// [`project_sql_alias_closure`] instead: dropping a local column from each row independently is not
+/// enough to make equivalent graphs compare equal.
 #[cfg(feature = "full")]
-pub fn project_sql_table(value: &Value, local_columns: &[&str], identity: Option<(&str, &str)>) -> Result<Value> {
+pub fn project_sql_table(value: &Value, local_columns: &[&str]) -> Result<Value> {
     let mut table: Table = serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
     if table.rows.iter().any(|row| row.len() != table.columns.len()) {
         return Err("SQL content projection has an invalid row width".into());
-    }
-    if let Some((from, to)) = identity {
-        let locate = |column| table.columns.iter().position(|name| name == column).ok_or("Missing identity column");
-        let (from,to) = (locate(from)?,locate(to)?);
-        table.rows.retain(|row| row[from] != row[to]);
     }
     let retained = table.columns.iter().enumerate().filter_map(|(i,name)|
         (!local_columns.contains(&name.as_str())).then_some(i)).collect::<BTreeSet<_>>();
@@ -1483,6 +1482,59 @@ pub fn project_sql_table(value: &Value, local_columns: &[&str], identity: Option
     for row in &mut table.rows {
         *row = std::mem::take(row).into_iter().enumerate().filter_map(|(i,value)| retained.contains(&i).then_some(value)).collect();
     }
+    table.rows.sort_by_cached_key(|row| serde_json::to_string(row).expect("SQL cells serialize"));
+    table.rows.dedup();
+    serde_json::to_value(table).map_err(|error| error.to_string())
+}
+
+/// Compares alias graphs by their final identities within each collection and namespace.
+/// Equivalent chains and flattened edges compare equally; self receipts carry no equivalence.
+/// Cycles and conflicting targets retain their original edges as evidence for correction.
+/// Preference sources use `<namespace>\u{1f}<identity>` with bare targets in that namespace.
+#[cfg(feature = "full")]
+pub fn project_sql_alias_closure(value: &Value, local_columns: &[&str], source: &str, target: &str) -> Result<Value> {
+    let mut table: Table = serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
+    if table.rows.iter().any(|row| row.len() != table.columns.len()) {
+        return Err("SQL content projection has an invalid row width".into());
+    }
+    let locate = |column: &str| table.columns.iter().position(|name| name == column).ok_or("Missing identity column");
+    let (from, to) = (locate(source)?, locate(target)?);
+    let text = |row: &[Cell], index: usize| match row.get(index) { Some(Cell::Text(value)) => Some(value.clone()), _ => None };
+    let split = |key: &str| match key.rsplit_once('\u{1f}') {
+        Some((namespace, identity)) => (namespace.to_owned(), identity.to_owned()),
+        None => (String::new(), key.to_owned()),
+    };
+    let retained = table.columns.iter().enumerate().filter_map(|(index, name)|
+        (!local_columns.contains(&name.as_str())).then_some(index)).collect::<BTreeSet<_>>();
+    // The remaining columns plus the namespace name one equivalence space: a name means different
+    // things in different collections and in different preference files, so chains never cross them.
+    let scope = retained.iter().copied().filter(|index| *index != from && *index != to).collect::<Vec<_>>();
+    let claimOf = |row: &[Cell]| -> Option<(Vec<String>, String, String)> {
+        let (namespace, key) = split(&text(row, from)?);
+        let mut space = scope.iter().map(|index| text(row, *index)).collect::<Option<Vec<String>>>()?;
+        space.push(namespace);
+        Some((space, key, split(&text(row, to)?).1))
+    };
+    let mut claims = BTreeMap::<(Vec<String>, String), BTreeSet<String>>::new();
+    for row in &table.rows {
+        let Some((scope, key, value)) = claimOf(row) else { continue };
+        if key != value { claims.entry((scope, key)).or_default().insert(value); }
+    }
+    table.rows.retain(|row| claimOf(row).is_none_or(|(_, key, value)| key != value));
+    for row in &mut table.rows {
+        if let Some((scope, mut current, _)) = claimOf(row) {
+            let mut seen = BTreeSet::new();
+            while seen.insert(current.clone()) {
+                match claims.get(&(scope.clone(), current.clone())) {
+                    None => { row[to] = Cell::Text(current); break; }
+                    Some(targets) if targets.len() == 1 => current = targets.first().expect("one target").clone(),
+                    Some(_) => break,
+                }
+            }
+        }
+        *row = retained.iter().map(|index| row[*index].clone()).collect();
+    }
+    table.columns = retained.into_iter().map(|index| table.columns[index].clone()).collect();
     table.rows.sort_by_cached_key(|row| serde_json::to_string(row).expect("SQL cells serialize"));
     table.rows.dedup();
     serde_json::to_value(table).map_err(|error| error.to_string())

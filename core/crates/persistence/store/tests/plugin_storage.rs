@@ -2045,6 +2045,26 @@ fn incremental_object_merge_bookkeeping_does_not_require_a_full_snapshot() {
     values["rows"][0][version] = json!({"Text":"another-local-cas-token"});
     assert_eq!(PluginStorage::snapshotContentSummary(&a).unwrap(), PluginStorage::snapshotContentSummary(&local_cas).unwrap());
     assert_ne!(b.token().unwrap(), local_cas.token().unwrap());
+    // Two peers holding identical records still record different last writers; that is not content drift.
+    let mut last_writer = b.clone();
+    let versions = last_writer.data.values.get_mut("_operit_versions").unwrap();
+    let columns = versions["columns"].as_array().unwrap().clone();
+    let created = columns.iter().position(|column| column == "created_at").unwrap();
+    let origin = columns.iter().position(|column| column == "origin").unwrap();
+    let sequence = columns.iter().position(|column| column == "sequence").unwrap();
+    assert!(!versions["rows"].as_array().unwrap().is_empty());
+    for row in versions["rows"].as_array_mut().unwrap() {
+        row[created] = json!({"Integer": 1795317000000i64});
+        row[origin] = json!({"Text": "another-device-storage-origin"});
+        row[sequence] = json!({"Integer": 424242i64});
+    }
+    assert_eq!(PluginStorage::snapshotContentSummary(&a).unwrap(), PluginStorage::snapshotContentSummary(&last_writer).unwrap());
+    assert_ne!(b.token().unwrap(), last_writer.token().unwrap());
+    // The covered identities themselves remain comparable: a differing record set is real drift.
+    let mut fewer = b.clone();
+    let versions = fewer.data.values.get_mut("_operit_versions").unwrap();
+    versions["rows"].as_array_mut().unwrap().pop();
+    assert_ne!(PluginStorage::snapshotContentSummary(&a).unwrap(), PluginStorage::snapshotContentSummary(&fewer).unwrap());
     let map = local_cas.data.values.get_mut("_operit_merge_map").unwrap();
     let canonical = map["columns"].as_array().unwrap().iter().position(|column| column == "canonical_key").unwrap();
     map["rows"][0][canonical] = json!({"Text":"different-canonical-card"});
@@ -2055,6 +2075,60 @@ fn incremental_object_merge_bookkeeping_does_not_require_a_full_snapshot() {
     values["rows"][0][value] = json!({"Text":"changed business content"});
     assert_ne!(PluginStorage::snapshotContentSummary(&a).unwrap(), PluginStorage::snapshotContentSummary(&changed).unwrap());
     source.dispose(); target.dispose();
+}
+
+/// Merge aliases describe one equivalence graph; spelling it at a different depth is not content drift.
+#[test]
+fn merge_alias_chain_depth_is_not_business_content() {
+    let fixture = Fixture::new("alias-closure");
+    let _handle = open_object_merge_fixture(&fixture);
+    let store = SqliteStore::openWithHost(fixture.host.clone(), &fixture.path).unwrap();
+    let text = |value: &str| operit_host_api::SqliteValue::Text(value.to_owned());
+    // Returns both summary paths: the stored one streams from disk, the decoded one compares values,
+    // so a rule that only holds in one of them cannot pass unnoticed.
+    let summary = |rows: &[(&str, &str, &str)]| {
+        store.executeBatch("DELETE FROM _operit_merge_map").unwrap();
+        for (origin, (collection, remote, canonical)) in rows.iter().enumerate() {
+            store.execute("INSERT INTO _operit_merge_map VALUES(?1,?2,?3,?4)",
+                vec![text(collection), text(&origin.to_string()), text(remote), text(canonical)]).unwrap();
+        }
+        let snapshot = PluginStorage::syncSnapshot(fixture.host.clone(), &fixture.path, fixture.device).unwrap();
+        let mut decoded = snapshot.clone();
+        decoded.data = serde_json::from_slice(&serde_json::to_vec(&decoded.data).unwrap()).unwrap();
+        let content = PluginStorage::snapshotContentSummary(&snapshot).unwrap();
+        assert_eq!(content, PluginStorage::snapshotContentSummary(&decoded).unwrap());
+        content
+    };
+    // One peer rewrites `x -> b -> z` into `x -> z`; another re-declares `x -> b`. Both mean the same.
+    assert_eq!(summary(&[("cards", "x", "b"), ("cards", "b", "z")]),
+        summary(&[("cards", "x", "z"), ("cards", "b", "z")]));
+    // A preference alias qualifies its source with the declaring file; the chain still follows.
+    assert_eq!(
+        summary(&[("_preference_aliases", "cards.preferences.json\u{1f}x", "b"),
+            ("_preference_aliases", "cards.preferences.json\u{1f}b", "z")]),
+        summary(&[("_preference_aliases", "cards.preferences.json\u{1f}x", "z"),
+            ("_preference_aliases", "cards.preferences.json\u{1f}b", "z")]));
+    // Names from different files are not one equivalence space, so their chains never join.
+    assert_ne!(
+        summary(&[("_preference_aliases", "cards.preferences.json\u{1f}x", "b"),
+            ("_preference_aliases", "chats.preferences.json\u{1f}b", "z")]),
+        summary(&[("_preference_aliases", "cards.preferences.json\u{1f}x", "z"),
+            ("_preference_aliases", "cards.preferences.json\u{1f}b", "z")]));
+    // The same depth with a different surviving identity is still an identity disagreement.
+    assert_ne!(summary(&[("cards", "x", "z"), ("cards", "b", "z")]),
+        summary(&[("cards", "x", "y"), ("cards", "b", "z")]));
+    // An unresolvable chain keeps its recorded targets instead of inventing a closure.
+    assert_ne!(summary(&[("cards", "x", "z"), ("cards", "b", "z")]),
+        summary(&[("cards", "x", "b"), ("cards", "b", "x")]));
+    // Ambiguity preserves every original edge, including predecessors, in both namespaces.
+    for (collection, prefix) in [("cards", ""), ("_preference_aliases", "cards.preferences.json\u{1f}")] {
+        let keys = ["u", "v", "w", "x"].map(|key| format!("{prefix}{key}"));
+        let ambiguous = |parent, left, right| summary(&[(collection, &keys[0], parent), (collection, &keys[1], "x"),
+            (collection, &keys[2], "x"), (collection, &keys[3], left), (collection, &keys[3], right)]);
+        assert_ne!(ambiguous("v", "a", "b"), ambiguous("v", "c", "d"));
+        assert_ne!(ambiguous("v", "a", "b"), ambiguous("w", "a", "b"));
+    }
+    drop(store); fixture.dispose();
 }
 
 #[test]

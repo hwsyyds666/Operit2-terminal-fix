@@ -60,12 +60,18 @@ void main(List<String> arguments) async {
         applicationStarted = true;
         return;
       }
+      final startsDetachedChatWindow =
+          _startsDetachedChatWindow(arguments) ||
+          FloatingWindows.parseLaunch(arguments) != null ||
+          DesktopWidgets.parseLaunch(arguments) != null;
       fvp.registerWith();
       await platformCoreProxy.dataRescue({'operation': 'runtimeLease'});
       consumeGitHubOAuthWebCallbackAtStartup();
       final bindingElapsedMs = bindingStopwatch.elapsedMilliseconds;
       final loggerStopwatch = Stopwatch()..start();
       await ClientLogger.initialize();
+      FloatingWindows.onDiagnostic = (message) =>
+          ClientLogger.i(message, tag: 'FloatingWindows');
       ClientLogger.v(
         'widgets binding initialized elapsedMs=$bindingElapsedMs',
         tag: _appStartupLogTag,
@@ -83,40 +89,10 @@ void main(List<String> arguments) async {
         tag: _appStartupLogTag,
         verboseLevel: VerboseLevel.level1,
       );
-      final startsDetachedChatWindow =
-          _startsDetachedChatWindow(arguments) ||
-          FloatingWindows.parseLaunch(arguments) != null ||
-          DesktopWidgets.parseLaunch(arguments) != null;
-      if (startsDetachedChatWindow) {
-        ClientLogger.v(
-          'skip process-owned startup for detached chat window',
-          tag: _appStartupLogTag,
-          verboseLevel: VerboseLevel.level1,
-        );
-        await RuntimeBootstrapManager.instance.initializeForDetachedWindow();
-        ClientLogger.v(
-          'detached runtime bootstrap state loaded',
-          tag: _appStartupLogTag,
-          verboseLevel: VerboseLevel.level1,
-        );
-      } else {
-        NotificationActivationService.instance.initialize(arguments);
-        IncomingAttachmentService.instance.initialize();
-        final runtimeStopwatch = Stopwatch()..start();
-        await RuntimeBootstrapManager.instance.initialize();
-        ClientLogger.v(
-          'runtime bootstrap initialized elapsedMs=${runtimeStopwatch.elapsedMilliseconds}',
-          tag: _appStartupLogTag,
-          verboseLevel: VerboseLevel.level1,
-        );
-      }
-      final glassStopwatch = Stopwatch()..start();
-      await prepareLiquidGlass();
-      ClientLogger.v(
-        'liquid glass initialized elapsedMs=${glassStopwatch.elapsedMilliseconds}',
-        tag: _appStartupLogTag,
-        verboseLevel: VerboseLevel.level1,
-      );
+      await Future.wait<void>([
+        _initializeRuntime(arguments, detached: startsDetachedChatWindow),
+        _initializeVisuals(),
+      ]);
       await FloatingWindows.run(
         arguments: arguments,
         windowBuilder: (launch) {
@@ -210,6 +186,40 @@ void main(List<String> arguments) async {
   );
 }
 
+Future<void> _initializeRuntime(
+  List<String> arguments, {
+  required bool detached,
+}) async {
+  if (detached) {
+    await RuntimeBootstrapManager.instance.initializeForDetachedWindow();
+    ClientLogger.v(
+      'detached runtime bootstrap state loaded',
+      tag: _appStartupLogTag,
+      verboseLevel: VerboseLevel.level1,
+    );
+    return;
+  }
+  NotificationActivationService.instance.initialize(arguments);
+  IncomingAttachmentService.instance.initialize();
+  final stopwatch = Stopwatch()..start();
+  await RuntimeBootstrapManager.instance.initialize();
+  ClientLogger.v(
+    'runtime bootstrap initialized elapsedMs=${stopwatch.elapsedMilliseconds}',
+    tag: _appStartupLogTag,
+    verboseLevel: VerboseLevel.level1,
+  );
+}
+
+Future<void> _initializeVisuals() async {
+  final stopwatch = Stopwatch()..start();
+  await prepareLiquidGlass();
+  ClientLogger.v(
+    'liquid glass initialized elapsedMs=${stopwatch.elapsedMilliseconds}',
+    tag: _appStartupLogTag,
+    verboseLevel: VerboseLevel.level1,
+  );
+}
+
 /// Identifies a detached chat engine from the launch contract before startup services run.
 bool _startsDetachedChatWindow(List<String> arguments) {
   if (arguments.length < 3 || arguments[0] != 'multi_window') {
@@ -230,12 +240,11 @@ void _runMainWindow() {
     tag: _appStartupLogTag,
     verboseLevel: VerboseLevel.level1,
   );
-  runApp(
-    FloatingWindowsHost(
-      windowBuilder: (launch) => FloatingWindowApp(launch: launch),
-      child: const OperitDesignCaptureScope(child: OperitApp()),
-    ),
+  final application = FloatingWindowsHost(
+    windowBuilder: (launch) => FloatingWindowApp(launch: launch),
+    child: OperitDesignCaptureScope(child: OperitApp()),
   );
+  runApp(application);
 }
 
 /// Starts a detached chat window after runtime configuration is loaded.

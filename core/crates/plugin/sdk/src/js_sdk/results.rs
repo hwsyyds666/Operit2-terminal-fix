@@ -391,6 +391,9 @@ fn append_ui_summary(node: &SimplifiedUINode, prefix: &str, depth: usize, output
         if node.properties.get("isEnabled").and_then(serde_json::Value::as_bool) == Some(false) {
             fields.push("disabled".into());
         }
+        if node.properties.get("isVisible").and_then(serde_json::Value::as_bool) == Some(false) {
+            fields.push("invisible".into());
+        }
         if node.properties.get("isCheckable").and_then(serde_json::Value::as_bool) == Some(true)
             && node.properties.get("isChecked").and_then(serde_json::Value::as_bool) == Some(false) {
             fields.push("unchecked".into());
@@ -452,6 +455,17 @@ mod ui_summary_tests {
         assert!(summary.contains('…'));
         assert!(summary.len() < 1500);
         assert!(root.children[0].text.as_ref().unwrap().len() > 30_000);
+    }
+
+    /// Preserves hidden native nodes while telling the model they are not current input targets.
+    #[test]
+    fn summary_marks_invisible_and_disabled_nodes() {
+        let mut node = button("Offscreen item");
+        node.properties.insert("isVisible".into(), serde_json::json!(false));
+        node.properties.insert("isEnabled".into(), serde_json::json!(false));
+        let summary = node.toTreeString(None);
+        assert!(summary.contains("disabled invisible"));
+        assert_eq!(node.text.as_deref(), Some("Offscreen item"));
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -556,6 +570,10 @@ pub enum TerminalImplementation {
     Native,
     #[serde(rename = "proot")]
     Proot,
+    #[serde(rename = "termux")]
+    Termux,
+    #[serde(rename = "chroot")]
+    Chroot,
     #[serde(rename = "android-system")]
     AndroidSystem,
     #[serde(rename = "adb")]
@@ -575,6 +593,8 @@ impl TerminalImplementation {
         match self {
             Self::Native => "native",
             Self::Proot => "proot",
+            Self::Termux => "termux",
+            Self::Chroot => "chroot",
             Self::AndroidSystem => "android-system",
             Self::Adb => "adb",
             Self::Shell => "shell",
@@ -597,6 +617,8 @@ impl TryFrom<&str> for TerminalImplementation {
         match value {
             "native" => Ok(Self::Native),
             "proot" => Ok(Self::Proot),
+            "termux" => Ok(Self::Termux),
+            "chroot" => Ok(Self::Chroot),
             "android-system" => Ok(Self::AndroidSystem),
             "adb" => Ok(Self::Adb),
             "shell" => Ok(Self::Shell),
@@ -1324,6 +1346,12 @@ pub struct ChatFindResultData {
 #[derive(Clone, Serialize, Deserialize)]
 /// Reports a chat agent's current state and whether it is idle or processing.
 pub struct AgentStatusResultData {
+    /// Title of the current execution, when the chat has started real work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taskTitle: Option<String>,
+    /// Actual model response rounds in this execution; zero before the first response.
+    #[serde(default)]
+    pub currentRound: i32,
     ///Target chat id
     #[serde(rename = "chatId")]
     pub chatId: String,

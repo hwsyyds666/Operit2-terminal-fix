@@ -1,5 +1,7 @@
 // ignore_for_file: file_names
 
+import 'package:operit2/l10n/generated/app_localizations.dart';
+
 import 'dart:async';
 import 'dart:math' as math;
 
@@ -12,12 +14,15 @@ import 'package:flutter/scheduler.dart';
 
 import '../../../common/ApiErrorText.dart';
 import '../../../common/markdown/StreamMarkdownRenderer.dart';
+import '../../../common/markdown/TranscriptMarkdownViewport.dart';
 import '../../../common/markdown/MarkdownFileScope.dart';
 import '../../../common/interactions/ChainedScrollController.dart';
+import '../../../../core/host/AppToastController.dart';
 import '../../../../core/proxy/generated/CoreProxyClients.g.dart';
 import '../../../../data/preferences/UserPreferencesManager.dart';
 import '../../../theme/OperitTheme.dart';
 import '../viewmodel/ChatViewModel.dart';
+import '../viewmodel/ChatTranscriptController.dart';
 import 'ChatLayoutMetrics.dart';
 import 'ChatMessageExtent.dart';
 import 'MessageContextMenu.dart';
@@ -38,6 +43,7 @@ class ChatArea extends StatefulWidget {
   const ChatArea({
     super.key,
     required this.messages,
+    this.transcript,
     required this.isLoading,
     required this.errorMessage,
     required this.scrollController,
@@ -80,6 +86,7 @@ class ChatArea extends StatefulWidget {
   });
 
   final List<ChatUiMessage> messages;
+  final ChatTranscriptController? transcript;
   final bool isLoading;
   final String? errorMessage;
   final ScrollController scrollController;
@@ -128,6 +135,7 @@ class _ChatAreaState extends State<ChatArea>
     with SingleTickerProviderStateMixin {
   final GlobalKey _viewportKey = GlobalKey();
   final Map<int, GlobalKey> _messageKeys = <int, GlobalKey>{};
+  final Map<int, Object> _mountedRows = <int, Object>{};
   final Map<Key, ChatMessageExtent> _rowExtents = <Key, ChatMessageExtent>{};
   final ValueNotifier<Map<int, ChatScrollMessageAnchor>>
   _messageAnchorsNotifier = ValueNotifier<Map<int, ChatScrollMessageAnchor>>(
@@ -141,6 +149,9 @@ class _ChatAreaState extends State<ChatArea>
   late final ValueNotifier<bool> _chatBusyNotifier;
   late EmbeddedPluginSurfaceCatalog _messageContributions;
   late MessageTransformCache _messageTransforms;
+  TranscriptPreparationQueue _markdownPreparation = TranscriptPreparationQueue(
+    2,
+  );
   Timer? _navigatorHideTimer;
   Timer? _viewportResizeTimer;
   bool _userScrollSessionActive = false;
@@ -166,7 +177,16 @@ class _ChatAreaState extends State<ChatArea>
   int _messageNavigationGeneration = 0;
   int? _layoutAnchorTimestamp;
   bool _layoutAnchorAtBottom = false;
-  double _leadingScrollExtent = 0;
+  final GlobalKey _leadingKey = GlobalKey();
+  final Map<int, int> _messageIndices = {};
+  List<({double height, int count})>? _measuredPrefix;
+  ChatScrollMessageAnchor? _visibleAnchor;
+  double? _rebaseOffset;
+  double get _leadingScrollExtent =>
+      (_leadingKey.currentContext?.findRenderObject() as RenderSliver?)
+          ?.geometry
+          ?.scrollExtent ??
+      0;
   double _layoutOriginTopPadding = 16;
   bool _initialLayoutOriginChosen = false;
   ScrollDirection _historyLoadDirection = ScrollDirection.idle;
@@ -196,8 +216,15 @@ class _ChatAreaState extends State<ChatArea>
       hasBottomLayoutOrigin: () => _layoutAnchorAtBottom,
       leadingScrollExtent: () => _leadingScrollExtent,
       layoutOriginTopPadding: () => _layoutOriginTopPadding,
+      viewportCorrection: _measureAnchorShift,
+      initialOffset: () {
+        final offset = _rebaseOffset;
+        _rebaseOffset = null;
+        return offset;
+      },
     );
     _bottomFollowTicker = createTicker(_tickBottomFollow);
+    _indexMessages();
   }
 
   /// Updates localized declarations without opening a catalog per transcript row.
@@ -242,6 +269,8 @@ class _ChatAreaState extends State<ChatArea>
 
   /// Prepares nearby rows while keeping distant history unmounted.
   Widget _buildTranscript(BuildContext context) {
+    final horizontalInset = OperitTheme.of(context)
+        .themePreferenceSnapshot.chatContentHorizontalPadding;
     final showLoadingIndicator = _shouldShowLoadingIndicator();
     final itemCount =
         widget.messages.length +
@@ -256,12 +285,6 @@ class _ChatAreaState extends State<ChatArea>
       );
     }
 
-    final rowExtents = List<ChatMessageExtent>.generate(itemCount, (index) {
-      final key = _extentKeyForIndex(index);
-      final extent = _rowExtents.putIfAbsent(key, ChatMessageExtent.new);
-      extent.updateTrailingSpacing(index == itemCount - 1 ? 0 : 8);
-      return extent;
-    }, growable: false);
     // Start at the tail instead of laying out from the oldest row and then
     // chasing an estimated maxScrollExtent. Those intermediate layouts mount
     // offscreen rows and start their Markdown requests before discarding them.
@@ -278,12 +301,8 @@ class _ChatAreaState extends State<ChatArea>
       }
       _layoutAnchorTimestamp ??= widget.messages.first.timestamp;
     }
-    final anchorIndex = widget.messages.indexWhere(
-      (message) => message.timestamp == _layoutAnchorTimestamp,
-    );
-    final centerIndex = anchorIndex < 0 ? 0 : anchorIndex;
+    final centerIndex = _messageIndices[_layoutAnchorTimestamp] ?? 0;
     _layoutOriginTopPadding = centerIndex == 0 ? 16 : 0;
-    if (centerIndex == 0) _leadingScrollExtent = 0;
     // A sidebar width animation changes constraints, not message data. Reuse
     // this viewport so LayoutBuilder does not recreate the scroll view's delegate and
     // rebuild all visible rows on every animation frame.
@@ -326,32 +345,56 @@ class _ChatAreaState extends State<ChatArea>
                   slivers: [
                     if (centerIndex > 0)
                       SliverPadding(
-                        padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
-                        sliver: ChatMessageSliverList(
-                          extents: rowExtents
-                              .take(centerIndex)
-                              .toList()
-                              .reversed
-                              .toList(),
-                          preserveViewport: _shouldPreserveManualViewport,
-                          onScrollExtentChanged: _recordLeadingScrollExtent,
-                          itemBuilder: (context, index) =>
-                              _buildListRow(centerIndex - index - 1, itemCount),
+                        key: _leadingKey,
+                        padding: EdgeInsets.fromLTRB(horizontalInset, 16, horizontalInset, 0),
+                        sliver: SliverList(
+                          delegate: _TranscriptSliverDelegate(
+                            (context, index) => _buildListRow(
+                              centerIndex - index - 1,
+                              itemCount,
+                            ),
+                            childCount: centerIndex,
+                            estimateTail: (last, mean) => _estimateRange(
+                              0,
+                              centerIndex - last - 1,
+                              mean,
+                              itemCount,
+                            ),
+                            findChildIndexCallback: (key) {
+                              final index = _findRowIndex(key, itemCount);
+                              return index != null && index < centerIndex
+                                  ? centerIndex - index - 1
+                                  : null;
+                            },
+                          ),
                         ),
                       ),
                     SliverPadding(
                       key: _centerSliverKey,
                       padding: EdgeInsets.fromLTRB(
-                        16,
+                        horizontalInset,
                         _layoutOriginTopPadding,
-                        16,
+                        horizontalInset,
                         16 + widget.bottomContentInset,
                       ),
-                      sliver: ChatMessageSliverList(
-                        extents: rowExtents.skip(centerIndex).toList(),
-                        preserveViewport: _shouldPreserveManualViewport,
-                        itemBuilder: (context, index) =>
-                            _buildListRow(centerIndex + index, itemCount),
+                      sliver: SliverList(
+                        delegate: _TranscriptSliverDelegate(
+                          (context, index) =>
+                              _buildListRow(centerIndex + index, itemCount),
+                          childCount: itemCount - centerIndex,
+                          estimateTail: (last, mean) => _estimateRange(
+                            centerIndex + last + 1,
+                            itemCount,
+                            mean,
+                            itemCount,
+                          ),
+                          findChildIndexCallback: (key) {
+                            final index = _findRowIndex(key, itemCount);
+                            return index != null && index >= centerIndex
+                                ? index - centerIndex
+                                : null;
+                          },
+                        ),
                       ),
                     ),
                   ],
@@ -374,28 +417,34 @@ class _ChatAreaState extends State<ChatArea>
                 return ValueListenableBuilder<bool>(
                   valueListenable: _showNavigatorChipNotifier,
                   builder: (context, showNavigatorChip, _) {
-                    return ChatScrollNavigator(
-                      messages: widget.messages,
-                      currentChatId: widget.currentChatId,
-                      scrollController: widget.scrollController,
-                      messageAnchors: messageAnchors,
-                      viewportHeight: _viewportHeight,
-                      autoScrollToBottom: autoScrollToBottom,
-                      hasNewerDisplayHistory: widget.hasNewerDisplayHistory,
-                      messageNavigation: widget.messageNavigation,
-                      loadLocatorEntries: widget.loadLocatorEntries,
-                      onRequestLatestMessages: widget.onShowLatestDisplayWindow,
-                      onAutoScrollToBottomChanged:
-                          widget.onAutoScrollToBottomChanged,
-                      onJumpToMessageTimestamp: _jumpToMessageTimestamp,
-                      onJumpToMessage: _jumpToMessageIndex,
-                      onToggleFavoriteMessage: widget.onToggleFavoriteMessage,
-                      onRequestScrollToBottom: _scrollToBottomFromNavigator,
-                      showNavigatorChip: showNavigatorChip,
-                      onNavigatorChipHidden: () {
-                        _showNavigatorChipNotifier.value = false;
-                        _userScrollSessionActive = false;
-                      },
+                    return ValueListenableBuilder<bool>(
+                      valueListenable:
+                          UserPreferencesManager.chatScrollNavigatorOnLeft,
+                      builder: (context, onLeft, _) => ChatScrollNavigator(
+                        onLeft: onLeft,
+                        messages: widget.messages,
+                        currentChatId: widget.currentChatId,
+                        scrollController: widget.scrollController,
+                        messageAnchors: messageAnchors,
+                        viewportHeight: _viewportHeight,
+                        autoScrollToBottom: autoScrollToBottom,
+                        hasNewerDisplayHistory: widget.hasNewerDisplayHistory,
+                        messageNavigation: widget.messageNavigation,
+                        loadLocatorEntries: widget.loadLocatorEntries,
+                        onRequestLatestMessages:
+                            widget.onShowLatestDisplayWindow,
+                        onAutoScrollToBottomChanged:
+                            widget.onAutoScrollToBottomChanged,
+                        onJumpToMessageTimestamp: _jumpToMessageTimestamp,
+                        onJumpToMessage: _jumpToMessageIndex,
+                        onToggleFavoriteMessage: widget.onToggleFavoriteMessage,
+                        onRequestScrollToBottom: _scrollToBottomFromNavigator,
+                        showNavigatorChip: showNavigatorChip,
+                        onNavigatorChipHidden: () {
+                          _showNavigatorChipNotifier.value = false;
+                          _userScrollSessionActive = false;
+                        },
+                      ),
                     );
                   },
                 );
@@ -420,18 +469,22 @@ class _ChatAreaState extends State<ChatArea>
     );
   }
 
-  /// Includes the history's top padding in the distance before the layout origin.
-  void _recordLeadingScrollExtent(double extent) {
-    _leadingScrollExtent = extent + 16;
-  }
-
   /// Builds one chronological row shared by both growth directions.
   Widget _buildListRow(int index, int itemCount) {
     late final Widget child;
     var observesLiveBottomGrowth = false;
+    int? timestamp;
     if (index < widget.messages.length) {
       final message = widget.messages[index];
-      child = _messageRowFor(index, message);
+      timestamp = message.timestamp;
+      final transcript = widget.transcript;
+      child = transcript == null
+          ? _messageRowFor(index, message)
+          : _TranscriptMessageBody(
+              message: message,
+              transcript: transcript,
+              builder: (body) => _messageRowFor(index, body),
+            );
       if (index == widget.messages.length - 1 && _isStreamingMessage(index)) {
         observesLiveBottomGrowth = true;
       }
@@ -444,20 +497,35 @@ class _ChatAreaState extends State<ChatArea>
       );
     }
     final rowKey = _rowKeyForIndex(index);
-    return observeChatMessageExtent(
-      key: ValueKey<Key>(rowKey),
-      extent: _rowExtents[_extentKeyForIndex(index)]!,
-      child: Padding(
-        padding: EdgeInsets.only(bottom: index == itemCount - 1 ? 0 : 8),
-        child: SizeChangedLayoutNotifier(
-          key: rowKey,
-          child: _LiveBottomStreamSizeObserver(
-            observesGrowth: observesLiveBottomGrowth,
-            onSizeGrown: _scheduleBottomFollow,
-            child: _ChatAreaContentColumn(child: child),
-          ),
+    final extentKey = _extentKeyForIndex(index);
+    final extent = _rowExtents.putIfAbsent(
+      extentKey,
+      () => ChatMessageExtent(
+        onLayoutHeightChanged: () => _measuredPrefix = null,
+      ),
+    );
+    extent.updateTrailingSpacing(index == itemCount - 1 ? 0 : 8);
+    final content = Padding(
+      padding: EdgeInsets.only(bottom: index == itemCount - 1 ? 0 : 8),
+      child: SizeChangedLayoutNotifier(
+        key: rowKey,
+        child: _LiveBottomStreamSizeObserver(
+          observesGrowth: observesLiveBottomGrowth,
+          onSizeGrown: _scheduleBottomFollow,
+          child: _ChatAreaContentColumn(child: child),
         ),
       ),
+    );
+    return observeChatMessageExtent(
+      key: extentKey,
+      extent: extent,
+      child: timestamp == null
+          ? content
+          : _TranscriptRowRegistration(
+              timestamp: timestamp,
+              rows: _mountedRows,
+              child: content,
+            ),
     );
   }
 
@@ -649,6 +717,21 @@ class _ChatAreaState extends State<ChatArea>
           _requestedOlderBoundary = null;
         } else {
           _requestedNewerBoundary = null;
+        }
+        if (widget.transcript != null) {
+          final chatId = widget.currentChatId;
+          AppToastController.instance.show(
+            error.toString(),
+            actionLabel: AppLocalizations.of(context)!.retry,
+            onAction: () {
+              if (mounted && widget.currentChatId == chatId) {
+                _scheduleHistoryLoad(
+                  older ? ScrollDirection.forward : ScrollDirection.reverse,
+                );
+              }
+            },
+          );
+          return;
         }
       }
       FlutterError.reportError(
@@ -964,6 +1047,8 @@ class _ChatAreaState extends State<ChatArea>
     _requestedOlderBoundary = null;
     _requestedNewerBoundary = null;
     _scrollLayoutKey = UniqueKey();
+    _visibleAnchor = null;
+    _rebaseOffset = null;
     _lastScrollMaxExtent = null;
     _messageAnchorsNotifier.value = const <int, ChatScrollMessageAnchor>{};
     _layoutAnchorAtBottom = false;
@@ -986,37 +1071,123 @@ class _ChatAreaState extends State<ChatArea>
         !scroll.position.hasPixels) {
       return;
     }
-    final viewportContext = _viewportKey.currentContext;
-    final viewportBox = viewportContext?.findRenderObject() as RenderBox?;
-    if (viewportBox == null || !viewportBox.attached) {
-      return;
-    }
     final anchors = <int, ChatScrollMessageAnchor>{};
-    for (var index = 0; index < widget.messages.length; index++) {
-      final message = widget.messages[index];
-      final key = _keyForMessage(message.timestamp);
-      final rowContext = key.currentContext;
-      final rowBox = rowContext?.findRenderObject() as RenderBox?;
-      if (rowBox == null || !rowBox.attached || !rowBox.hasSize) {
+    ChatScrollMessageAnchor? firstVisible;
+    ChatScrollMessageAnchor? partiallyVisible;
+    for (final timestamp in _mountedRows.keys) {
+      final key = _messageKeys[timestamp];
+      final index = _messageIndices[timestamp];
+      if (index == null || key == null) continue;
+      final measured = _measureRow(timestamp);
+      if (measured == null ||
+          measured.top >= scroll.position.viewportDimension ||
+          measured.top + measured.height <= 0)
         continue;
-      }
-      try {
-        final localTop = rowBox
-            .localToGlobal(Offset.zero, ancestor: viewportBox)
-            .dy;
-        anchors[message.timestamp] = ChatScrollMessageAnchor(
-          timestamp: message.timestamp,
-          index: index,
-          key: key,
-          absoluteTopPx: scroll.offset + localTop,
-          heightPx: rowBox.size.height,
-        );
-      } catch (_) {
-        // Skip rows that are being unmounted or detached from viewportBox during resize
-        continue;
+      final anchor = ChatScrollMessageAnchor(
+        timestamp: timestamp,
+        index: index,
+        key: key,
+        absoluteTopPx: scroll.offset + measured.top,
+        heightPx: measured.height,
+      );
+      anchors[timestamp] = anchor;
+      if (measured.top < -0.5) {
+        partiallyVisible ??= anchor;
+      } else if (firstVisible == null ||
+          anchor.absoluteTopPx < firstVisible.absoluteTopPx) {
+        firstVisible = anchor;
       }
     }
-    _messageAnchorsNotifier.value = anchors;
+    _visibleAnchor = firstVisible ?? partiallyVisible;
+    widget.messageNavigation?.visibleTimestamp = _visibleAnchor?.timestamp;
+    if (_showNavigatorChipNotifier.value) {
+      _messageAnchorsNotifier.value = anchors;
+    }
+  }
+
+  void _indexMessages() {
+    _measuredPrefix = null;
+    _messageIndices.clear();
+    for (var index = 0; index < widget.messages.length; index++) {
+      _messageIndices[widget.messages[index].timestamp] = index;
+    }
+  }
+
+  /// Keeps exact measured extents when a different set of rows enters the viewport.
+  double _estimateRange(int start, int end, double mean, int itemCount) {
+    if (start >= end) return 0;
+    var prefix = _measuredPrefix;
+    if (prefix == null || prefix.length != itemCount + 1) {
+      prefix = [(height: 0.0, count: 0)];
+      for (var index = 0; index < itemCount; index++) {
+        final height = _rowExtents[_extentKeyForIndex(index)]?.lastLayoutHeight;
+        final previous = prefix.last;
+        prefix.add((
+          height: previous.height + (height ?? 0),
+          count: previous.count + (height == null ? 0 : 1),
+        ));
+      }
+      _measuredPrefix = prefix;
+    }
+    final before = prefix[start];
+    final after = prefix[end];
+    return after.height -
+        before.height +
+        (end - start - after.count + before.count) * mean;
+  }
+
+  int? _findRowIndex(Key key, int itemCount) {
+    if (key is ValueKey<int>) return _messageIndices[key.value];
+    return key == const ValueKey<String>('row-status') &&
+            itemCount > widget.messages.length
+        ? widget.messages.length
+        : null;
+  }
+
+  /// Reads only sliver geometry while the viewport is in its layout phase.
+  ({double top, double height})? _measureRow(int timestamp) {
+    final extent = _rowExtents[ValueKey<int>(timestamp)];
+    RenderObject? child = extent?.mountedBox;
+    while (child != null && child.parent is! RenderSliverMultiBoxAdaptor) {
+      child = child.parent;
+    }
+    if (child == null || !child.attached) return null;
+    final sliver = child.parent! as RenderSliverMultiBoxAdaptor;
+    final data = child.parentData as SliverMultiBoxAdaptorParentData;
+    final offset = data.layoutOffset;
+    final geometry = sliver.geometry;
+    final height = extent?.lastLayoutHeight;
+    if (offset == null ||
+        geometry == null ||
+        data.keptAlive ||
+        height == null) {
+      return null;
+    }
+    final viewport = RenderAbstractViewport.maybeOf(sliver);
+    if (viewport == null) return null;
+    final constraints = sliver.constraints;
+    final local = offset - constraints.scrollOffset;
+    final reversed =
+        applyGrowthDirectionToAxisDirection(
+          constraints.axisDirection,
+          constraints.growthDirection,
+        ) ==
+        AxisDirection.up;
+    final sliverTop = MatrixUtils.transformPoint(
+      sliver.getTransformTo(viewport),
+      Offset.zero,
+    ).dy;
+    final top =
+        sliverTop + (reversed ? geometry.paintExtent - height - local : local);
+    return top.isFinite ? (top: top, height: height) : null;
+  }
+
+  /// Adding pixels back cancels gesture motion and isolates changes in layout.
+  double _measureAnchorShift(double pixels) {
+    final anchor = _visibleAnchor;
+    if (anchor == null || !_shouldPreserveManualViewport()) return 0;
+    final measured = _measureRow(anchor.timestamp);
+    return measured == null ? 0 : measured.top + pixels - anchor.absoluteTopPx;
   }
 
   /// Returns the persistent render key for one message identity.
@@ -1054,10 +1225,15 @@ class _ChatAreaState extends State<ChatArea>
     _chatBusyNotifier.value = widget.isLoading;
     _layoutScrollController.delegate = widget.scrollController;
     final chatChanged = oldWidget.currentChatId != widget.currentChatId;
+    if (!identical(oldWidget.messages, widget.messages) || chatChanged) {
+      _indexMessages();
+    }
     if (oldWidget.fileDirectory != widget.fileDirectory) {
       _messageRowCache.clear();
     }
     if (chatChanged) {
+      _markdownPreparation.dispose();
+      _markdownPreparation = TranscriptPreparationQueue(2);
       _historyLoadDirection = ScrollDirection.idle;
       _historyLoadRequest = null;
       _requestedOlderBoundary = null;
@@ -1065,6 +1241,9 @@ class _ChatAreaState extends State<ChatArea>
       _stopBottomFollow();
       _lastScrollMaxExtent = null;
       _messageKeys.clear();
+      _mountedRows.clear();
+      _visibleAnchor = null;
+      widget.messageNavigation?.visibleTimestamp = null;
       _messageRowCache.clear();
       _disposeRowExtents();
       _messageAnchorsNotifier.value = const <int, ChatScrollMessageAnchor>{};
@@ -1088,12 +1267,19 @@ class _ChatAreaState extends State<ChatArea>
         oldWidget.messages.lastOrNull?.timestamp !=
             widget.messages.lastOrNull?.timestamp;
     if (_layoutAnchorTimestamp != null &&
-        !widget.messages.any(
-          (message) => message.timestamp == _layoutAnchorTimestamp,
-        )) {
-      _layoutAnchorTimestamp = null;
+        !_messageIndices.containsKey(_layoutAnchorTimestamp)) {
+      final anchor = _visibleAnchor;
+      final preserve =
+          anchor != null &&
+          _messageIndices.containsKey(anchor.timestamp) &&
+          !_ownsBottomScroll();
+      if (preserve && widget.scrollController.hasClients) {
+        _rebaseOffset = widget.scrollController.offset - anchor.absoluteTopPx;
+      }
+      _layoutAnchorTimestamp = preserve ? anchor.timestamp : null;
+      _visibleAnchor = null;
       _layoutAnchorAtBottom = false;
-      _initialLayoutOriginChosen = false;
+      _initialLayoutOriginChosen = preserve;
       _scrollLayoutKey = UniqueKey();
     }
     _applyPendingNavigation();
@@ -1109,15 +1295,29 @@ class _ChatAreaState extends State<ChatArea>
       _scheduleHistoryLoad(_historyLoadDirection);
       _scheduleMessageAnchorCollection();
     }
-    final timestamps = widget.messages
-        .map((message) => message.timestamp)
-        .toSet();
-    _messageKeys.removeWhere(
-      (timestamp, key) => !timestamps.contains(timestamp),
-    );
-    _messageRowCache.removeWhere(
-      (timestamp, row) => !timestamps.contains(timestamp),
-    );
+    if (messagesChanged) {
+      _messageKeys.removeWhere(
+        (timestamp, _) => !_messageIndices.containsKey(timestamp),
+      );
+      _messageRowCache.removeWhere(
+        (timestamp, _) => !_messageIndices.containsKey(timestamp),
+      );
+      final retired = <ChatMessageExtent>[];
+      if (_rowExtents.length > 160) {
+        final staleKeys = _rowExtents.keys
+            .where(
+              (key) =>
+                  key is ValueKey<int> &&
+                  !_messageIndices.containsKey(key.value),
+            )
+            .take(_rowExtents.length - 160)
+            .toList();
+        for (final key in staleKeys) {
+          retired.add(_rowExtents.remove(key)!);
+        }
+      }
+      _releaseRowExtents(retired);
+    }
   }
 
   /// Releases measurements after their old row render trees have detached.
@@ -1141,6 +1341,7 @@ class _ChatAreaState extends State<ChatArea>
   /// Releases timers, cached rows, and navigation state.
   @override
   void dispose() {
+    _markdownPreparation.dispose();
     _messageTransforms.dispose();
     _messageContributions.dispose();
     _navigatorHideTimer?.cancel();
@@ -1153,6 +1354,7 @@ class _ChatAreaState extends State<ChatArea>
     _showNavigatorChipNotifier.dispose();
     _chatBusyNotifier.dispose();
     _messageKeys.clear();
+    _mountedRows.clear();
     _messageRowCache.clear();
     _disposeRowExtents();
     super.dispose();
@@ -1176,7 +1378,6 @@ class _ChatAreaState extends State<ChatArea>
     final cached = _messageRowCache[message.timestamp];
     final cachedMessageMatches =
         cached != null &&
-        cached.index == messageIndex &&
         cached.depthAnchor == widget.messages.lastOrNull?.timestamp &&
         cached.selected == selected &&
         cached.selectionMode == selectionMode &&
@@ -1192,17 +1393,26 @@ class _ChatAreaState extends State<ChatArea>
     }
 
     /// Builds a visual copy while actions retain the original canonical message.
+    final splitter = widget.splitMarkdownContent;
+    final preparation = _markdownPreparation;
     Widget renderMessage(ChatUiMessage displayMessage) =>
-        buildThemedChatMessage(
-          snapshot: themePreferenceSnapshot,
-          colorScheme: colorScheme,
-          key: ValueKey<String>(_messageWidgetKey(message)),
-          message: displayMessage,
-          onIdentityTap: widget.onIdentityTap,
-          splitMarkdownContent: widget.splitMarkdownContent,
-          onDeleteMessage: widget.onDeleteMessage,
-          onEditSummary: widget.onSelectMessageToEdit,
-          enableDialogs: !selectionMode,
+        TranscriptMarkdownScope(
+          enabled: !isStreaming,
+          child: buildThemedChatMessage(
+            snapshot: themePreferenceSnapshot,
+            colorScheme: colorScheme,
+            key: ValueKey<String>(_messageWidgetKey(message)),
+            message: displayMessage,
+            onIdentityTap: widget.onIdentityTap,
+            splitMarkdownContent:
+                splitter == null || isStreaming || widget.transcript == null
+                ? splitter
+                : (content) async =>
+                      await preparation.run(() => splitter(content)) ?? [],
+            onDeleteMessage: widget.onDeleteMessage,
+            onEditSummary: widget.onSelectMessageToEdit,
+            enableDialogs: !selectionMode,
+          ),
         );
     final currentChatId = widget.currentChatId;
     final chatMessage = currentChatId == null
@@ -1262,6 +1472,7 @@ class _ChatAreaState extends State<ChatArea>
               message: message,
               chatId: widget.currentChatId!,
               messageIndex: messageIndex,
+              resolveMessageIndex: () => _messageIndices[message.timestamp],
               clients: widget.clients,
               packageManager: widget.packageManager,
               onToggleFavoriteMessage: widget.onToggleFavoriteMessage,
@@ -1283,7 +1494,6 @@ class _ChatAreaState extends State<ChatArea>
             ),
           );
     _messageRowCache[message.timestamp] = _CachedMessageRow(
-      index: messageIndex,
       depthAnchor: widget.messages.lastOrNull?.timestamp,
       message: message,
       selected: selected,
@@ -1341,6 +1551,148 @@ class _ChatAreaState extends State<ChatArea>
 }
 
 /// Creates layout-aware positions while keeping the public controller attached.
+class _TranscriptSliverDelegate extends SliverChildBuilderDelegate {
+  const _TranscriptSliverDelegate(
+    super.builder, {
+    required super.childCount,
+    required super.findChildIndexCallback,
+    required this.estimateTail,
+  });
+
+  final double Function(int, double) estimateTail;
+
+  @override
+  double estimateMaxScrollOffset(
+    int firstIndex,
+    int lastIndex,
+    double leadingScrollOffset,
+    double trailingScrollOffset,
+  ) =>
+      trailingScrollOffset +
+      estimateTail(
+        lastIndex,
+        (trailingScrollOffset - leadingScrollOffset) /
+            (lastIndex - firstIndex + 1),
+      );
+}
+
+class _TranscriptRowRegistration extends StatefulWidget {
+  const _TranscriptRowRegistration({
+    required this.timestamp,
+    required this.rows,
+    required this.child,
+  });
+
+  final int timestamp;
+  final Map<int, Object> rows;
+  final Widget child;
+
+  @override
+  State<_TranscriptRowRegistration> createState() =>
+      _TranscriptRowRegistrationState();
+}
+
+class _TranscriptRowRegistrationState
+    extends State<_TranscriptRowRegistration> {
+  @override
+  void initState() {
+    super.initState();
+    widget.rows[widget.timestamp] = this;
+  }
+
+  @override
+  void dispose() {
+    if (identical(widget.rows[widget.timestamp], this)) {
+      widget.rows.remove(widget.timestamp);
+    }
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => widget.child;
+}
+
+class _TranscriptMessageBody extends StatefulWidget {
+  const _TranscriptMessageBody({
+    required this.message,
+    required this.transcript,
+    required this.builder,
+  });
+
+  final ChatUiMessage message;
+  final ChatTranscriptController transcript;
+  final Widget Function(ChatUiMessage) builder;
+
+  @override
+  State<_TranscriptMessageBody> createState() => _TranscriptMessageBodyState();
+}
+
+class _TranscriptMessageBodyState extends State<_TranscriptMessageBody> {
+  Future<ChatUiMessage?>? _body;
+  ChatUiMessage? _visible;
+
+  @override
+  void initState() {
+    super.initState();
+    _bindBody();
+  }
+
+  @override
+  void didUpdateWidget(covariant _TranscriptMessageBody oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.transcript != widget.transcript ||
+        oldWidget.message.selectedVariantIndex !=
+            widget.message.selectedVariantIndex) {
+      _visible = null;
+    }
+    if (!identical(oldWidget.message, widget.message) ||
+        oldWidget.transcript != widget.transcript) {
+      _bindBody();
+    }
+  }
+
+  void _bindBody() {
+    final message = widget.message;
+    if (message.parts.isEmpty && message.contentStream == null) {
+      _body = widget.transcript.hydrate(message);
+    } else {
+      _visible = message;
+      _body = null;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => FutureBuilder<ChatUiMessage?>(
+    future: _body,
+    builder: (context, snapshot) {
+      if (snapshot.connectionState == ConnectionState.done &&
+          snapshot.data != null) {
+        _visible = snapshot.data;
+      }
+      final visible = _visible;
+      if (visible != null) return widget.builder(visible);
+      if (snapshot.hasError) {
+        return TextButton(
+          onPressed: () => setState(() {
+            _body = widget.transcript.retryBody(widget.message);
+          }),
+          child: Text(AppLocalizations.of(context)!.retry),
+        );
+      }
+      return const SizedBox(
+        height: 54,
+        child: Align(
+          alignment: Alignment.centerLeft,
+          child: SizedBox.square(
+            dimension: 14,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+        ),
+      );
+    },
+  );
+}
+
 class _ChatLayoutScrollController extends ScrollController {
   /// Retains the external navigation controller and the current ownership policy.
   _ChatLayoutScrollController({
@@ -1350,6 +1702,8 @@ class _ChatLayoutScrollController extends ScrollController {
     required this.hasBottomLayoutOrigin,
     required this.leadingScrollExtent,
     required this.layoutOriginTopPadding,
+    required this.viewportCorrection,
+    required this.initialOffset,
   }) : _delegate = delegate,
        super(keepScrollOffset: false);
 
@@ -1359,6 +1713,8 @@ class _ChatLayoutScrollController extends ScrollController {
   final ValueGetter<bool> hasBottomLayoutOrigin;
   final ValueGetter<double> leadingScrollExtent;
   final ValueGetter<double> layoutOriginTopPadding;
+  final double Function(double) viewportCorrection;
+  final double? Function() initialOffset;
   ScrollPosition? _origin;
 
   /// Requests bottom alignment in the current position's next layout pass.
@@ -1425,13 +1781,14 @@ class _ChatLayoutScrollController extends ScrollController {
     return _ChatLayoutScrollPosition(
       physics: physics,
       context: context,
-      initialPixels: _delegate.initialScrollOffset,
+      initialPixels: initialOffset() ?? _delegate.initialScrollOffset,
       oldPosition: oldPosition,
       shouldAlignBottom: shouldAlignBottom,
       shouldInitiallyAlignBottom: shouldInitiallyAlignBottom,
       hasBottomLayoutOrigin: hasBottomLayoutOrigin,
       leadingScrollExtent: leadingScrollExtent,
       layoutOriginTopPadding: layoutOriginTopPadding,
+      viewportCorrection: viewportCorrection,
     );
   }
 }
@@ -1449,6 +1806,7 @@ class _ChatLayoutScrollPosition extends ScrollPositionWithSingleContext {
     required this.hasBottomLayoutOrigin,
     required this.leadingScrollExtent,
     required this.layoutOriginTopPadding,
+    required this.viewportCorrection,
   }) : super(keepScrollOffset: false);
 
   final ValueGetter<bool> shouldAlignBottom;
@@ -1456,6 +1814,8 @@ class _ChatLayoutScrollPosition extends ScrollPositionWithSingleContext {
   final ValueGetter<bool> hasBottomLayoutOrigin;
   final ValueGetter<double> leadingScrollExtent;
   final ValueGetter<double> layoutOriginTopPadding;
+  final double Function(double) viewportCorrection;
+  bool _corrected = false;
   double? _previousOriginTopPadding;
   bool _bottomAlignmentRequested = false;
 
@@ -1485,10 +1845,19 @@ class _ChatLayoutScrollPosition extends ScrollPositionWithSingleContext {
     _previousOriginTopPadding = padding;
     // Prepending moves transcript-top padding away from the stable layout origin.
     // Correct that coordinate change before paint while retaining the active drag.
-    if (!alignsBottom && paddingDelta != 0) {
-      correctPixels(pixels + paddingDelta);
-      return false;
+    if (!alignsBottom && !_corrected) {
+      final measured = viewportCorrection(pixels);
+      final delta = measured.abs() >= 0.5 ? measured : paddingDelta;
+      final corrected = (pixels + delta)
+          .clamp(minScrollExtent, maxScrollExtent)
+          .toDouble();
+      if (delta.abs() >= 0.5 && (corrected - pixels).abs() >= 0.5) {
+        _corrected = true;
+        correctPixels(corrected);
+        return false;
+      }
     }
+    _corrected = false;
     if (alignsBottom && pixels != maxScrollExtent) {
       correctPixels(maxScrollExtent);
       return false;
@@ -1598,7 +1967,7 @@ class _StatusMessage extends StatelessWidget {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
       child: SelectableText(
-        isError ? apiErrorText(text) : text,
+        isError ? apiErrorText(text, AppLocalizations.of(context)!) : text,
         style: theme.textTheme.bodySmall?.copyWith(
           color: isError
               ? theme.colorScheme.error
@@ -1663,7 +2032,6 @@ class _SelectableMessageFrame extends StatelessWidget {
 class _CachedMessageRow {
   /// Records the message and rendering state represented by one retained row.
   const _CachedMessageRow({
-    required this.index,
     required this.depthAnchor,
     required this.message,
     required this.selected,
@@ -1677,7 +2045,6 @@ class _CachedMessageRow {
     required this.widget,
   });
 
-  final int index;
   final int? depthAnchor;
   final ChatUiMessage message;
   final bool selected;

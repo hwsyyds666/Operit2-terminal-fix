@@ -20,6 +20,8 @@ class MessageTransformCache {
           (revision) {
             final initial = _revision == null;
             _revision = revision;
+            _hasDisplayTransforms = null;
+            unawaited(_refreshTransformAvailability(revision));
             if (initial) {
               for (final entry in _entries.values) {
                 entry.revision = revision;
@@ -48,9 +50,26 @@ class MessageTransformCache {
   late final StreamSubscription<int> _subscription;
   String? _chatId;
   int? _revision;
+  bool? _hasDisplayTransforms;
   bool _disposed = false;
   final _pending = <_MessageProjection>{};
   bool _dispatchScheduled = false;
+
+  Future<void> _refreshTransformAvailability(int revision) async {
+    try {
+      final enabled = await clients.chatRuntimeHolderMain
+          .hasDisplayMessageTransforms();
+      if (_disposed || _revision != revision) return;
+      _hasDisplayTransforms = enabled;
+      if (!enabled) {
+        for (final entry in _entries.values) {
+          if (entry.mounts > 0) _enqueue(entry);
+        }
+      }
+    } catch (_) {
+      // Older cores use the normal projection path.
+    }
+  }
 
   /// Changes conversation ownership without projecting any unmounted messages.
   void bindChat(String? chatId) {
@@ -150,6 +169,10 @@ class MessageTransformCache {
             part.kind == core_proxy.MessagePartKind.thinking,
       );
       if (usesLiveStream(entry.source) ||
+          (_hasDisplayTransforms == false &&
+              !entry.source.pluginExtensions.containsKey(
+                responsePresentationExtension,
+              )) ||
           (!hasText &&
               !entry.source.pluginExtensions.containsKey(
                 responsePresentationExtension,

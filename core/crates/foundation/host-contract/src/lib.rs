@@ -10,6 +10,9 @@ pub mod HttpServer;
 pub mod PluginSdkIpc;
 pub mod Tcp;
 pub mod TerminalWorkingDirectory;
+pub mod TerminalCommand;
+pub mod TerminalText;
+pub mod TerminalControl;
 pub mod TerminalProfiles;
 pub use TerminalProfiles::{TerminalDistribution, TerminalInstallProgress, TerminalInstallProgressCallback, TerminalProfile, TerminalProfileSettings, TerminalProfileSupport};
 pub mod TimeUtils;
@@ -909,12 +912,12 @@ fn androidOnboardingRequirements() -> Vec<HostOnboardingRequirement> {
         HostOnboardingRequirement {
             id: "android.shizuku".to_string(),
             title: "Shizuku".to_string(),
-            description: "可选。需先启动 Shizuku 或 Sui；授权后 Operit 可以使用支持 Shizuku 的 Android 系统能力。"
+            description: "可选。管理内置系统服务，可通过 Root 或无线调试激活；也可选择外部 Shizuku 或 Sui。"
                 .to_string(),
             capabilityIds: vec!["host.privilege".to_string()],
             isRequired: false,
             status: HostRequirementStatus::Missing,
-            action: HostRequirementAction::HostManaged,
+            action: HostRequirementAction::OpenSystemSettings,
         },
         HostOnboardingRequirement {
             id: "android.root".to_string(),
@@ -1897,6 +1900,12 @@ pub fn terminalSessionNameMatches(actual: &str, expected: &str) -> bool {
         .is_some_and(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// Builds the canonical key used by native terminal session registries.
+#[allow(non_snake_case)]
+pub fn terminalSessionKey(terminalType: &str, name: &str) -> String {
+    format!("{terminalType}:{name}")
+}
+
 pub trait TerminalHost: Send + Sync {
     /// Lists archives executable by this host; an empty catalog means installation is unsupported.
     fn terminalDistributions(&self) -> HostResult<Vec<TerminalDistribution>> {
@@ -1921,7 +1930,7 @@ pub trait TerminalHost: Send + Sync {
     /// Declares editable fields for each implementation without probing or starting processes.
     fn terminalProfileSupport(&self) -> HostResult<Vec<TerminalProfileSupport>> {
         Ok(self.terminalInfo()?.types.into_iter().map(|entry| TerminalProfileSupport {
-            terminal: entry.terminal, terminalType: entry.terminalType, fields: Vec::new(),
+            terminal: entry.terminal, terminalType: entry.terminalType, fields: Vec::new(), fieldChoices: None,
         }).collect())
     }
     /// Creates an isolated host with immutable launch options for new sessions.
@@ -1995,8 +2004,8 @@ pub trait TerminalHost: Send + Sync {
         timeoutMs: u64,
     ) -> HostResult<TerminalCommandOutput>;
     /// Executes in the same session while forwarding raw PTY bytes before completion.
-    /// Empty frames allow cancellation checks during quiet commands. A callback error
-    /// interrupts the command and leaves the session available for subsequent work.
+    /// Output and close events wake the command observer. A callback error interrupts
+    /// the command and waits for shell readiness before releasing the session.
     /// A zero timeout disables the execution deadline; callers may stop waiting independently.
     fn executeInSessionStreaming(
         &self,
@@ -2007,23 +2016,36 @@ pub trait TerminalHost: Send + Sync {
     ) -> HostResult<TerminalCommandOutput> {
         Err(HostError::new("Terminal output streaming is not supported by this host"))
     }
-    /// Schedules native PTY work independently of the caller's foreground wait.
-    /// Event-loop hosts override this operation to poll without blocking their runtime worker.
+    /// Submits one command and returns its nonblocking observation state.
+    fn beginInSessionStreaming(
+        self: Arc<Self>,
+        _sessionId: String,
+        _command: String,
+        _timeoutMs: u64,
+    ) -> HostResult<Box<dyn TerminalCommand::TerminalCommandExecution>> {
+        Err(HostError::new("Cooperative terminal command execution is not supported by this host"))
+    }
+    /// Keeps finite submission and cleanup on blocking workers and observes output cooperatively.
     fn scheduleInSessionStreaming(
         self: Arc<Self>,
         scheduler: Arc<dyn HostRuntimeTaskSchedulerHost>,
         sessionId: String,
         command: String,
         timeoutMs: u64,
-        mut onOutput: TerminalOutputCallback,
+        onOutput: TerminalOutputCallback,
         onComplete: TerminalCompletionCallback,
     ) -> HostResult<()> where Self: 'static {
-        scheduler.scheduleHostRuntimeTask("terminal-command-stream", Box::new(move || {
-            let result = self.executeInSessionStreaming(
-                &sessionId, &command, timeoutMs, &mut |data| onOutput(data, false),
-            ).and_then(|receipt| { onOutput(&[], true)?; Ok(receipt) });
+        let commandScheduler = scheduler.clone();
+        scheduler.scheduleHostRuntimeCooperativeAsyncTask("terminal-command-stream", Box::new(move || Box::pin(async move {
+            let result = TerminalCommand::runTerminalBlocking(commandScheduler.clone(), "terminal-command-start", move || {
+                self.beginInSessionStreaming(sessionId, command, timeoutMs)
+            }).await;
+            let result = match result {
+                Ok(execution) => TerminalCommand::observeTerminalCommand(execution, commandScheduler, onOutput).await,
+                Err(error) => Err(error),
+            };
             onComplete(result);
-        }))
+        })))
     }
     fn executeHiddenCommand(
         &self,
@@ -2054,6 +2076,10 @@ pub struct RuntimeStorageEntry {
 }
 
 pub trait RuntimeStorageHost: Send + Sync {
+    /// Excludes Host-private storage from portable snapshots before traversal or replacement.
+    /// Paths use the logical runtime namespace; exclusions include the entire addressed subtree.
+    fn isSnapshotExcludedPath(&self, _path: &str) -> bool { false }
+
     /// Opens a private sequential writer; commit publishes the complete file atomically.
     /// Returning None allows small legacy hosts to use their ordinary bounded write path.
     fn openWriteSession(&self, _path: &str) -> HostResult<Option<Box<dyn RuntimeStorageWriteSession>>> {
@@ -2130,6 +2156,10 @@ pub trait RuntimeStorageHost: Send + Sync {
 macro_rules! delegate_runtime_storage {
     ($host:ty, $field:ident) => {
         impl $crate::RuntimeStorageHost for $host {
+            /// Delegates portable snapshot ownership to the underlying storage Host.
+            fn isSnapshotExcludedPath(&self, path: &str) -> bool {
+                $crate::RuntimeStorageHost::isSnapshotExcludedPath(&self.$field, path)
+            }
             fn openWriteSession(&self, path: &str) -> $crate::HostResult<Option<Box<dyn $crate::RuntimeStorageWriteSession>>> {
                 $crate::RuntimeStorageHost::openWriteSession(&self.$field, path)
             }
@@ -2434,7 +2464,10 @@ pub type HostRuntimeTask = Box<dyn FnOnce() + Send + 'static>;
 pub type HostRuntimeAsyncTask =
     Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'static>> + Send + 'static>;
 
-/// Represents one host-owned asynchronous runtime turn boundary that may cross runtime schedulers.
+/// Owns a thread-independent continuation that a Host pool may move between polls.
+pub type HostRuntimePooledTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+/// Represents one platform-owned asynchronous delay that may cross runtime schedulers.
 pub type HostRuntimeTurnFuture = Pin<Box<dyn Future<Output = HostResult<()>> + Send + 'static>>;
 
 /// Submits an owned JSON-compatible request. The request id refers to a Promise
@@ -2481,8 +2514,31 @@ pub type HostJavaScriptCallback =
 /// Returns one binary payload with small structured metadata, without Base64 or byte arrays in JSON.
 pub type HostJavaScriptBinaryCallback = Arc<dyn Fn(Vec<Value>) -> HostResult<(Value, Vec<u8>)> + Send + Sync + 'static>;
 
+/// Describes a realm operation that can execute untrusted code or Promise continuations.
+pub enum HostJavaScriptCommand<'a> {
+    Evaluate(&'a str, &'a str),
+    Call(&'a str, &'a [Value]),
+    Jobs,
+    Settle(u64, Value, bool),
+    Cancel(&'a str),
+}
+
 /// Owns one concrete JavaScript runtime created by the active platform host.
 pub trait HostJavaScriptRuntime {
+    /// Suspends the caller while its affine realm executes code and services host callbacks.
+    fn executeHostJavaScriptCommand<'a>(&'a mut self, command: HostJavaScriptCommand<'a>)
+        -> Pin<Box<dyn Future<Output = HostResult<Value>> + 'a>> {
+        Box::pin(async move {
+            match command {
+                HostJavaScriptCommand::Evaluate(name, source) => self.evaluateHostJavaScriptVoid(name, source).map(|()| Value::Null),
+                HostJavaScriptCommand::Call(name, arguments) => self.callHostJavaScriptFunction(name, arguments),
+                HostJavaScriptCommand::Jobs => self.executePendingHostJavaScriptJobs().map(|()| Value::Null),
+                HostJavaScriptCommand::Settle(id, value, reject) => self.settleHostJavaScriptPromise(id, value, reject).map(|()| Value::Null),
+                HostJavaScriptCommand::Cancel(scope) => self.cancelHostJavaScriptPromises(scope).map(|()| Value::Null),
+            }
+        })
+    }
+
     /// Installs a synchronous binary resource reader returning { metadata, bytes: Uint8Array }.
     fn registerHostJavaScriptBinaryFunction(&mut self, _name: &str, _callback: HostJavaScriptBinaryCallback) -> HostResult<()> {
         Err(HostError::new("JavaScript binary resource bindings are unavailable"))
@@ -2621,12 +2677,12 @@ pub trait HostJavaScriptRuntimeHost: Send + Sync {
         task: HostJavaScriptRuntimeStateTask,
     ) -> HostResult<HostJavaScriptRuntimeStateOutput>;
 
-    /// Enqueues one synchronous continuation directly on its owner without waiting for completion.
+    /// Enqueues one asynchronous continuation directly on its owner without waiting for completion.
     fn enqueueHostJavaScriptRuntimeStateTask(
         &self,
         handle: HostJavaScriptRuntimeStateHandle,
         interrupt: HostJavaScriptExecutionInterrupt,
-        task: HostJavaScriptRuntimeStateTask,
+        task: HostJavaScriptRuntimeStateAsyncTask,
     ) -> HostResult<()>;
 
     /// Executes one asynchronous operation against an affine JavaScript runtime state.
@@ -2684,6 +2740,17 @@ pub trait HostRuntimeTaskSchedulerHost: Send + Sync {
         task: HostRuntimeAsyncTask,
     ) -> HostResult<()>;
 
+    /// Admits movable work; an optional affine opener reserves both stages atomically.
+    /// Native Hosts use coordination capacity without an opener, blocking capacity with one.
+    fn scheduleHostRuntimePooledTask(
+        &self,
+        _taskName: &str,
+        _opening: Option<HostRuntimeAsyncTask>,
+        _task: HostRuntimePooledTask,
+    ) -> HostResult<()> {
+        Err(HostError::new("Pooled runtime tasks are not supported by this host"))
+    }
+
     /// Schedules a named runtime task after a platform-owned delay.
     fn scheduleDelayedHostRuntimeTask(
         &self,
@@ -2691,9 +2758,6 @@ pub trait HostRuntimeTaskSchedulerHost: Send + Sync {
         delayMs: u64,
         task: HostRuntimeTask,
     ) -> HostResult<()>;
-
-    /// Waits until the platform runtime can continue work on a later event-loop turn.
-    fn waitForHostRuntimeTaskTurn(&self) -> HostRuntimeTurnFuture;
 
     /// Waits for a platform-owned delay without using a shared runtime timer.
     fn waitForHostRuntimeDelay(&self, delayMs: u64) -> HostRuntimeTurnFuture;
@@ -3474,6 +3538,10 @@ pub trait SystemOperationHost: Send + Sync {
     fn applicationUpdateBase(&self) -> HostResult<ApplicationUpdateBase> {
         Ok(ApplicationUpdateBase::RetainedPackage)
     }
+    /// Reports cache retention policy without querying an installer or its owner UI.
+    fn retainsApplicationUpdatePackages(&self) -> bool {
+        true
+    }
     /// Reports the running application's distribution; None disables in-app updates.
     fn applicationUpdateTarget(&self) -> HostResult<Option<ApplicationUpdateTarget>> {
         Ok(None)
@@ -3552,6 +3620,25 @@ pub trait FileSystemHost: Send + Sync {
         ))
     }
     fn writeFile(&self, path: &str, content: &str, append: bool) -> HostResult<()>;
+    /// Checks a directory with a unique temporary file and removes it.
+    fn verifyWritableDirectory(&self, directory: &str, name: &str) -> HostResult<()> {
+        let path = format!("{}/{}", directory.trim_end_matches('/'), name);
+        self.listFiles(directory)?;
+        let checked = (|| {
+            self.writeFile(&path, name, false)?;
+            if !self.listFiles(directory)?.iter().any(|entry| entry.name == name) {
+                return Err(HostError::new("Created probe is not visible under its requested name"));
+            }
+            if self.readFile(&path)? != name {
+                return Err(HostError::new("Backup directory write verification failed"));
+            }
+            Ok(())
+        })();
+        if self.fileExists(&path)?.exists {
+            self.deleteFile(&path, false)?;
+        }
+        checked
+    }
     fn writeFileBytes(&self, path: &str, content: &[u8]) -> HostResult<()>;
     /// Opens an existing file for repeated appends, creating it when absent.
     /// Callers must drop the handle before truncating, moving or deleting the file.

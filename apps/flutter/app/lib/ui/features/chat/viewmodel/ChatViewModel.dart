@@ -145,6 +145,9 @@ class ChatViewModel {
   /// The chat runtime scoped to this view model's window.
   GeneratedChatRuntimeHolderMainCoreProxy get chatCore => _chat;
 
+  /// Uses the executor that owns the live response streams for this surface.
+  GeneratedChatRuntimeHolderMainCoreProxy get transcriptCore => _observationChat;
+
   /// Watches the selected chat id used to bind per-chat Core flows.
   Stream<String?> watchCurrentChatId() {
     return _chat.currentChatIdFlow();
@@ -189,12 +192,16 @@ class ChatViewModel {
     String text, {
     ChatUiMessage? replyToMessage,
     String? chatIdOverride,
+    List<AttachmentInfo>? attachmentsOverride,
   }) async {
     debugPrint(
       'Chat send requested chatId=${chatIdOverride ?? 'current'} '
       'chars=${text.length}',
     );
-    final attachments = await _chat.attachments();
+    // A queued send carries its own captured attachments; Core consumed those
+    // records from the composer when the draft entered the queue.
+    final attachments =
+        attachmentsOverride ?? await _chat.attachments();
     await _chat.sendUserMessage(
       promptFunctionType: core_proxy.PromptFunctionType.chat,
       participantId: null,
@@ -215,7 +222,7 @@ class ChatViewModel {
       ),
     );
     debugPrint('Chat send accepted chatId=${chatIdOverride ?? 'current'}');
-    if (attachments.isNotEmpty) {
+    if (attachmentsOverride == null && attachments.isNotEmpty) {
       await _chat.clearAttachments();
     }
   }
@@ -275,10 +282,12 @@ class ChatViewModel {
   Future<void> enqueuePendingQueueMessage({
     required String chatId,
     required String messageText,
+    List<AttachmentInfo> attachments = const <AttachmentInfo>[],
   }) {
     return _chat.enqueuePendingQueueMessage(
       chatId: chatId,
       messageText: messageText,
+      attachments: attachments,
     );
   }
 

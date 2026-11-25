@@ -64,6 +64,7 @@ class AiChatScreenRoute extends OperitScreen {
     : super(
         routeTypeName: 'AiChat',
         title: 'AI Chat',
+        keepAlive: true,
         handlesBottomSafeArea: true,
       );
 

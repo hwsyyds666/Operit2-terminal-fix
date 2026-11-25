@@ -2,7 +2,7 @@ use crate::plugins::toolpkg::ToolPkgMessageTransformBridge::ToolPkgMessageTransf
 use operit_tools::tools::packTool::RuntimePackageManager::RuntimePackageManager;
 use crate::core::chat::AIMessageManager::AIMessageManager;
 use crate::data::preferences::ApiPreferences::ApiPreferences;
-use crate::data::preferences::FunctionalConfigManager::FunctionalConfigManager;
+use crate::data::preferences::FunctionalConfigManager::{FunctionModelBinding, FunctionalConfigManager};
 use crate::data::preferences::ModelConfigManager::ModelConfigManager;
 use crate::plugins::toolpkg::ToolPkgChatInputHookBridge::{
     ChatInputHookContext, ChatInputHookResult, ToolPkgChatInputHookBridge,
@@ -20,6 +20,7 @@ use crate::services::core::MessageProcessingDelegate::{
     ChatExecutionState, ChatTurnSubmission, MessageProcessingDelegate, SendUserMessageProcessingRequest,
 };
 use crate::services::core::TokenStatisticsDelegate::TokenStatisticsDelegate;
+use crate::services::ChatModelBindingService::ChatModelBindingService;
 use crate::services::ProviderRuntimeSupportService::{ChatConfigurationApi, MODEL_CONFIGURATION_OWNER};
 use crate::services::RuntimeHostInteractionService::{
     chatToolPermissionRequestsFlow, respondChatToolPermission,
@@ -41,6 +42,7 @@ use operit_model::ChatMessageTimestampAllocator::ChatMessageTimestampAllocator;
 use operit_model::ChatHistory::ChatHistory;
 use operit_model::ChatHistoryListItem::ChatHistoryListItem;
 use operit_model::ChatMessage::ChatMessage;
+use crate::services::core::ChatTranscript::{ChatTranscriptChange, ChatTranscriptPage, run_transcript_read};
 use operit_model::ChatMessageLocatorPreview::ChatMessageLocatorPreview;
 use operit_model::ChatTurnOptions::ChatTurnOptions;
 use operit_plugin_sdk::js_sdk::results::{JsOptional, MessageSendOutcome, MessageSendResultData};
@@ -862,11 +864,9 @@ impl ChatServiceCore {
         self.chatHistoryDelegate.openChatHistory(chatId.clone(), false)?;
         delegate.chatHistoryDelegate = self.chatHistoryDelegate.clone_for_core();
         delegate.messageProcessingDelegate = self.messageProcessingDelegate.clone_for_core();
-        let executionLease = self
-            .chatHistoryDelegate
-            .chatHistoryManager
-            .beginChatExecution(&chatId)
-            .map_err(|error| error.to_string())?;
+        let executionLease = ChatModelBindingService::beginExecution(
+            &self.chatHistoryDelegate.chatHistoryManager, &chatId,
+        )?;
         let mut api = ChatConfigurationApi::ready(&service.tool_handler).await;
         let support = service.provider_runtime_context.support();
         let configuration = api
@@ -877,7 +877,7 @@ impl ChatServiceCore {
                 participantId: Some(resumeContext.participantId.clone()),
                 promptFunctionType: resumeContext.promptFunctionType.clone(),
                 defaultModelBinding: support
-                    .modelBindingForFunction(FunctionType::CHAT)?,
+                    .modelBindingForChat(Some(&chatId), FunctionType::CHAT)?,
                 defaultTtsConfigId: support.defaultTtsConfigId()?,
             })
             .await?;
@@ -965,19 +965,30 @@ impl ChatServiceCore {
         self.messageProcessingDelegate.steerMessage(chatId, messageText)
     }
 
-    /// Adds one message to the queue owned by a specific chat.
+    /// Queues a draft and consumes its unchanged composer attachments in the same Core call.
     #[allow(non_snake_case)]
     #[operit_route_macros::operit_core_route(binding = chatId)]
-    pub fn enqueuePendingQueueMessage(&mut self, chatId: String, messageText: String) {
+    pub fn enqueuePendingQueueMessage(
+        &mut self,
+        chatId: String,
+        messageText: String,
+        attachments: Vec<AttachmentInfo>,
+    ) {
         let mut queueStateByChatId = self.pendingQueueStateFlow().value();
         let queueState = queueStateByChatId
-            .entry(chatId)
+            .entry(chatId.clone())
             .or_insert_with(PendingChatQueueState::new);
         let messageId = queueState.nextMessageId;
         queueState.nextMessageId += 1;
+        // The caller may have added/replaced attachments or switched chats while this call
+        // was in transit. Only this chat's exact submitted records belong to the queue.
+        if self.chatHistoryDelegate.currentChatIdFlow.value().as_deref() == Some(chatId.as_str()) {
+            self.attachments.retain(|attachment| !attachments.contains(attachment));
+        }
         queueState.messages.push(PendingQueueMessageItem {
             id: messageId,
             text: messageText,
+            attachments,
         });
         queueState.isExpanded = true;
         queueState.wasBlocked = true;
@@ -1094,16 +1105,27 @@ impl ChatServiceCore {
     }
 
     /// Splits markdown content into stable render events for the client.
-    pub fn splitMarkdownContent(&self, content: String) -> Vec<MarkdownStreamEvent> {
-        let mut events = MarkdownRenderEventStream::fromContent(content);
+    pub fn splitMarkdownContent(
+        &self, content: String,
+    ) -> impl std::future::Future<Output = Result<Vec<MarkdownStreamEvent>, String>> + 'static {
         let handler = self.runtimeToolHandler();
-        for event in &mut events { handler.decorateToolDisplayEvent(event); }
-        events
+        async move {
+            run_transcript_read(move || {
+                let mut events = MarkdownRenderEventStream::fromContent(content);
+                for event in &mut events { handler.decorateToolDisplayEvent(event); }
+                Ok(events)
+            }).await
+        }
     }
 
     /// Observes enabled transform handlers and their explicitly invalidated settings.
     pub fn messageTransformRevisionFlow(&self) -> StateFlow<i64> {
         ToolPkgMessageTransformBridge::revisionFlow()
+    }
+
+    /// Reports whether presentation plugins need to transform message text.
+    pub fn hasDisplayMessageTransforms(&self) -> bool {
+        ToolPkgMessageTransformBridge::hasDisplayHooks()
     }
 
     /// Projects a client-owned display snapshot and releases the receiver before invoking presentation plugins.
@@ -1201,6 +1223,45 @@ impl ChatServiceCore {
         Ok(())
     }
 
+    /// Returns the effective conversation model without modifying the global chat binding.
+    #[operit_route_macros::operit_core_route(binding = chatId)]
+    pub fn chatModelBinding(&self, chatId: String) -> Result<FunctionModelBinding, String> {
+        self.chatHistoryDelegate.requireChatExists(&chatId)?;
+        let models = ModelConfigManager::default();
+        if let Some(binding) = ChatModelBindingService::read(
+            &self.chatHistoryDelegate.chatHistoryManager,
+            &models,
+            &chatId,
+        )? {
+            return Ok(binding);
+        }
+        FunctionalConfigManager::default()
+            .getModelBindingForFunction(FunctionType::CHAT)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Persists a model for this exact conversation; selecting the global pair resumes global updates.
+    #[operit_route_macros::operit_core_route(binding = chatId)]
+    pub fn setChatModelBinding(
+        &self,
+        chatId: String,
+        binding: Option<FunctionModelBinding>,
+    ) -> Result<(), String> {
+        self.chatHistoryDelegate.requireChatExists(&chatId)?;
+        let global = FunctionalConfigManager::default()
+            .getModelBindingForFunction(FunctionType::CHAT)
+            .map_err(|error| error.to_string())?;
+        let binding = binding.filter(|binding| {
+            binding.providerId != global.providerId || binding.modelId != global.modelId
+        });
+        ChatModelBindingService::write(
+            &self.chatHistoryDelegate.chatHistoryManager,
+            &ModelConfigManager::default(),
+            &chatId,
+            binding,
+        )
+    }
+
     /// Resolves and publishes only generic display identity, ordered participants and plugin-authored initialization data.
     #[operit_route_macros::operit_core_route(binding = chatId)]
     pub fn chatConfiguration(
@@ -1222,7 +1283,7 @@ impl ChatServiceCore {
                 chatExtension: None,
                 participantId: None,
                 promptFunctionType: PromptFunctionType::CHAT,
-                defaultModelBinding: support.modelBindingForFunction(FunctionType::CHAT)?,
+                defaultModelBinding: support.modelBindingForChat(Some(&chatId), FunctionType::CHAT)?,
                 defaultTtsConfigId: support.defaultTtsConfigId()?,
             }).await?;
             history
@@ -1259,12 +1320,12 @@ impl ChatServiceCore {
         let support = service.provider_runtime_context.support();
         api.resolve(ChatConfigurationRequest {
             purpose: ChatConfigurationPurpose::Execution,
-            chatId: Some(chatId),
+            chatId: Some(chatId.clone()),
             chatExtension: None,
             participantId,
             promptFunctionType: PromptFunctionType::CHAT,
             defaultModelBinding: support
-                .modelBindingForFunction(FunctionType::CHAT)?,
+                .modelBindingForChat(Some(&chatId), FunctionType::CHAT)?,
             defaultTtsConfigId: support.defaultTtsConfigId()?,
         })
         .await
@@ -1637,11 +1698,9 @@ impl ChatServiceCore {
             Some(id) if !id.trim().is_empty() => id,
             _ => self.chatHistoryDelegate.currentChatIdFlow.value().ok_or_else(|| "No chat is active".to_string())?,
         };
-        let executionLease = self
-            .chatHistoryDelegate
-            .chatHistoryManager
-            .beginChatExecution(&targetChatId)
-            .map_err(|error| error.to_string())?;
+        let executionLease = ChatModelBindingService::beginExecution(
+            &self.chatHistoryDelegate.chatHistoryManager, &targetChatId,
+        )?;
         let Some(mut enhancedAiService) = self.newEnhancedAiServiceForChat(&targetChatId) else {
             return Ok(false);
         };
@@ -2417,13 +2476,15 @@ impl ChatServiceCore {
             return;
         }
 
+        if isStandardPackage {
+            let enabled = packageManager.lock().expect("package manager mutex poisoned")
+                .enablePackage(packageName);
+            enabled.await;
+        }
         {
             let mut packageManagerGuard = packageManager
                 .lock()
                 .expect("package manager mutex poisoned");
-            if isStandardPackage {
-                packageManagerGuard.enablePackage(packageName);
-            }
             let packageContent = packageManagerGuard.usePackage(packageName);
             if isPackageAttachmentError(packageName, &packageContent) {
                 self.messageProcessingDelegate
@@ -2703,6 +2764,58 @@ impl ChatServiceCore {
     #[operit_route_macros::operit_core_route(binding = chatId)]
     pub async fn chatMessagesFlow(&self, chatId: String) -> StateFlow<Vec<ChatMessage>> {
         self.localChatMessagesFlow(chatId)
+    }
+
+    /// Reads an independent, local transcript page without changing the legacy display window.
+    pub fn loadTranscriptPage(
+        &self, chatId: String, direction: String, timestamp: Option<i64>,
+    ) -> impl std::future::Future<Output = Result<ChatTranscriptPage, String>> + 'static {
+        let manager = self.chatHistoryDelegate.chatHistoryManager.clone();
+        let live = self.chatHistoryDelegate.liveTranscriptMessages(&chatId);
+        async move {
+            run_transcript_read(move || {
+                let mut messages = manager.loadTranscriptMessages(&chatId, &direction, timestamp)
+                    .map_err(|error| error.to_string())?;
+                let lower = messages.first().map(|row| row.timestamp);
+                let upper = messages.last().map(|row| row.timestamp);
+                for message in live {
+                    if let Ok(index) = messages.binary_search_by_key(&message.timestamp, |row| row.timestamp) {
+                        messages[index] = message;
+                    } else if direction == "latest" && upper.is_none_or(|bound| message.timestamp > bound) {
+                        messages.push(message);
+                    }
+                }
+                messages.sort_by_key(|row| row.timestamp);
+                if messages.len() > 20 {
+                    messages.drain(..messages.len() - 20);
+                }
+                let hasOlder = match messages.first().map(|row| row.timestamp).or(lower).or(timestamp) {
+                    Some(bound) => manager.hasMessagesBefore(chatId.clone(), bound).map_err(|e| e.to_string())?,
+                    None => false,
+                };
+                let hasNewer = match messages.last().map(|row| row.timestamp).or(timestamp) {
+                    Some(bound) if direction != "latest" => manager.hasMessagesAfter(chatId, bound).map_err(|e| e.to_string())?,
+                    _ => false,
+                };
+                Ok(ChatTranscriptPage { messages, hasOlder, hasNewer })
+            }).await
+        }
+    }
+
+    /// Hydrates one visible message using its current persisted revision.
+    pub fn loadTranscriptMessage(
+        &self, chatId: String, timestamp: i64,
+    ) -> impl std::future::Future<Output = Result<Option<ChatMessage>, String>> + 'static {
+        let manager = self.chatHistoryDelegate.chatHistoryManager.clone();
+        async move {
+            run_transcript_read(move || manager.loadTranscriptMessage(&chatId, timestamp)
+                .map_err(|error| error.to_string())).await
+        }
+    }
+
+    /// Observes compact message changes for the local Flutter transcript.
+    pub fn watchTranscriptChanges(&self, chatId: String) -> StateFlow<Vec<ChatTranscriptChange>> {
+        self.chatHistoryDelegate.watchTranscript(chatId)
     }
 
     /// Watches one bounded display window, addressed by an optional history cursor.
@@ -3025,27 +3138,41 @@ impl ChatServiceCore {
             .triggerToggleForFlutter(toggleId, chatId, Some("main".into()))
     }
 
+    /// Returns usage and context limits for the effective conversation model.
     #[operit_route_macros::operit_core_route(binding = chatId)]
     pub async fn chatInputMenuSummary(
         &self,
         chatId: Option<String>,
     ) -> Result<ChatInputMenuSummary, String> {
-        let binding = FunctionalConfigManager::default()
-            .getModelBindingForFunction(FunctionType::CHAT)
-            .map_err(|e| e.to_string())?;
+        let binding = match &chatId {
+            Some(id) => self.chatModelBinding(id.clone())?,
+            None => FunctionalConfigManager::default()
+                .getModelBindingForFunction(FunctionType::CHAT)
+                .map_err(|error| error.to_string())?,
+        };
         let config = ModelConfigManager::default()
             .getResolvedModelConfig(&binding.providerId, &binding.modelId)
             .map_err(|e| e.to_string())?;
-        let chat = match chatId {
+        let chat = match &chatId {
             Some(id) => self
                 .chatHistoryDelegate
                 .chatHistoryManager
-                .loadChatHistory(id)
+                .loadChatHistory(id.clone())
                 .map_err(|e| e.to_string())?,
             None => None,
         };
+        // A non-zero live estimate tracks every request/tool round and is reseeded on each
+        // persisted write, so it is never older than the row; zero means a cold cache.
+        let liveWindowSize = if chatId.is_some() {
+            self.getTokenStatisticsDelegate()
+                .map(|delegate| delegate.getLastCurrentWindowSize(chatId.clone()))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let persistedWindowSize = chat.as_ref().map(|c| c.currentWindowSize).unwrap_or(0);
         Ok(ChatInputMenuSummary {
-            currentWindowSize: chat.as_ref().map(|c| c.currentWindowSize).unwrap_or(0),
+            currentWindowSize: if liveWindowSize > 0 { liveWindowSize } else { persistedWindowSize },
             inputTokenCount: chat.as_ref().map(|c| c.inputTokens).unwrap_or(0),
             outputTokenCount: chat.as_ref().map(|c| c.outputTokens).unwrap_or(0),
             maxContextLength: f64::from(config.context.maxContextLength),
@@ -3616,8 +3743,6 @@ mod chat_deletion_tests {
         fn scheduleDelayedHostRuntimeTask(&self, _: &str, _: u64, _: operit_host_api::HostRuntimeTask) -> operit_host_api::HostResult<()> {
             panic!("chat deletion must not schedule timers")
         }
-        /// Completes observer turns without delay.
-        fn waitForHostRuntimeTaskTurn(&self) -> operit_host_api::HostRuntimeTurnFuture { Box::pin(async { Ok(()) }) }
         /// Rejects timer futures outside this lifecycle test.
         fn waitForHostRuntimeDelay(&self, _: u64) -> operit_host_api::HostRuntimeTurnFuture {
             panic!("chat deletion must not wait for timers")
@@ -3659,6 +3784,8 @@ mod chat_deletion_tests {
             runtime.responseStream = Some(stream.clone());
             core.messageProcessingDelegate.chatRuntimes.lock().unwrap().insert(id.into(), runtime);
             core.messageProcessingDelegate.setChatExecutionStateForTest(id.into(), ChatExecutionState {
+                taskTitle: None,
+                currentRound: 0,
                 isLoading: true,
                 inputProcessingState: InputProcessingState::Processing { message: "processing".into() },
             });
@@ -3700,6 +3827,8 @@ mod chat_deletion_tests {
 
         // A summary occupies the chat after streaming resources have finished.
         core.messageProcessingDelegate.setChatExecutionStateForTest("live-chat".into(), ChatExecutionState {
+            taskTitle: None,
+            currentRound: 0,
             isLoading: false,
             inputProcessingState: InputProcessingState::Summarizing { message: "summarizing".into() },
         });
@@ -3818,6 +3947,8 @@ mod chat_deletion_tests {
             turn.responseStream = Some(response.clone());
             core.messageProcessingDelegate.chatRuntimes.lock().unwrap().insert("route-chat".into(), turn);
             core.messageProcessingDelegate.setChatExecutionStateForTest("route-chat".into(), ChatExecutionState {
+                taskTitle: None,
+                currentRound: 0,
                 isLoading: true,
                 inputProcessingState: InputProcessingState::Processing { message: "processing".into() },
             });
@@ -3849,6 +3980,108 @@ mod chat_deletion_tests {
             let next = database.store().beginChatExecution("route-chat").unwrap();
             next.release().unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod chat_input_menu_summary_tests {
+    use super::*;
+    use operit_host_native_filesystem::PosixFileSystemHost;
+    use operit_host_native_storage::NativeRuntimeStorageHost;
+    use operit_model::ChatEntity::ChatEntity;
+    use operit_store::RuntimeStorageHost::{setDefaultRuntimeSqliteHost, setDefaultRuntimeStorageHost};
+    use operit_store::RuntimeStorePaths::RuntimeStorePaths;
+    use operit_store::db::AppDatabase::AppDatabase;
+
+    /// Runs preference notifications inline and keeps background work out of the assertions.
+    struct SummaryScheduler;
+    impl operit_host_api::HostRuntimeTaskSchedulerHost for SummaryScheduler {
+        fn monotonicTimeMillis(&self) -> operit_host_api::HostResult<u64> { Ok(0) }
+        fn scheduleHostRuntimeTask(&self, _: &str, task: operit_host_api::HostRuntimeTask) -> operit_host_api::HostResult<()> {
+            task(); Ok(())
+        }
+        fn scheduleHostRuntimeAsyncTask(&self, _: &str, _: operit_host_api::HostRuntimeAsyncTask) -> operit_host_api::HostResult<()> { Ok(()) }
+        fn scheduleHostRuntimeCooperativeAsyncTask(&self, name: &str, task: operit_host_api::HostRuntimeAsyncTask) -> operit_host_api::HostResult<()> {
+            self.scheduleHostRuntimeAsyncTask(name, task)
+        }
+        fn scheduleDelayedHostRuntimeTask(&self, _: &str, _: u64, _: operit_host_api::HostRuntimeTask) -> operit_host_api::HostResult<()> { Ok(()) }
+        fn waitForHostRuntimeDelay(&self, _: u64) -> operit_host_api::HostRuntimeTurnFuture { Box::pin(async { Ok(()) }) }
+    }
+
+    #[tokio::test]
+    async fn summary_prefers_live_window_estimate_and_falls_back_to_persisted_row() {
+        operit_host_api::HostManager::setDefaultHostRuntimeTaskSchedulerHost(Arc::new(SummaryScheduler));
+        let root = std::env::temp_dir().join(format!("operit-context-summary-{}", uuid::Uuid::new_v4()));
+        let host = Arc::new(NativeRuntimeStorageHost::new(root.join("runtime"), root.join("workspaces")));
+        setDefaultRuntimeStorageHost(host.clone());
+        setDefaultRuntimeSqliteHost(host.clone());
+
+        let models = ModelConfigManager::default();
+        let providerId = models.createProvider(
+            "summary-provider".into(),
+            "OPENAI".into(),
+            "https://example.invalid/v1".into(),
+        ).unwrap();
+        models.createProviderModel(&providerId, "summary-model".into()).unwrap();
+        FunctionalConfigManager::default()
+            .setModelForFunction(FunctionType::CHAT, providerId, "summary-model".into())
+            .unwrap();
+
+        let database = AppDatabase::getDatabase(RuntimeStorePaths::default()).unwrap();
+        let mut stale = ChatEntity::new("summary-stale".into(), "Stale row".into(), 1);
+        stale.inputTokens = 111;
+        stale.outputTokens = 22;
+        stale.currentWindowSize = 1000;
+        database.chatDao().insertChat(stale).unwrap();
+        let mut stuck = ChatEntity::new("summary-stuck".into(), "Stuck at zero".into(), 1);
+        stuck.inputTokens = 333;
+        stuck.outputTokens = 44;
+        stuck.currentWindowSize = 0;
+        database.chatDao().insertChat(stuck).unwrap();
+
+        let filesystem = VisualFileSystem::fromStorage(Arc::new(PosixFileSystemHost::new()), host).unwrap();
+        let mut core = ChatServiceCore::new(ChatSelectionMode::FOLLOW_GLOBAL, Arc::new(filesystem));
+
+        // Cold delegate cache (e.g. after restart): the persisted row is the only source.
+        let summary = core.chatInputMenuSummary(Some("summary-stale".into())).await.unwrap();
+        assert_eq!(summary.currentWindowSize, 1000);
+        assert_eq!((summary.inputTokenCount, summary.outputTokenCount), (111, 22));
+
+        // A live mid-turn estimate must win over the row left by the previous completed turn.
+        core.getMessageCoordinationDelegate().unwrap().tokenStatisticsDelegate.setTokenCounts(
+            Some("summary-stale".into()), 111, 22, 5000,
+        );
+        let summary = core.chatInputMenuSummary(Some("summary-stale".into())).await.unwrap();
+        assert_eq!(summary.currentWindowSize, 5000);
+        assert_eq!((summary.inputTokenCount, summary.outputTokenCount), (111, 22));
+
+        // Production sends run on a deep-cloned worker delegate; its updates must reach the Core.
+        let mut workerDelegate = core.getMessageCoordinationDelegate().unwrap().tokenStatisticsDelegate.clone();
+        workerDelegate.setTokenCounts(Some("summary-stale".into()), 111, 22, 6000);
+        let summary = core.chatInputMenuSummary(Some("summary-stale".into())).await.unwrap();
+        assert_eq!(summary.currentWindowSize, 6000);
+
+        // A row stuck at zero after failed completion estimates still shows the live estimate.
+        core.getMessageCoordinationDelegate().unwrap().tokenStatisticsDelegate.setTokenCounts(
+            Some("summary-stuck".into()), 333, 44, 7000,
+        );
+        let summary = core.chatInputMenuSummary(Some("summary-stuck".into())).await.unwrap();
+        assert_eq!(summary.currentWindowSize, 7000);
+        assert_eq!((summary.inputTokenCount, summary.outputTokenCount), (333, 44));
+
+        // Estimates are per chat: another conversation keeps its own persisted value.
+        let mut other = ChatEntity::new("summary-other".into(), "Other chat".into(), 1);
+        other.currentWindowSize = 2000;
+        database.chatDao().insertChat(other).unwrap();
+        let summary = core.chatInputMenuSummary(Some("summary-other".into())).await.unwrap();
+        assert_eq!(summary.currentWindowSize, 2000);
+
+        // No selected conversation keeps returning zeros instead of the active chat's estimate.
+        let summary = core.chatInputMenuSummary(None).await.unwrap();
+        assert_eq!(
+            (summary.currentWindowSize, summary.inputTokenCount, summary.outputTokenCount),
+            (0, 0, 0)
+        );
     }
 }
 
@@ -3886,5 +4119,177 @@ mod edge_plugin_metadata_tests {
         let details = ChatPluginDetails { id:"a".repeat(108),description:"中".repeat(64),
             tools:vec!["a".repeat(64);3],toolTotal:999, ..Default::default() };
         assert!(serde_json::to_vec(&details).unwrap().len() < 768);
+    }
+}
+
+#[cfg(test)]
+mod pending_queue_attachment_tests {
+    use super::*;
+    use crate::services::core::MessageProcessingDelegate::ChatExecutionState;
+    use operit_host_api::HostManager::setDefaultHostRuntimeTaskSchedulerHost;
+    use operit_host_api::{
+        HostResult, HostRuntimeAsyncTask, HostRuntimeTask, HostRuntimeTaskSchedulerHost,
+        HostRuntimeTurnFuture,
+    };
+    use operit_host_native_filesystem::PosixFileSystemHost;
+    use operit_host_native_storage::NativeRuntimeStorageHost;
+    use operit_store::RuntimeStorageHost::{setDefaultRuntimeSqliteHost, setDefaultRuntimeStorageHost};
+
+    /// Delivers synchronous work immediately and retains background tasks so queue
+    /// flow publication never needs a platform executor.
+    #[derive(Default)]
+    struct QueueTestScheduler(std::sync::Mutex<Vec<HostRuntimeAsyncTask>>);
+
+    impl HostRuntimeTaskSchedulerHost for QueueTestScheduler {
+        fn monotonicTimeMillis(&self) -> HostResult<u64> {
+            Ok(0)
+        }
+        fn scheduleHostRuntimeTask(&self, _: &str, task: HostRuntimeTask) -> HostResult<()> {
+            task();
+            Ok(())
+        }
+        fn scheduleHostRuntimeAsyncTask(&self, _: &str, task: HostRuntimeAsyncTask) -> HostResult<()> {
+            self.0.lock().unwrap().push(task);
+            Ok(())
+        }
+        fn scheduleHostRuntimeCooperativeAsyncTask(&self, name: &str, task: HostRuntimeAsyncTask) -> HostResult<()> {
+            self.scheduleHostRuntimeAsyncTask(name, task)
+        }
+        fn scheduleDelayedHostRuntimeTask(&self, _: &str, _: u64, task: HostRuntimeTask) -> HostResult<()> {
+            task();
+            Ok(())
+        }
+        fn waitForHostRuntimeDelay(&self, _: u64) -> HostRuntimeTurnFuture {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Builds a chat core whose queue store is empty and whose storage hosts are process-wide.
+    fn queueTestCore() -> ChatServiceCore {
+        let root = std::env::temp_dir().join(format!("operit-queue-attach-{}", uuid::Uuid::new_v4()));
+        let runtimeRoot = root.join("runtime");
+        let workspaceRoot = root.join("workspaces");
+        std::fs::create_dir_all(&runtimeRoot).unwrap();
+        let host = Arc::new(NativeRuntimeStorageHost::new(runtimeRoot, workspaceRoot));
+        setDefaultRuntimeStorageHost(host.clone());
+        setDefaultRuntimeSqliteHost(host.clone());
+        setDefaultHostRuntimeTaskSchedulerHost(Arc::new(QueueTestScheduler::default()));
+        let filesystem = VisualFileSystem::fromStorage(Arc::new(PosixFileSystemHost::new()), host).unwrap();
+        ChatServiceCore::new(ChatSelectionMode::FOLLOW_GLOBAL, Arc::new(filesystem))
+    }
+
+    fn sampleAttachment() -> AttachmentInfo {
+        AttachmentInfo::new(
+            "/tmp/queued-image.png".into(),
+            "queued-image.png".into(),
+            "image/png".into(),
+            42,
+        )
+    }
+
+    #[test]
+    fn enqueue_with_attachments_survives_until_the_chat_is_ready() {
+        let mut core = queueTestCore();
+        let chatId = "queue-chat".to_string();
+        core.messageProcessingDelegate.setChatExecutionStateForTest(chatId.clone(), ChatExecutionState {
+            taskTitle: None,
+            currentRound: 0,
+            isLoading: false,
+            inputProcessingState: InputProcessingState::Summarizing { message: "compressing".into() },
+        });
+        core.enqueuePendingQueueMessage(chatId.clone(), "look at this".into(), vec![sampleAttachment()]);
+        // A busy chat (here: compressing history) must not dequeue yet.
+        assert!(core.takeNextPendingQueueMessageIfReady(chatId.clone()).is_none());
+        core.messageProcessingDelegate.finishChatExecution(chatId.clone(), InputProcessingState::Completed);
+        let item = core.takeNextPendingQueueMessageIfReady(chatId.clone()).expect("ready chat dequeues");
+        assert_eq!(item.text, "look at this");
+        assert_eq!(item.attachments, vec![sampleAttachment()]);
+        assert!(core.takeNextPendingQueueMessageIfReady(chatId).is_none());
+    }
+
+    #[test]
+    fn restore_round_trip_preserves_attachments() {
+        let mut core = queueTestCore();
+        let chatId = "queue-chat".to_string();
+        core.enqueuePendingQueueMessage(chatId.clone(), "queued".into(), vec![sampleAttachment()]);
+        let item = core.takeNextPendingQueueMessageIfReady(chatId.clone()).expect("dequeues");
+        core.restorePendingQueueMessage(chatId.clone(), item.clone());
+        // Restoring re-inserts the item but leaves the queue disarmed so a rejected
+        // message cannot auto-fire again; the next submit re-arms it (see sendUserMessage).
+        core.pendingQueueStateFlow().update(|queues| {
+            if let Some(queue) = queues.get_mut(&chatId) { queue.wasBlocked = true; }
+        });
+        let restored = core.takeNextPendingQueueMessageIfReady(chatId).expect("re-dequeues");
+        assert_eq!(restored, item);
+        assert_eq!(restored.attachments, vec![sampleAttachment()]);
+    }
+
+    /// A newer pick must survive while the accepted attachment moves into the queue.
+    #[test]
+    fn enqueue_consumes_submitted_attachments_and_preserves_new_picks() {
+        let mut core = queueTestCore();
+        let chatId = "queue-chat".to_string();
+        core.chatHistoryDelegate.currentChatIdFlow.set_value(Some(chatId.clone()));
+        let submitted = sampleAttachment();
+        let mut newer = sampleAttachment();
+        newer.filePath = "/tmp/newer-image.png".into();
+        core.attachments = vec![submitted.clone(), newer.clone()];
+
+        core.enqueuePendingQueueMessage(chatId.clone(), "queued".into(), vec![submitted.clone()]);
+
+        assert_eq!(core.attachments(), vec![newer.clone()]);
+        let item = core.takeNextPendingQueueMessageIfReady(chatId).expect("dequeues");
+        assert_eq!(item.attachments, vec![submitted]);
+        // An upload finishing after enqueue also has no delayed Flutter clear to race with.
+        let mut later = newer.clone();
+        later.filePath = "/tmp/later-image.png".into();
+        core.attachments.push(later.clone());
+        assert_eq!(core.attachments(), vec![newer, later]);
+    }
+
+    /// A delayed enqueue for another chat must never consume the selected chat's composer.
+    #[test]
+    fn enqueue_for_another_chat_does_not_clear_current_attachments() {
+        let mut core = queueTestCore();
+        core.chatHistoryDelegate.currentChatIdFlow.set_value(Some("selected-chat".into()));
+        let attachment = sampleAttachment();
+        core.attachments = vec![attachment.clone()];
+
+        core.enqueuePendingQueueMessage("previous-chat".into(), "queued".into(), vec![attachment.clone()]);
+
+        assert_eq!(core.attachments(), vec![attachment.clone()]);
+        let item = core.takeNextPendingQueueMessageIfReady("previous-chat".into()).expect("dequeues");
+        assert_eq!(item.attachments, vec![attachment]);
+    }
+
+    /// Matching host path/name/size is insufficient when the file's owning node changed.
+    #[test]
+    fn enqueue_preserves_replaced_attachment_with_the_same_host_path() {
+        let mut core = queueTestCore();
+        let chatId = "queue-chat".to_string();
+        core.chatHistoryDelegate.currentChatIdFlow.set_value(Some(chatId.clone()));
+        let mut submitted = sampleAttachment();
+        submitted.nodeId = Some("node-a".into());
+        let mut replacement = submitted.clone();
+        replacement.nodeId = Some("node-b".into());
+        core.attachments = vec![replacement.clone()];
+
+        core.enqueuePendingQueueMessage(chatId, "queued".into(), vec![submitted]);
+
+        assert_eq!(core.attachments(), vec![replacement]);
+    }
+
+    /// Queueing text alone must not consume an attachment selected after the captured draft.
+    #[test]
+    fn enqueue_without_attachments_preserves_the_composer() {
+        let mut core = queueTestCore();
+        let chatId = "queue-chat".to_string();
+        core.chatHistoryDelegate.currentChatIdFlow.set_value(Some(chatId.clone()));
+        let attachment = sampleAttachment();
+        core.attachments = vec![attachment.clone()];
+
+        core.enqueuePendingQueueMessage(chatId, "queued".into(), vec![]);
+
+        assert_eq!(core.attachments(), vec![attachment]);
     }
 }

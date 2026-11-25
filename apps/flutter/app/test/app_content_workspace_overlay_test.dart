@@ -11,6 +11,73 @@ import 'package:operit2/ui/theme/OperitTheme.dart';
 
 /// Checks workspace attachment above the toolbar without recreating the chat.
 void main() {
+  testWidgets(
+    'returning from settings retains the chat draft and scroll position',
+    (tester) async {
+      final chat = RouteEntry(instanceId: 'chat', routeId: 'ai_chat');
+      final settings = RouteEntry(instanceId: 'settings', routeId: 'settings');
+      final router = AppRouterState(chat);
+      final layout = MainLayoutController();
+      final topBar = TopBarController();
+      final scroll = ScrollController();
+      addTearDown(router.dispose);
+      addTearDown(layout.dispose);
+      addTearDown(topBar.dispose);
+      addTearDown(scroll.dispose);
+
+      Future<void> show(RouteEntry entry, OperitScreen screen) async {
+        router.resetTo(entry);
+        await tester.pumpWidget(
+          OperitTheme(
+            initialThemePreferenceSnapshot:
+                UserPreferencesManager.defaultThemePreferenceSnapshot,
+            initialThemeIsReady: false,
+            unconfiguredChildEnabled: true,
+            hostInteractionHostsEnabled: false,
+            child: MainLayoutScope(
+              controller: layout,
+              child: AppContent(
+                routerState: router,
+                currentScreen: screen,
+                currentRouteEntry: entry,
+                currentRouteTitle: entry.routeId,
+                useTabletLayout: false,
+                isTabletSidebarExpanded: false,
+                canGoBack: false,
+                enableNavigationAnimation: true,
+                isNavigatingBack: false,
+                topBarController: topBar,
+                appBarEntries: const [],
+                onGoBack: () {},
+                onNavigationButtonPressed: () {},
+                onAppBarEntrySelected: (_) {},
+              ),
+            ),
+          ),
+        );
+        await tester.pump(const Duration(milliseconds: 300));
+        await tester.pumpAndSettle();
+      }
+
+      final chatScreen = _RetainedChatRoute(scroll);
+      await show(chat, chatScreen);
+      final composer = find.byType(TextField);
+      final state = tester.state(composer);
+      await tester.enterText(composer, 'Draft in progress');
+      scroll.jumpTo(400);
+      await tester.pump();
+
+      await show(settings, const _SettingsRoute());
+      expect(composer.hitTestable(), findsNothing);
+      await show(chat, chatScreen);
+      expect(tester.state(composer), same(state));
+      expect(find.text('Draft in progress'), findsOneWidget);
+      expect(scroll.offset, 400);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
+
   for (final width in [402.0, 900.0]) {
     testWidgets('workspace covers the toolbar and retains chat at $width', (
       tester,
@@ -120,6 +187,32 @@ void main() {
       await tester.pumpWidget(const SizedBox.shrink());
     });
   }
+}
+
+class _RetainedChatRoute extends AiChatScreenRoute {
+  const _RetainedChatRoute(this.scroll);
+
+  final ScrollController scroll;
+
+  @override
+  Widget build(BuildContext context) => Column(
+    children: [
+      Expanded(
+        child: ListView(
+          controller: scroll,
+          children: const [SizedBox(height: 2000)],
+        ),
+      ),
+      const TextField(),
+    ],
+  );
+}
+
+class _SettingsRoute extends OperitScreen {
+  const _SettingsRoute() : super(routeTypeName: 'Settings');
+
+  @override
+  Widget build(BuildContext context) => const Center(child: Text('Settings'));
 }
 
 class _ChatRoute extends OperitScreen {

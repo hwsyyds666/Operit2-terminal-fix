@@ -32,6 +32,7 @@ import 'package:operit2/ui/features/chat/components/style/input/common/InputProc
 import 'package:operit2/ui/features/chat/components/style/cursor/CursorStyleChatMessage.dart';
 import 'package:operit2/ui/features/chat/components/style/bubble/BubbleAiMessageComposable.dart';
 import 'package:operit2/ui/features/chat/viewmodel/ChatViewModel.dart';
+import 'package:operit2/ui/features/chat/viewmodel/ChatTranscriptController.dart';
 import 'package:operit2/ui/theme/OperitTheme.dart';
 
 /// Counts how many positions the owner controller holds at once.
@@ -50,6 +51,58 @@ class _PositionPeakController extends ScrollController {
 
 /// Verifies transcript rendering and scroll ownership across asynchronous updates.
 void main() {
+  testWidgets('keeps the previous body while a compact final row hydrates', (
+    tester,
+  ) async {
+    const index = 90001;
+    final previous = _heightTestMessageWithContent(index, 'Earlier body');
+    final finalBody = _heightTestMessageWithContent(index, 'Persisted body');
+    final compact = _aiMessage(
+      timestamp: previous.timestamp,
+      completedAt: 1,
+      parts: [],
+    );
+    final pending = Completer<ChatUiMessage?>();
+    final transcript = ChatTranscriptController(
+      readPage: (direction, cursor) async => ChatTranscriptPage(
+        messages: [compact],
+        hasOlder: false,
+        hasNewer: false,
+      ),
+      readMessage: (_) => pending.future,
+      visibleTimestamp: () => null,
+      followLatest: () => true,
+      onChanged: () {},
+      onError: (error) => fail(error.toString()),
+    );
+    final scroll = ScrollController();
+    final follow = ValueNotifier(true);
+    addTearDown(transcript.dispose);
+    addTearDown(scroll.dispose);
+    addTearDown(follow.dispose);
+    await transcript.load('latest');
+    Widget view(ChatUiMessage message) => _chatArea(
+      message: message,
+      transcript: transcript,
+      isLoading: false,
+      scrollController: scroll,
+      autoScrollToBottom: follow,
+    );
+    ChatUiMessage visibleBody() => tester
+        .widget<CursorStyleChatMessage>(find.byType(CursorStyleChatMessage))
+        .message;
+    await tester.pumpWidget(view(previous));
+    await tester.pumpAndSettle();
+    expect(visibleBody().parts.single.content, 'Earlier body');
+    await tester.pumpWidget(view(compact));
+    await tester.pumpAndSettle();
+    expect(visibleBody().parts.single.content, 'Earlier body');
+    pending.complete(finalBody);
+    await tester.pumpAndSettle();
+    expect(visibleBody().parts.single.content, 'Persisted body');
+    await tester.pumpWidget(const SizedBox());
+  });
+
   for (final tailOrigin in [false, true]) {
     testWidgets(
       'prepares bubbles before scrolling them into view, tail origin=$tailOrigin',
@@ -3460,6 +3513,7 @@ Widget _chatArea({
   _ScriptedGeneratedChatBridge? bridge,
   ChatUiMessage? message,
   List<ChatUiMessage>? messages,
+  ChatTranscriptController? transcript,
   required ScrollController scrollController,
   required ValueNotifier<bool> autoScrollToBottom,
   bool isLoading = true,
@@ -3480,6 +3534,7 @@ Widget _chatArea({
   final owner = bridge ?? _testChatBridge();
   final clients = GeneratedCoreProxyClients(owner);
   final chatArea = ChatArea(
+    transcript: transcript,
     messages:
         messages ??
         (message == null ? const <ChatUiMessage>[] : <ChatUiMessage>[message]),

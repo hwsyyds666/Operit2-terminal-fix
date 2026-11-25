@@ -40,20 +40,8 @@ impl ChatBackupDirectoryService {
     /// Verifies listing, writing, reading and cleanup without recreating a missing directory.
     pub fn checkDirectory(&self, directory: String) -> Result<(), String> {
         let root = self.directory(&directory)?;
-        self.files.listFiles(&root)?;
-        let name = format!(".operit-backup-probe-{}", uuid::Uuid::new_v4().simple());
-        let path = format!("{root}/{name}");
-        let checked = (|| {
-            self.files.writeFile(&path, &name, false)?;
-            if self.files.readFile(&path)? != name {
-                return Err("Backup directory write verification failed".into());
-            }
-            Ok(())
-        })();
-        if self.files.fileExists(&path)?.exists {
-            self.files.deleteFile(&path, false)?;
-        }
-        checked
+        let name = format!("operit-backup-probe-{}.sqlite", uuid::Uuid::new_v4().simple());
+        self.files.verifyWritableDirectory(&root, &name)
     }
 
     /// Closes the database, copies its file directly to the selected folder, and reopens it.

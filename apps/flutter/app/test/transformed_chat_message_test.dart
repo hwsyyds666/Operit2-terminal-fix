@@ -15,6 +15,7 @@ import 'package:operit2/ui/features/chat/components/ChatMessageExtent.dart';
 
 /// Retains projection requests so tests can complete them out of order.
 class _ProjectionBridge extends OperitRuntimeBridge {
+  bool transformsEnabled = true;
   final revisions = StreamController<CoreEvent>.broadcast(sync: true);
   final requests = <Map<String, Object?>>[];
   final completions = <Completer<Uint8List>>[];
@@ -23,6 +24,9 @@ class _ProjectionBridge extends OperitRuntimeBridge {
   /// Captures the exact source snapshot passed through the real generated client.
   @override
   Future<Uint8List> callBytes(CoreCallRequest request) {
+    if (request.methodName == 'hasDisplayMessageTransforms') {
+      return Future.value(encodeCoreLink([0, transformsEnabled]));
+    }
     expect(request.methodName, 'projectMessagesForDisplay');
     requests.add(Map<String, Object?>.from(request.args as Map));
     final pending = Completer<Uint8List>();
@@ -139,6 +143,19 @@ ChatMessage _message([
 
 /// Exercises actual generated projection requests, revision watches, and widget lifetime.
 void main() {
+  testWidgets('renders without projection when display transforms are disabled', (tester) async {
+    final bridge = _ProjectionBridge()..transformsEnabled = false;
+    addTearDown(bridge.revisions.close);
+    final clients = GeneratedCoreProxyClients(bridge);
+    final cache = MessageTransformCache(clients);
+    addTearDown(cache.dispose);
+    await tester.pump();
+    await tester.pumpWidget(_rows(clients, [_message()], cache: cache, depthAnchor: 42));
+    await tester.pump();
+    expect(find.text('canonical'), findsOneWidget);
+    expect(bridge.requests, isEmpty);
+    await tester.pumpWidget(const SizedBox());
+  });
   testWidgets(
     'preserves measured bubble height while display projection waits',
     (tester) async {

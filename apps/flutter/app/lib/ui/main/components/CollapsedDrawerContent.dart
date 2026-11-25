@@ -935,7 +935,7 @@ class _ConversationMoreMenuButton extends StatelessWidget {
         const SidebarMenuAction(
           value: _ConversationQuickAction.bindWorkspace,
           icon: Icons.folder_open_outlined,
-          label: '项目绑定',
+          label: '更换工作区',
         ),
         SidebarMenuAction(
           value: _ConversationQuickAction.togglePinned,

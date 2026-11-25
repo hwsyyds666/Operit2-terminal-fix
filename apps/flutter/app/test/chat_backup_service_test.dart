@@ -72,7 +72,7 @@ void main() {
 
   for (final brightness in Brightness.values) {
     testWidgets(
-      'missing directory shows an opaque $brightness dialog and returns to the mounted app after selection',
+      'missing or inaccessible backup directory leaves the $brightness application usable',
       (tester) async {
         final storage = _DirectoryStorage();
         final service = ChatBackupService(
@@ -99,33 +99,10 @@ void main() {
           ),
         );
         await tester.pumpAndSettle();
-        expect(find.text('选择你的备份目录'), findsOneWidget);
-        expect(find.byType(Dialog), findsOneWidget);
-        final barrier = tester.widget<ModalBarrier>(
-          find.descendant(
-            of: find.byType(ChatBackupHost),
-            matching: find.byType(ModalBarrier),
-          ),
-        );
-        expect(barrier.dismissible, isFalse);
-        expect(barrier.color!.a, greaterThan(0));
-        final surface = tester.widget<Material>(
-          find
-              .descendant(
-                of: find.byType(Dialog),
-                matching: find.byType(Material),
-              )
-              .first,
-        );
-        expect(surface.color, theme.colorScheme.surfaceContainerHigh);
-        expect(surface.color!.a, 1);
-        await tester.tapAt(const Offset(4, 4));
-        await tester.pumpAndSettle();
-        expect(find.text('选择你的备份目录'), findsOneWidget);
+        expect(find.byType(Dialog), findsNothing);
+        expect(find.text('Existing application'), findsOneWidget);
         await tester.runAsync(() async {
-          await tester.tap(find.text('选择备份目录'));
-          // Drain the channel write and the panel's unawaited initial backup.
-          await Future<void>.delayed(Duration.zero);
+          expect(await service.selectDirectory(), isTrue);
           await service.checkAndBackup();
         });
         await tester.pumpAndSettle();
@@ -134,16 +111,8 @@ void main() {
         storage.available = false;
         await tester.runAsync(service.checkAndBackup);
         await tester.pumpAndSettle();
-        expect(find.text('选择你的备份目录'), findsOneWidget);
-        tester.view.physicalSize = const Size(360, 480);
-        tester.view.devicePixelRatio = 1;
-        addTearDown(tester.view.resetPhysicalSize);
-        addTearDown(tester.view.resetDevicePixelRatio);
-        await tester.pumpAndSettle();
-        await tester.ensureVisible(find.text('稍后设置'));
-        await tester.tap(find.text('稍后设置'));
-        await tester.pumpAndSettle();
         expect(find.byType(Dialog), findsNothing);
+        expect(service.needsDirectory, isTrue);
         expect(find.text('Existing application'), findsOneWidget);
         expect(tester.takeException(), isNull);
         await tester.pumpWidget(const SizedBox.shrink());
@@ -162,6 +131,30 @@ void main() {
       expect(await service.selectDirectory(), isFalse);
       expect(service.needsDirectory, isTrue);
       expect(manager.config.chatBackupDirectory, isNull);
+      service.dispose();
+    },
+  );
+
+  test(
+    'existing SAF backup binding remains usable without opening a new selector',
+    () async {
+      const legacyPath = '/virtual/android/documents/existing-grant';
+      final record = jsonEncode({
+        'path': legacyPath,
+        'label': 'Existing SAF backups',
+      });
+      await manager.saveChatBackupDirectory(record);
+      final storage = _DirectoryStorage()
+        ..selectFailure = StateError(
+          'Existing bindings must not reopen a selector',
+        );
+      final service = ChatBackupService(storage: storage);
+      await service.checkAndBackup();
+      expect(service.directory!.path, legacyPath);
+      expect(service.needsDirectory, isFalse);
+      expect(storage.creates, 1);
+      expect(storage.lists, [legacyPath]);
+      expect(manager.config.chatBackupDirectory, record);
       service.dispose();
     },
   );
@@ -264,10 +257,10 @@ void main() {
       await tester.tap(find.text('选择备份目录'));
       await tester.pumpAndSettle();
       expect(
-        find.text('无法使用所选文件夹。请在可用的文件夹（如“文档”或“下载”）下新建目录，并选择该目录。'),
+        find.textContaining('无法使用所选文件夹'),
         findsOneWidget,
       );
-      expect(find.textContaining('Directory access denied'), findsNothing);
+      expect(find.textContaining('Directory access denied'), findsOneWidget);
       expect(selections, 0);
       expect(manager.config.chatBackupDirectory, isNull);
       expect(find.text('选择备份目录'), findsOneWidget);
@@ -678,15 +671,13 @@ class _ChatBridge extends OperitRuntimeBridge {
       throw UnimplementedError();
 }
 
-/// Supplies the same platform-neutral resource descriptor used by workspace folder selection.
+/// Supplies an authorized local source without invoking a workspace document picker.
 class _ExternalFolderPicker extends OperitFolderAccessPlatform {
   int selections = 0;
 
   /// Returns an authorized resource without exposing a native filesystem path.
   @override
-  Future<FolderMountSource?> pickWorkspaceDirectory({
-    String? initialDirectory,
-  }) async {
+  Future<FolderMountSource?> pickLocalDirectory() async {
     selections++;
     return const FolderMountSource(
       backend: 'test_documents',
@@ -695,6 +686,12 @@ class _ExternalFolderPicker extends OperitFolderAccessPlatform {
       name: 'External backups',
     );
   }
+
+  /// Rejects accidental reuse of the system document-tree selector for backups.
+  @override
+  Future<FolderMountSource?> pickWorkspaceDirectory({
+    String? initialDirectory,
+  }) => throw StateError('Backups must use local directory selection');
 
   /// Rejects physical-path selection because backups must use resource mounts.
   @override

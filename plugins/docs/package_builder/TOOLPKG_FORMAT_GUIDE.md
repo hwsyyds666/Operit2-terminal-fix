@@ -505,6 +505,12 @@ exports.onInputMenuToggle = onInputMenuToggle;
 | `ToolPkg.registerXmlRenderPlugin` | `function` | 是 | 函数引用（支持箭头函数） |
 | `ToolPkg.registerInputMenuTogglePlugin` | `id` | 是 | 输入菜单开关插件唯一标识 |
 | `ToolPkg.registerInputMenuTogglePlugin` | `function` | 是 | 函数引用（支持箭头函数） |
+| `ToolPkg.registerCoreCommand` | `id` | 是 | 斜杠命令唯一标识 |
+| `ToolPkg.registerCoreCommand` | `name` | 是 | 命令名（不含 `/`，不得含空白） |
+| `ToolPkg.registerCoreCommand` | `title` / `description` | 是 | 命令标题与描述（支持 `LocalizedText`） |
+| `ToolPkg.registerCoreCommand` | `usage` | 是 | 命令用法说明，如 `/goal <objective>`；展示仍以 `usage` 为准 |
+| `ToolPkg.registerCoreCommand` | `args` | 否 | 结构化参数声明数组，供命令补全使用；省略或为空表示传统命令，宿主继续解析 `usage`。每项含 `name`（参数名）、`required`（是否必需，缺省 `true`）、`options`（可选字面量列表）。示例：`args: [{ name: "objective", required: true, options: ["set", "edit", "pause"] }]`。若 `args` 与 `usage` 不一致，消费方优先采用 `args` |
+| `ToolPkg.registerCoreCommand` | `function` | 是 | 函数引用（支持箭头函数） |
 
 > **函数引用必须来自模块导出**：上表的 `function`（以及 `registerCoreCommand` 等注册的 `function`）必须传一个**已导出的函数**——可以是当前入口模块的导出（先 `exports.onX = onX`，再传 `onX`），也可以是 `require(...)` 引入模块的导出。直接传未导出的局部函数或内联箭头函数会报 `requires an exported ToolPkg function reference`。箭头函数本身可用，但同样要先导出再传入。
 
@@ -522,6 +528,21 @@ exports.onInputMenuToggle = onInputMenuToggle;
 - `activity_on_pause`
 - `activity_on_stop`
 - `activity_on_destroy`
+
+应用级前后台由宿主统一判断，插件只使用上面的 `registerAppLifecycleHook`：
+
+| 事件 | 产品含义 |
+| --- | --- |
+| `application_on_create` | 当前 runtime 初始化；插件后启用时回放 |
+| `application_on_foreground` | 主界面显示：桌面窗口显示且未最小化，移动端场景可见，Web 标签页可见 |
+| `application_on_background` | 主界面收起：桌面最小化／隐藏／关闭后进程继续运行，移动端退后台，Web 标签页隐藏 |
+| `application_on_terminate` | runtime 有机会报告的正常终止；系统强杀时不保证收到 |
+
+失焦、输入法、系统弹窗、被其他窗口遮挡和插件辅助窗口都不改变应用级前后台。
+注册激活时按创建、当前前台或后台的顺序回放，不回放过期的前台状态；重复状态不重复通知。
+宿主尚未报告可见状态时不猜测前后台。`detached` 只代表 Flutter 视图分离，不代表 runtime 终止。
+Android 的 `activity_*` 仍表达 Activity 事实；跨平台产品行为应使用 `application_*`。
+普通插件不需要同时订阅 `registerHostEventHook` 的原始生命周期广播，也不需要按系统分别判断。
 
 **Compose DSL 运行时**：
 - 使用 JavaScript 编写声明式 UI

@@ -104,10 +104,11 @@ gboolean CloseWindow(gpointer data) {
 
 /// Sizes a host-sized surface to the primary monitor's full geometry.
 void FillDisplay(GtkWindow* window) {
-  GdkScreen* screen = gtk_window_get_screen(window);
+  GdkDisplay* display = gtk_widget_get_display(GTK_WIDGET(window));
+  GdkMonitor* monitor = gdk_display_get_primary_monitor(display);
+  if (monitor == nullptr) monitor = gdk_display_get_monitor_at_window(display, gtk_widget_get_window(GTK_WIDGET(window)));
   GdkRectangle bounds;
-  const int primary = gdk_screen_get_primary_monitor(screen);
-  gdk_screen_get_monitor_geometry(screen, primary >= 0 ? primary : 0, &bounds);
+  gdk_monitor_get_geometry(monitor, &bounds);
   gtk_window_move(window, bounds.x, bounds.y);
   gtk_window_resize(window, bounds.width, bounds.height);
 }
@@ -135,6 +136,11 @@ void ApplyBounds(GtkWindow* window, FlValue* args) {
 /// Applies geometry and input policy to this GTK surface.
 void Apply(WidgetHost* host, GtkWindow* window, FlValue* args) {
   if (!args || fl_value_get_type(args) != FL_VALUE_TYPE_MAP) throw std::invalid_argument("Expected window options");
+  if (FlValue* value = fl_value_lookup_string(args, "fill")) {
+    if (fl_value_get_type(value) != FL_VALUE_TYPE_BOOL) throw std::invalid_argument("fill must be boolean");
+    host->fill = fl_value_get_bool(value);
+    host->screen_bounded = false;
+  }
   if (FlValue* value = fl_value_lookup_string(args, "draggable")) {
     if (fl_value_get_type(value) != FL_VALUE_TYPE_BOOL) throw std::invalid_argument("draggable must be boolean");
     host->draggable = fl_value_get_bool(value);

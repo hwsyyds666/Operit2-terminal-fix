@@ -10,12 +10,11 @@ Future<String?> sidebarNewChatWorkspaceId({
   required List<core_proxy.ChatHistoryListItem> histories,
   required String? currentChatId,
 }) async {
-  final tabId = await UserPreferencesManager(
+  final id = await UserPreferencesManager(
     clients: clients,
-  ).loadChatSidebarTab();
-  if (tabId != UserPreferencesManager.CHAT_SIDEBAR_WORKSPACE_TAB) return null;
-  for (final history in histories) {
-    if (history.id == currentChatId) return history.workspaceId;
-  }
-  return null;
+  ).loadDefaultWorkspaceId();
+  if (id == null) return null;
+  return (await clients.repositoryWorkspacePreferenceStore.getById(
+    workspaceId: id,
+  ))?.id;
 }

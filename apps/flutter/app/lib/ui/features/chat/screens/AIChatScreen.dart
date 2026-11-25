@@ -43,12 +43,13 @@ import '../components/style/input/common/MentionTokenUtils.dart';
 import '../components/style/input/common/PendingQueueMessageItem.dart';
 import '../components/workspace/ChatContextStatsTopBarButton.dart';
 import '../components/workspace/WorkspaceLayoutMetrics.dart';
+import '../components/workspace/WorkspaceSession.dart';
 import '../components/workspace/WorkspaceTopBarButton.dart';
 import '../../../../core/host/LocalSpeechRecorder.dart';
 import '../viewmodel/ChatSelectionTransition.dart';
 import '../viewmodel/ChatViewModel.dart';
+import '../viewmodel/ChatTranscriptController.dart';
 
-bool _chatWorkspaceOpen = false;
 const String _localSttLogTag = 'LocalSTT';
 const String _packageAttachmentPrefix = 'package_attach:';
 const String _workspaceMentionAttachmentPrefix = 'workspace_mention:';
@@ -298,7 +299,12 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
   final _messageNavigation = ChatMessageNavigationController();
   final LocalSpeechRecorder _speechRecorder = LocalSpeechRecorder();
   late final Map<String?, TextEditingValue> _inputDraftsByChatId;
-  final List<ChatUiMessage> _messages = <ChatUiMessage>[];
+  List<ChatUiMessage> _messages = const [];
+  String? _messagesChatId;
+  ChatTranscriptController? _transcript;
+  StreamSubscription<List<core_proxy.ChatTranscriptChange>>?
+  _transcriptSubscription;
+  final _pluginMessages = Expando<Map<String, Object?>>();
   List<AttachmentInfo> _attachments = const <AttachmentInfo>[];
   Set<String>? _attachmentHostCapabilities;
   late final ValueNotifier<_ChatContentData> _chatContentDataNotifier;
@@ -355,6 +361,7 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
   bool _isPreparingChatSwitch = false;
   String? _pendingChatSwitchTargetId;
   late bool _workspaceOpen;
+  late WorkspaceSession _workspaceSession;
   bool _isCurrentMainScreen = true;
   bool _topBarActionsUpdateScheduled = false;
   bool _pendingQueueEnqueueInFlight = false;
@@ -382,9 +389,10 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
     );
     _autoScrollToBottomNotifier = ValueNotifier<bool>(_autoScrollToBottom);
     _toastMessageNotifier = ValueNotifier<String?>(_toastMessage);
-    _workspaceOpen = _chatWorkspaceOpen;
+    _workspaceSession = WorkspaceShell.session;
+    _workspaceOpen = _workspaceSession.isOpen;
     if (!widget.embedded) {
-      WorkspaceShell.session.onOpenRequested = _openWorkspace;
+      _workspaceSession.onOpenRequested = _openWorkspace;
     }
     _watchChatFlows();
     _watchToastEvent();
@@ -460,6 +468,8 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
     _toastMessageNotifier.dispose();
     _currentChatIdSubscription?.cancel();
     _messagesSubscription?.cancel();
+    _transcriptSubscription?.cancel();
+    _transcript?.dispose();
     _chatStateSubscription?.cancel();
     _toastEventSubscription?.cancel();
     _workspacesSubscription?.cancel();
@@ -472,8 +482,8 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
     _mainLayoutController?.clearWorkspaceDockDestination(
       owner: _mainLayoutOwner,
     );
-    if (WorkspaceShell.session.onOpenRequested == _openWorkspace) {
-      WorkspaceShell.session.onOpenRequested = null;
+    if (_workspaceSession.onOpenRequested == _openWorkspace) {
+      _workspaceSession.onOpenRequested = null;
     }
     super.dispose();
   }
@@ -1021,12 +1031,18 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
       return;
     }
     _pendingQueueEnqueueInFlight = true;
+    final submittedAttachments = _attachments;
     try {
       await _viewModel.enqueuePendingQueueMessage(
         chatId: chatId,
         messageText: draftText,
+        attachments: submittedAttachments,
       );
       _clearSubmittedDraft(chatId, draftText);
+      if (!mounted || _currentChatId != chatId) {
+        return;
+      }
+      await _refreshAttachments();
       if (!mounted || _currentChatId != chatId) {
         return;
       }
@@ -1214,7 +1230,7 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
       text: queuedText,
       selectionStart: queuedText.length,
       selectionEnd: queuedText.length,
-      attachments: const [],
+      attachments: item.attachments,
       replyToMessageTimestamp: null,
     );
     if (decision != null) {
@@ -1279,6 +1295,7 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
     await _viewModel.sendUserMessage(
       queuedText.trim(),
       chatIdOverride: queueChatId,
+      attachmentsOverride: item.attachments,
     );
     if (mounted && _currentChatId == queueChatId) {
       await _refreshAttachments();
@@ -1319,9 +1336,11 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
     _toastMessageNotifier.value = message;
   }
 
+  /// Publishes a composer snapshot only while its requesting chat remains selected.
   Future<void> _refreshAttachments() async {
+    final chatId = _currentChatId;
     final attachments = await _viewModel.attachments();
-    if (!mounted) {
+    if (!mounted || _currentChatId != chatId) {
       return;
     }
     _attachments = attachments;
@@ -1716,6 +1735,10 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
     final previousChatStateSubscription = _chatStateSubscription;
     _messagesSubscription = null;
     _chatStateSubscription = null;
+    unawaited(_transcriptSubscription?.cancel());
+    _transcriptSubscription = null;
+    _transcript?.dispose();
+    _transcript = null;
     // Native watch shutdown waits for the routed stream task to observe its
     // close signal.  It must not delay opening the replacement chat watches.
     if (previousMessagesSubscription != null) {
@@ -1748,40 +1771,112 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
         _mutateChatContentData(() {
           _clearChatFlowError();
           _loading = false;
-          _messages.clear();
-          WorkspaceShell.session.pluginHostState = const {};
+          _messages = const [];
           _currentChatId = null;
+          _currentWorkspacePath = null;
+          _currentFileDirectory = null;
+          _selectWorkspaceSession();
+          if (!widget.embedded) {
+            _workspaceSession.pluginHostState = const {};
+          }
           _inputProcessingState = core_proxy.InputProcessingState.idle();
         });
+        setState(() {});
+        _updateTopBarActions();
+        _mainLayoutController?.refreshAttachment(owner: _mainLayoutOwner);
       }
       return;
     }
-    _messagesSubscription = _viewModel
-        .watchMessages(chatId)
-        .listen(
-          (messages) {
-            if (generation == _chatFlowBindingGeneration &&
-                _requestedChatFlowChatId == chatId) {
-              if (!firstMessagesLogged && switchTimer != null) {
-                firstMessagesLogged = true;
-                ClientLogger.v(
-                  'chat_switch.messages_received chatId=$chatId elapsedMs=${switchTimer.elapsedMilliseconds} count=${messages.length}',
-                  tag: 'ChatSwitchTrace',
-                  verboseLevel: VerboseLevel.level2,
-                );
+    bool isCurrent() =>
+        mounted &&
+        generation == _chatFlowBindingGeneration &&
+        _requestedChatFlowChatId == chatId;
+
+    void watchLegacyMessages() {
+      if (!isCurrent()) return;
+      _messagesSubscription = _viewModel
+          .watchMessages(chatId)
+          .listen(
+            (messages) {
+              if (generation == _chatFlowBindingGeneration &&
+                  _requestedChatFlowChatId == chatId) {
+                if (!firstMessagesLogged && switchTimer != null) {
+                  firstMessagesLogged = true;
+                  ClientLogger.v(
+                    'chat_switch.messages_received chatId=$chatId elapsedMs=${switchTimer.elapsedMilliseconds} count=${messages.length}',
+                    tag: 'ChatSwitchTrace',
+                    verboseLevel: VerboseLevel.level2,
+                  );
+                }
+                _applyMessages(messages);
               }
-              _applyMessages(messages);
-            }
-          },
-          onError: (Object error, StackTrace stackTrace) {
-            _handleBoundChatFlowError(
-              error: error,
-              stackTrace: stackTrace,
-              chatId: chatId,
-              generation: generation,
-            );
-          },
-        );
+            },
+            onError: (Object error, StackTrace stackTrace) {
+              _handleBoundChatFlowError(
+                error: error,
+                stackTrace: stackTrace,
+                chatId: chatId,
+                generation: generation,
+              );
+            },
+          );
+    }
+
+    unawaited(() async {
+      var local = false;
+      try {
+        final route = await _viewModel.clients.serverCoreNodeRouter
+            .bindingRouteStatus(key: chatId);
+        local = route.ownerIsLocal;
+      } catch (_) {
+        // Older runtimes and unresolved bindings use the established watch.
+      }
+      if (!isCurrent()) return;
+      if (!local) {
+        watchLegacyMessages();
+        return;
+      }
+      final chat = _viewModel.transcriptCore;
+      final transcript = ChatTranscriptController(
+        readPage: (direction, timestamp) => chat.loadTranscriptPage(
+          chatId: chatId,
+          direction: direction,
+          timestamp: timestamp,
+        ),
+        readMessage: (timestamp) =>
+            chat.loadTranscriptMessage(chatId: chatId, timestamp: timestamp),
+        visibleTimestamp: () => _messageNavigation.visibleTimestamp,
+        followLatest: () => _autoScrollToBottom,
+        onChanged: () {
+          final current = _transcript;
+          if (!isCurrent() || current == null) return;
+          _hasOlderDisplayHistory = current.hasOlder;
+          _hasNewerDisplayHistory = current.hasNewer;
+          _isLoadingDisplayWindow = false;
+          _applyMessages(current.messages);
+        },
+        onError: (error) {
+          if (isCurrent()) _showLocalToast(error.toString());
+        },
+      );
+      _transcript = transcript;
+      void fallBack() {
+        if (!isCurrent() || !identical(_transcript, transcript)) return;
+        transcript.dispose();
+        _transcript = null;
+        unawaited(_transcriptSubscription?.cancel());
+        _transcriptSubscription = null;
+        watchLegacyMessages();
+      }
+
+      _transcriptSubscription = chat
+          .watchTranscriptChanges(chatId: chatId)
+          .listen(
+            transcript.accept,
+            onError: (Object error) => fallBack(),
+            onDone: fallBack,
+          );
+    }());
     _chatStateSubscription = _viewModel
         .watchChatState(chatId)
         .listen(
@@ -1816,13 +1911,9 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
     if (!mounted) {
       return;
     }
-    _messages
-      ..clear()
-      ..addAll(messages);
-    WorkspaceShell.session.pluginHostState = {
-      'chatId': _currentChatId,
-      'messages': [for (final message in messages) pluginMessageState(message)],
-    };
+    _messages = messages;
+    _messagesChatId = _requestedChatFlowChatId;
+    _publishWorkspaceMessageState(_requestedChatFlowChatId);
     if (_selectedMessageTimestamps.isNotEmpty) {
       final selectableTimestamps = messages
           .where((message) {
@@ -1838,6 +1929,53 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
     _publishChatContentData();
     _scheduleScrollToBottom();
   }
+
+  void _publishWorkspaceMessageState(String? chatId) {
+    if (widget.embedded) return;
+    final messages = _messagesChatId == chatId
+        ? _messages
+        : const <ChatUiMessage>[];
+    final session = _workspaceSession;
+    final transcript = _transcript;
+    Map<String, Object?> snapshot(List<ChatUiMessage> rows) => {
+      'chatId': chatId,
+      'messages': [
+        for (final row in rows)
+          _pluginMessages[row] ??= pluginMessageState(row),
+      ],
+    };
+    session.updatePluginHostState(() {
+      if (transcript != null && messages.any(_transcriptBodyDeferred)) {
+        unawaited(() async {
+          final rows = <ChatUiMessage>[];
+          for (final row in messages) {
+            if (!mounted ||
+                !identical(_messages, messages) ||
+                !identical(_transcript, transcript))
+              return;
+            rows.add(
+              _transcriptBodyDeferred(row)
+                  ? await transcript
+                            .hydrate(row)
+                            .catchError((Object _) => null) ??
+                        row
+                  : row,
+            );
+          }
+          if (mounted &&
+              identical(_workspaceSession, session) &&
+              identical(_messages, messages) &&
+              identical(_transcript, transcript)) {
+            session.pluginHostState = snapshot(rows);
+          }
+        }());
+      }
+      return snapshot(messages);
+    });
+  }
+
+  bool _transcriptBodyDeferred(ChatUiMessage message) =>
+      message.parts.isEmpty && message.contentStream == null;
 
   /// Applies a locally requested visual transition before routed Core state arrives.
   void _onChatSelectionTransition() {
@@ -1883,10 +2021,6 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
     if (chatChanged) {
       _saveCurrentInputDraft();
       _currentChatId = state.currentChatId;
-      WorkspaceShell.session.pluginHostState = {
-        'chatId': state.currentChatId,
-        'messages': const <Object?>[],
-      };
       _isMultiSelectMode = false;
       _selectedMessageTimestamps = const <int>{};
       _restoreInputDraftForChat(state.currentChatId);
@@ -1898,6 +2032,10 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
     }
     _currentWorkspacePath = state.currentWorkspacePath;
     _currentFileDirectory = state.currentFileDirectory;
+    _selectWorkspaceSession();
+    if (chatChanged || workspaceChanged) {
+      _publishWorkspaceMessageState(state.currentChatId);
+    }
     final chatFlowErrorMessage = _chatFlowErrorMessage;
     if (_chatFlowError != null) {
       _loading = false;
@@ -1908,9 +2046,12 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
       _loading = state.isLoading;
       _inputProcessingState = state.inputProcessingState;
     }
-    _hasOlderDisplayHistory = state.hasOlderDisplayHistory;
-    _hasNewerDisplayHistory = state.hasNewerDisplayHistory;
-    _isLoadingDisplayWindow = state.isLoadingDisplayWindow;
+    _hasOlderDisplayHistory =
+        _transcript?.hasOlder ?? state.hasOlderDisplayHistory;
+    _hasNewerDisplayHistory =
+        _transcript?.hasNewer ?? state.hasNewerDisplayHistory;
+    _isLoadingDisplayWindow =
+        _transcript == null && state.isLoadingDisplayWindow;
     _toolPermissionRequests = state.toolPermissionRequests;
     if (_pendingChatSwitchTargetId == state.currentChatId) {
       _pendingChatSwitchTargetId = null;
@@ -2120,10 +2261,12 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
     if (busyMode == _BusyDraftSendMode.interrupt) {
       await _viewModel.cancelMessage(chatId);
     }
+    final outgoingDraft = _messageController.value;
+    final reply = _replyToMessage;
     _clearMentionSuggestionState();
     _messageController.clear();
     _inputFocusNode.unfocus();
-    _startSendMessageText(submittedText, chatId);
+    _startSendMessageText(submittedText, chatId, outgoingDraft, reply);
   }
 
   /// Starts or stops local speech input from the chat action button.
@@ -2220,7 +2363,12 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
   }
 
   /// Starts one send while retaining the chat id that accepted the submit hook.
-  void _startSendMessageText(String text, String chatId) {
+  void _startSendMessageText(
+    String text,
+    String chatId,
+    TextEditingValue draft,
+    ChatUiMessage? reply,
+  ) {
     if (_currentChatId != chatId) {
       return;
     }
@@ -2234,17 +2382,17 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
       );
     });
     _scheduleScrollToBottom();
-    _sendMessageAfterNextFrame(text, chatId);
+    unawaited(_sendSubmittedMessage(text, chatId, draft, reply));
   }
 
   /// Requests the latest display window before ChatArea follows layout growth.
   void _scheduleScrollToBottom() {
-    if (!_autoScrollToBottom) {
+    if (!_autoScrollToBottom || (_transcript?.loading ?? false)) {
       return;
     }
     if (_hasNewerDisplayHistory && !_isLoadingDisplayWindow) {
       unawaited(
-        _viewModel.showLatestMessagesForCurrentChat().catchError((
+        _showLatestDisplayWindow().catchError((
           Object error,
           StackTrace stackTrace,
         ) {
@@ -2255,44 +2403,41 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
     }
   }
 
-  /// Sends the submitted text after layout has accepted the optimistic UI state.
-  void _sendMessageAfterNextFrame(String text, String chatId) {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) {
+  Future<void> _sendSubmittedMessage(
+    String text,
+    String chatId,
+    TextEditingValue draft,
+    ChatUiMessage? reply,
+  ) async {
+    try {
+      await _viewModel.sendUserMessage(
+        text,
+        replyToMessage: reply,
+        chatIdOverride: chatId,
+      );
+    } catch (error) {
+      if (!mounted) return;
+      if (_currentChatId != chatId) {
+        if (_inputDraftsByChatId[chatId]?.text.isNotEmpty != true) {
+          _inputDraftsByChatId[chatId] = draft;
+        }
         return;
       }
-      _viewModel
-          .sendUserMessage(
-            text,
-            replyToMessage: _replyToMessage,
-            chatIdOverride: chatId,
-          )
-          .then((_) async {
-            if (!mounted || _currentChatId != chatId) {
-              return null;
-            }
-            _replyToMessage = null;
-            await _refreshAttachments();
-            return null;
-          })
-          .catchError((Object error, StackTrace stackTrace) {
-            debugPrint('Failed to send chat message: $error\n$stackTrace');
-            if (!mounted) {
-              return null;
-            }
-            if (_currentChatId != chatId) {
-              return null;
-            }
-            _mutateChatContentData(() {
-              _errorMessage = error.toString();
-              _loading = false;
-              _inputProcessingState = core_proxy.InputProcessingState.error(
-                message: error.toString(),
-              );
-            });
-            return null;
-          });
-    });
+      if (_messageController.text.isEmpty) {
+        _messageController.value = draft;
+      }
+      _mutateChatContentData(() {
+        _errorMessage = error.toString();
+        _loading = false;
+        _inputProcessingState = core_proxy.InputProcessingState.error(
+          message: error.toString(),
+        );
+      });
+      return;
+    }
+    if (!mounted || _currentChatId != chatId) return;
+    if (identical(_replyToMessage, reply)) _replyToMessage = null;
+    await _refreshAttachments();
   }
 
   /// Cancels the active turn for the selected chat.
@@ -2587,15 +2732,33 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
   }
 
   Future<void> _loadOlderDisplayWindow() async {
-    await _viewModel.loadOlderMessagesForCurrentChat();
+    await (_transcript?.load('older') ??
+        _viewModel.loadOlderMessagesForCurrentChat());
   }
 
   Future<void> _loadNewerDisplayWindow() async {
-    await _viewModel.loadNewerMessagesForCurrentChat();
+    await (_transcript?.load('newer') ??
+        _viewModel.loadNewerMessagesForCurrentChat());
   }
 
   Future<void> _showLatestDisplayWindow() async {
-    await _viewModel.showLatestMessagesForCurrentChat();
+    await (_transcript?.load('latest') ??
+        _viewModel.showLatestMessagesForCurrentChat());
+  }
+
+  Future<bool> _revealTranscriptMessage(int timestamp) async {
+    final transcript = _transcript;
+    if (transcript == null)
+      return _viewModel.revealMessageForCurrentChat(timestamp);
+    try {
+      final found = await transcript.reveal(timestamp);
+      return found && identical(transcript, _transcript);
+    } catch (error) {
+      if (mounted && identical(transcript, _transcript)) {
+        _showLocalToast(error.toString());
+      }
+      return false;
+    }
   }
 
   /// Requests display context after a durable plugin or package catalog change.
@@ -2746,17 +2909,33 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
     });
   }
 
+  /// Activates the selected chat's local workspace navigation and visibility.
+  void _selectWorkspaceSession() {
+    if (widget.embedded) return;
+    final next = WorkspaceShell.sessions.select(
+      workspacePath: _currentWorkspacePath,
+      chatId: _currentChatId,
+    );
+    if (identical(next, _workspaceSession)) return;
+    _workspaceSession.onOpenRequested = null;
+    _workspaceSession = next;
+    _workspaceSession.onOpenRequested = _openWorkspace;
+    _workspaceOpen = next.isOpen;
+  }
+
+  /// Toggles visibility for the selected workspace.
   void _toggleWorkspace() {
     _setWorkspaceOpen(!_workspaceOpen);
   }
 
+  /// Records visibility in the selected workspace's process-local session.
   void _setWorkspaceOpen(bool value) {
     if (_workspaceOpen == value) {
       return;
     }
     setState(() {
       _workspaceOpen = value;
-      _chatWorkspaceOpen = value;
+      _workspaceSession.isOpen = value;
     });
     _updateTopBarActions();
     _mainLayoutController?.refreshAttachment(owner: _mainLayoutOwner);
@@ -2852,6 +3031,7 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
         final content = ChatScreenContent(
           showInput: widget.showInput,
           messages: data.messages,
+          transcript: _transcript,
           loading: data.loading,
           errorMessage: data.errorMessage,
           messageController: _messageController,
@@ -2873,7 +3053,7 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
           isLoadingDisplayWindow: data.isLoadingDisplayWindow,
           messageNavigation: _messageNavigation,
           loadLocatorEntries: _loadMessageLocatorEntries,
-          onRevealMessageForLocator: _viewModel.revealMessageForCurrentChat,
+          onRevealMessageForLocator: _revealTranscriptMessage,
           onAutoScrollToBottomChanged: _setAutoScrollToBottom,
           onLoadOlderDisplayWindow: _loadOlderDisplayWindow,
           onLoadNewerDisplayWindow: _loadNewerDisplayWindow,
@@ -2895,7 +3075,7 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
           onSelectAllMessages: _selectAllMessages,
           onClearMessageSelection: _clearMessageSelection,
           onDeleteSelectedMessages: _deleteSelectedMessages,
-          onRefreshRequested: _viewModel.showLatestMessagesForCurrentChat,
+          onRefreshRequested: _showLatestDisplayWindow,
           isMultiSelectMode: data.isMultiSelectMode,
           selectedMessageTimestamps: data.selectedMessageTimestamps,
           isPreparingChatSwitch: data.isPreparingChatSwitch,
@@ -3002,6 +3182,7 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
     Widget child,
   ) {
     return WorkspaceShell(
+      workspaceSession: _workspaceSession,
       workspaceOpen: _workspaceOpen,
       onWorkspaceOpenChanged: _setWorkspaceOpen,
       currentChatId: _currentChatId,
@@ -3059,7 +3240,7 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
     bool isPendingQueueExpanded = true,
   }) {
     return _ChatContentData(
-      messages: List<ChatUiMessage>.unmodifiable(_messages),
+      messages: _messagesChatId == _currentChatId ? _messages : const [],
       loading: _loading,
       errorMessage: _errorMessage,
       inputProcessingState: _inputProcessingState,

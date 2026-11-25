@@ -578,6 +578,13 @@ fn validateSegment(segment: &str, originalPath: &str) -> Result<(), String> {
             "Invalid VFS path segment in {originalPath}: {segment}"
         ));
     }
+    // On Windows hosts Path::push replaces the whole accumulated path when a
+    // segment carries a drive letter, so ':' must never reach joinPhysical.
+    if segment.contains(':') || segment.contains('\\') {
+        return Err(format!(
+            "Invalid VFS path segment in {originalPath}: {segment}"
+        ));
+    }
     Ok(())
 }
 
@@ -776,6 +783,15 @@ fn windowsDriveEntries(hostRoots: HostFileSystemRoots) -> Vec<FileEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn segments_with_drive_letters_or_backslashes_are_rejected() {
+        assert!(validateSegment("C:evil", "/app/data/C:evil").is_err());
+        assert!(validateSegment("a\\b", "/app/data/a\\b").is_err());
+        assert!(validateSegment("file.txt", "/app/data/file.txt").is_ok());
+        assert!(normalizeAbsoluteVfsPath("/app/data/C:evil/x").is_err());
+        assert!(PathMapper::resolveFileToolPath(Some("/app/workspaces/chat-a"), "C:evil").is_err());
+    }
 
     #[test]
     fn file_tool_paths_resolve_against_workspace_without_alias_rewrites() {
@@ -1103,6 +1119,34 @@ mod tests {
                 if foreign != name {
                     assert!(mapper.resolve(&format!("/virtual/{foreign}/data")).is_err(), "{platform:?}: {foreign}");
                 }
+            }
+        }
+    }
+
+    /// Resolves application aliases and native platform addresses to the same selected directories.
+    #[test]
+    fn customStorageAliasesResolveToNativePlatformDirectories() {
+        use operit_host_contract::HostPlatform;
+        for (platform, selectedRoot, platformRoot) in [
+            (HostPlatform::Android, "/storage/emulated/0/Download/Operit data", "/virtual/android/root"),
+            (HostPlatform::Linux, "/home/user/Operit data", "/virtual/linux"),
+            (HostPlatform::Macos, "/Users/user/Operit data", "/virtual/macos"),
+            (HostPlatform::Ios, "/private/var/mobile/Containers/Shared/AppGroup/UUID/Operit data", "/virtual/ios"),
+            (HostPlatform::Ohos, "/data/storage/el2/base/files/Operit data", "/virtual/ohos"),
+        ] {
+            let runtimeRoot = format!("{selectedRoot}/runtime");
+            let workspaceRoot = format!("{selectedRoot}/workspaces");
+            let mut mapper = PathMapper::builtinOnly(runtimeRoot.clone().into(), workspaceRoot.clone().into());
+            mapper.hostRoots = HostFileSystemRoots::forPlatform(&platform);
+            for (applicationPath, nativePath) in [
+                ("/operitapp/data/config", format!("{runtimeRoot}/config")),
+                ("/operitapp/outputs/chat", format!("{runtimeRoot}/data/chat_outputs/chat")),
+                ("/operitapp/workspaces/project", format!("{workspaceRoot}/project")),
+            ] {
+                let directory = mapper.resolve(applicationPath).unwrap().nativePath().unwrap();
+                assert_eq!(directory, nativePath, "{platform:?}: {applicationPath}");
+                let platformPath = format!("{platformRoot}{nativePath}");
+                assert_eq!(mapper.resolve(&platformPath).unwrap().nativePath().unwrap(), directory);
             }
         }
     }

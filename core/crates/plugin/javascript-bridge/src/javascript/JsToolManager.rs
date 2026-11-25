@@ -359,6 +359,14 @@ impl JsToolManager {
         &self,
         request: &JsPackageToolCallRequest,
     ) -> JsPackageToolCallResult {
+        self.executeScriptWithOutput(request, None).await
+    }
+
+    /// Keeps the intermediate sink attached until the actual package function completes.
+    async fn executeScriptWithOutput(
+        &self, request: &JsPackageToolCallRequest,
+        onIntermediateResult: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    ) -> JsPackageToolCallResult {
         let Some((packageName, functionName)) = Self::parsePackageToolName(&request.tool_name)
         else {
             return Self::failure(
@@ -378,8 +386,8 @@ impl JsToolManager {
 
         let result = self
             .withExecutionEngineForPackage(selection.toolpkg_runtime.as_ref(), |engine| {
-                engine.execute_script_function_owned(
-                    selection.definition.script, functionName, runtimeParams, BTreeMap::new(),
+                engine.execute_script_function_owned_with_output(
+                    selection.definition.script, functionName, runtimeParams, BTreeMap::new(), onIntermediateResult,
                 )
             })
             .await;
@@ -397,15 +405,32 @@ impl JsToolManager {
     }
 }
 
+impl operit_plugin_sdk::javascript::ToolPkgRegistrationExecutor for JsToolManager {
+    /// Shares the existing four-slot engine pool with package registration.
+    fn register_toolpkg(
+        &self, script: &str, function: &str, params: &BTreeMap<String, Value>,
+        resources: Option<Arc<dyn operit_plugin_sdk::javascript::ToolPkgTextResourceHost>>,
+    ) -> JsExecutionCompletion<JsExecutionResult<operit_plugin_sdk::javascript::ToolPkgMainRegistrationCapture>> {
+        let manager = self.clone();
+        let (script, function, params) = (script.to_owned(), function.to_owned(), params.clone());
+        Box::pin(async move {
+            manager.withEngine(move |engine| engine.execute_toolpkg_main_registration_function_with_text_resources(
+                &script, &function, &params, resources,
+            )).await
+        })
+    }
+}
+
 impl JsPackageExecutor for JsToolManager {
     /// Executes one package tool through this manager's bound runtime context.
-    fn execute_package_tool(
+    fn execute_package_tool_streaming(
         &self,
         request: &JsPackageToolCallRequest,
+        on_intermediate_result: Option<Arc<dyn Fn(String) + Send + Sync>>,
     ) -> JsExecutionCompletion<JsPackageToolCallResult> {
         let manager = self.clone();
         let request = request.clone();
-        Box::pin(async move { manager.executeScript(&request).await })
+        Box::pin(async move { manager.executeScriptWithOutput(&request, on_intermediate_result).await })
     }
 }
 
@@ -601,8 +626,8 @@ mod tests {
         }
 
         /// Rejects package import in manager tests.
-        fn import_package(&self, _package_name: &str) -> Result<String, String> {
-            Err("Package import is not part of this test".to_string())
+        fn import_package(&self, _package_name: &str) -> operit_plugin_sdk::javascript::JsExecutionFuture<Result<String, String>> {
+            Box::pin(async { Err("Package import is not part of this test".to_string()) })
         }
 
         /// Rejects package removal in manager tests.
@@ -638,10 +663,6 @@ mod tests {
             Ok(())
         }
 
-        /// Completes one JavaScript runtime turn immediately in manager tests.
-        fn wait_for_javascript_runtime_turn(&self) -> operit_host_api::HostRuntimeTurnFuture {
-            Box::pin(async { Ok(()) })
-        }
     }
 
     #[derive(Clone, Copy)]
@@ -1201,17 +1222,26 @@ mod tests {
     }
 
     /// Loads a downloaded ToolPkg through the standard external-file path.
-    fn load_downloaded_toolpkg(downloaded_bytes: Vec<u8>) -> ToolPkgLoadResult {
+    async fn load_downloaded_toolpkg(downloaded_bytes: Vec<u8>) -> ToolPkgLoadResult {
         let source_path = "/marketplace/downloaded/market_flow_toolpkg.toolpkg";
         let host = DownloadedToolPkgFileSystemHost::new(source_path, downloaded_bytes);
         let filesystem = test_filesystem(Arc::new(host));
         let registration_engine = JsEngine::new(Arc::new(TestJsExecutionHost)).expect("registration fixture must initialize");
         let load_errors = Mutex::new(Vec::<String>::new());
-        let load_result = ToolPkgLoader::loadToolPkgFromExternalFile(
-            &filesystem,
+        let bytes = filesystem.readFileBytes("/operitapp/data/marketplace/downloaded/market_flow_toolpkg.toolpkg").unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).unwrap();
+        let index = operit_plugin_sdk::toolpkg::ToolPkgParser::ToolPkgArchiveParser::buildZipEntryIndex(&mut archive);
+        let resources = index.entryNames.iter().filter_map(|name| {
+            operit_plugin_sdk::toolpkg::ToolPkgParser::ToolPkgArchiveParser::readZipEntryText(&mut archive, &index, name)
+                .map(|text| (name.to_ascii_lowercase(), text))
+        }).collect::<BTreeMap<_, _>>();
+        let load_result = ToolPkgLoader::loadToolPkgFromArchiveBytes(
+            &bytes, operit_plugin_sdk::toolpkg::ToolPkgParser::ToolPkgSourceType::EXTERNAL,
             "/operitapp/data/marketplace/downloaded/market_flow_toolpkg.toolpkg",
+            false,
             ToolPkgConfigScope::Device,
             &registration_engine,
+            Arc::new(resources),
             |package_name, error| {
                 load_errors
                     .lock()
@@ -1219,7 +1249,7 @@ mod tests {
                     .push(format!("{package_name}: {error}"));
             },
         )
-        .expect("installed market ToolPkg should load");
+        .await.expect("installed market ToolPkg should load");
         let load_errors = load_errors.lock().expect("load error mutex poisoned");
         assert!(
             load_errors.is_empty(),
@@ -1372,6 +1402,33 @@ mod tests {
         (manager, package_runtime)
     }
 
+    /// Registers many owners through one pooled engine and clears captures after failure.
+    #[tokio::test(flavor = "current_thread")]
+    async fn registration_reuses_bounded_pool_without_cross_package_capture() {
+        use operit_plugin_sdk::javascript::ToolPkgRegistrationExecutor;
+        use operit_host_api::HostManager::{setDefaultHostJavaScriptRuntimeHost, setDefaultHostRuntimeTaskSchedulerHost};
+        setDefaultHostJavaScriptRuntimeHost(Arc::new(operit_host_native_scheduler::NativeHostJavaScriptRuntimeHost::new()));
+        setDefaultHostRuntimeTaskSchedulerHost(Arc::new(operit_host_native_scheduler::NativeHostRuntimeTaskSchedulerHost::new()));
+        register_test_runtime_storage("registration-pool");
+        let (manager, _) = toolpkg_manager("exports.run = () => true;");
+        let first = manager.withEngine(|engine| Box::pin(async move { Ok(engine) })).await.unwrap();
+        for index in 0..24 {
+            let params = BTreeMap::from([
+                ("toolPkgId".into(), serde_json::json!(format!("test.owner{index}"))),
+                ("__operit_registration_config_scope".into(), serde_json::json!("device")),
+            ]);
+            let script = if index == 12 { "exports.registerToolPkg = () => { throw Error('expected'); };" }
+                else { "if (typeof ToolPkg.route !== 'function') throw Error('Missing route API'); exports.probe = () => true; exports.registerToolPkg = () => { ToolPkg.registerApi({name:'probe', function:exports.probe}); };" };
+            let result = manager.register_toolpkg(script, "registerToolPkg", &params, None).await;
+            if index == 12 { assert!(result.is_err()); }
+            else { assert_eq!(result.unwrap().publicApis.len(), 1); }
+            let pool = manager.enginePool.lock().unwrap();
+            assert_eq!(pool.len(), 1);
+            assert!(Arc::ptr_eq(&first, &pool[0]));
+        }
+        manager.destroy();
+    }
+
     /// Idle and in-flight engines must both leave the pool when its manager closes.
     #[tokio::test(flavor = "current_thread")]
     async fn manager_shutdown_releases_idle_and_returning_engines() {
@@ -1445,7 +1502,7 @@ mod tests {
         ));
         assert_eq!(asset_bytes, b"asset-secret-value");
 
-        let load_result = load_downloaded_toolpkg(downloaded_bytes);
+        let load_result = load_downloaded_toolpkg(downloaded_bytes).await;
         assert_eq!(
             load_result.containerRuntime.sourceType,
             ToolPkgSourceType::EXTERNAL

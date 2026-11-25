@@ -27,6 +27,7 @@ class ChatMessageNavigationController extends ChangeNotifier {
   final openRequests = ValueNotifier<int>(0);
   String? chatId;
   int? timestamp;
+  int? visibleTimestamp;
 
   void open() => openRequests.value++;
 
@@ -63,6 +64,7 @@ class ChatScrollNavigator extends StatefulWidget {
   const ChatScrollNavigator({
     super.key,
     this.messageNavigation,
+    this.onLeft = false,
     required this.messages,
     required this.currentChatId,
     required this.scrollController,
@@ -82,6 +84,7 @@ class ChatScrollNavigator extends StatefulWidget {
   });
 
   final ChatMessageNavigationController? messageNavigation;
+  final bool onLeft;
   final List<ChatUiMessage> messages;
   final String? currentChatId;
   final ScrollController scrollController;
@@ -106,6 +109,7 @@ class ChatScrollNavigator extends StatefulWidget {
 class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
   List<ChatMessageLocatorPreview> _locatorEntries =
       const <ChatMessageLocatorPreview>[];
+  Map<int, ChatMessageLocatorPreview> _locatorEntriesByTimestamp = const {};
 
   bool _locatorLoadFailed = false;
   int? _hoveredEntryIndex;
@@ -117,7 +121,9 @@ class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
   void initState() {
     super.initState();
     widget.messageNavigation?.addListener(_onMessageNavigation);
-    _loadLocatorEntries();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _loadLocatorEntries();
+    });
   }
 
   /// Refreshes history geometry without retaining a preview from another chat.
@@ -128,27 +134,47 @@ class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
       oldWidget.messageNavigation?.removeListener(_onMessageNavigation);
       widget.messageNavigation?.addListener(_onMessageNavigation);
     }
-    if (oldWidget.viewportHeight != widget.viewportHeight) {
+    if (oldWidget.viewportHeight != widget.viewportHeight ||
+        oldWidget.onLeft != widget.onLeft) {
       _hoveredEntryIndex = null;
     }
-    final favoritesChanged =
-        !identical(oldWidget.messages, widget.messages) &&
-        _favoritesChanged(oldWidget.messages, widget.messages);
     final messagesChanged =
         oldWidget.messages.length != widget.messages.length ||
         oldWidget.messages.firstOrNull?.timestamp !=
             widget.messages.firstOrNull?.timestamp ||
         oldWidget.messages.lastOrNull?.timestamp !=
             widget.messages.lastOrNull?.timestamp;
-    if (messagesChanged ||
-        favoritesChanged ||
-        oldWidget.currentChatId != widget.currentChatId) {
+    final chatChanged = oldWidget.currentChatId != widget.currentChatId;
+    final needsIndexRefresh = messagesChanged
+        ? !_isIndexedWindowExpansion(oldWidget.messages)
+        : !identical(oldWidget.messages, widget.messages) &&
+              _favoritesChanged(oldWidget.messages, widget.messages);
+    if (chatChanged || needsIndexRefresh) {
       _hoveredEntryIndex = null;
-      if (oldWidget.currentChatId != widget.currentChatId) {
-        _locatorEntries = const <ChatMessageLocatorPreview>[];
-      }
+      if (chatChanged) _replaceLocatorEntries(const []);
       _loadLocatorEntries();
     }
+  }
+
+  /// A body page containing already indexed messages does not change the rail.
+  bool _isIndexedWindowExpansion(List<ChatUiMessage> before) {
+    final after = widget.messages;
+    if (before.isEmpty || after.length <= before.length) return false;
+    final start = after.indexWhere(
+      (row) => row.timestamp == before.first.timestamp,
+    );
+    if (start < 0 || start + before.length > after.length) return false;
+    final end = start + before.length;
+    for (var index = 0; index < after.length; index++) {
+      final row = after[index];
+      if (index >= start && index < end) {
+        if (!identical(row, before[index - start])) return false;
+      } else if (_locatorEntriesByTimestamp[row.timestamp]?.isFavorite !=
+          row.isFavorite) {
+        return false;
+      }
+    }
+    return true;
   }
 
   /// Builds an isolated paint-driven rail and a preview only for the selected row.
@@ -181,7 +207,8 @@ class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
           children: <Widget>[
             if (_locatorLoadFailed)
               Positioned(
-                right: 0,
+                left: widget.onLeft ? 0 : null,
+                right: widget.onLeft ? null : 0,
                 top: 16,
                 child: IconButton(
                   key: const ValueKey('chat-message-index-retry'),
@@ -194,33 +221,42 @@ class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
               ),
             if (geometry != null)
               Positioned(
-                right: 0,
+                left: widget.onLeft ? 0 : null,
+                right: widget.onLeft ? null : 0,
                 top: 0,
                 bottom: 0,
                 width: ChatScrollRailGeometry.interactionWidth,
-                child: _MessageTickRail(
-                  key: ValueKey(widget.currentChatId),
-                  entries: entries,
-                  activeTimestamp: activeTimestamp,
-                  geometry: geometry,
-                  onHoverEntry: (index, center) {
-                    if (_hoveredEntryIndex == index &&
-                        _hoveredEntryCenter == center) {
-                      return;
-                    }
-                    setState(() {
-                      _hoveredEntryIndex = index;
-                      _hoveredEntryCenter = center;
-                    });
-                  },
-                  onTapTick: _handleJumpToMessage,
+                child: Transform.flip(
+                  flipX: widget.onLeft,
+                  child: _MessageTickRail(
+                    key: ValueKey((widget.currentChatId, widget.onLeft)),
+                    entries: entries,
+                    activeTimestamp: activeTimestamp,
+                    geometry: geometry,
+                    onHoverEntry: (index, center) {
+                      if (_hoveredEntryIndex == index &&
+                          _hoveredEntryCenter == center) {
+                        return;
+                      }
+                      setState(() {
+                        _hoveredEntryIndex = index;
+                        _hoveredEntryCenter = center;
+                      });
+                    },
+                    onTapTick: _handleJumpToMessage,
+                  ),
                 ),
               ),
             if (hoveredIndex != null &&
                 hoveredIndex < entries.length &&
                 previewWidth > 0)
               Positioned(
-                right: ChatScrollRailGeometry.interactionWidth + 8,
+                left: widget.onLeft
+                    ? ChatScrollRailGeometry.interactionWidth + 8
+                    : null,
+                right: widget.onLeft
+                    ? null
+                    : ChatScrollRailGeometry.interactionWidth + 8,
                 top: (_hoveredEntryCenter - 32).clamp(
                   8.0,
                   math.max(8.0, widget.viewportHeight - 112),
@@ -288,6 +324,13 @@ class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
     return _locatorEntries;
   }
 
+  void _replaceLocatorEntries(List<ChatMessageLocatorPreview> entries) {
+    _locatorEntries = entries;
+    _locatorEntriesByTimestamp = {
+      for (final entry in entries) entry.timestamp: entry,
+    };
+  }
+
   /// Routes a confirmed tap to its visible row or its history timestamp.
   void _handleJumpToMessage(int timestamp) {
     final targetIndex = widget.messages.indexWhere(
@@ -333,7 +376,7 @@ class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
     final chatId = widget.currentChatId;
     if (chatId == null || chatId.trim().isEmpty) {
       setState(() {
-        _locatorEntries = const <ChatMessageLocatorPreview>[];
+        _replaceLocatorEntries(const []);
         _locatorLoadFailed = false;
       });
       return;
@@ -343,13 +386,13 @@ class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
       final entries = await widget.loadLocatorEntries(chatId, '');
       if (!mounted || generation != _locatorLoadGeneration) return;
       setState(() {
-        _locatorEntries = entries;
+        _replaceLocatorEntries(entries);
         _hoveredEntryIndex = null;
       });
     } catch (_) {
       if (!mounted || generation != _locatorLoadGeneration) return;
       setState(() {
-        _locatorEntries = const <ChatMessageLocatorPreview>[];
+        _replaceLocatorEntries(const []);
         _hoveredEntryIndex = null;
         _locatorLoadFailed = true;
       });
@@ -539,7 +582,7 @@ class _MessageTickRailState extends State<_MessageTickRail>
     }
   }
 
-  /// The narrow right-hand strip owns one continuous press/move/release gesture.
+  /// The narrow edge strip owns one continuous press/move/release gesture.
   void _handlePointerDown(PointerDownEvent event) {
     if (_touchPointer != null || event.buttons != kPrimaryButton) return;
     _touchPointer = event.pointer;

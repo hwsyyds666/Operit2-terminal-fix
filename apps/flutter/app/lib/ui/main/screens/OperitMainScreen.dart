@@ -21,6 +21,7 @@ import '../../features/chat/components/NewChatIntro.dart';
 import '../../features/chat/viewmodel/ChatSelectionTransition.dart';
 import '../components/AppContent.dart';
 import '../components/DrawerConversationState.dart';
+import '../components/SidebarChatCreation.dart';
 import '../layout/NavigationLayoutMetrics.dart';
 import '../layout/PhoneLayout.dart';
 import '../MainLayoutController.dart';
@@ -233,10 +234,7 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
     if (!mounted) {
       return;
     }
-    await _loadDrawerConversations();
-    if (!mounted) {
-      return;
-    }
+    // The state flows start with a fresh snapshot after any startup selection.
     _watchDrawerConversations();
   }
 
@@ -263,7 +261,11 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
             setAsCurrentChat: true,
             sourceChatId: null,
             parentChatId: null,
-            workspaceId: null,
+            workspaceId: await sidebarNewChatWorkspaceId(
+              clients: _clients,
+              histories: state.histories,
+              currentChatId: state.currentChatId,
+            ),
             input: null,
           );
         } catch (error, stackTrace) {

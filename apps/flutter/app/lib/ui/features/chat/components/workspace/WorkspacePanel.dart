@@ -22,6 +22,10 @@ import '../../../../common/contributions/EmbeddedPluginSurfaceHost.dart';
 import '../../../../common/contributions/PluginWorkspacePresentation.dart';
 import '../../../../main/layout/SidebarDockController.dart';
 import '../../../../main/navigation/ToolPkgCatalogChangeBus.dart';
+import '../../../settings/models/SettingsModels.dart';
+import '../../../../main/navigation/AppNavigationModels.dart';
+import '../../../../main/screens/OperitScreens.dart';
+import '../../../../main/screens/ScreenRouteRegistry.dart';
 
 import '../../../../../l10n/generated/app_localizations.dart';
 import '../../../../theme/OperitTheme.dart';
@@ -37,7 +41,7 @@ import 'WorkspaceUnbindDialog.dart';
 import 'WorkspaceTabStrip.dart';
 import 'WorkspaceTopBarButton.dart';
 import 'browser/WorkspaceBrowserViewStore.dart';
-import 'browser/automation/WorkspaceWebVisitSessionRegistry.dart';
+import 'package:operit2/core/web_visit/RuntimeWebVisitRegistry.dart';
 import 'browser/tabs/WorkspaceBrowserTabModels.dart';
 import 'file_preview/WorkspaceTextCloseDialog.dart';
 import 'terminal/WorkspaceTerminalSessions.dart';
@@ -102,12 +106,10 @@ class _WorkspacePanelState extends State<WorkspacePanel> {
       RuntimeBrowserSessionRegistry.instance;
   final WorkspaceBrowserViewStore _browserViewStore =
       WorkspaceBrowserViewStore.instance;
-  final WorkspaceWebVisitSessionRegistry _webVisitSessionRegistry =
-      WorkspaceWebVisitSessionRegistry.instance;
+  final RuntimeWebVisitRegistry _webVisitSessionRegistry =
+      RuntimeWebVisitRegistry.instance;
   final WorkspaceTerminalSessions _terminalSessions =
       const WorkspaceTerminalSessions();
-  final Map<String, Completer<WebVisitResponse>> _webVisitCompleters =
-      <String, Completer<WebVisitResponse>>{};
 
   /// Returns the workspace state owned by the main chat shell.
   WorkspaceSession get _session => widget.session;
@@ -245,7 +247,7 @@ class _WorkspacePanelState extends State<WorkspacePanel> {
     _embeddedContributions.dispose();
     _session.removeListener(_handleSessionChanged);
     widget.sidebarDockController?.removeListener(_handleSidebarDockChanged);
-    _webVisitSessionRegistry.clearControls();
+    _webVisitSessionRegistry.clearControls(this);
     _browserSessionRegistry.removeListener(
       _handleBrowserSessionRegistryChanged,
     );
@@ -258,19 +260,6 @@ class _WorkspacePanelState extends State<WorkspacePanel> {
       _handleWorkspaceOverviewContributionsChanged,
     );
     _workspaceOverviewContributions.dispose();
-    for (final entry in _webVisitCompleters.entries) {
-      final completer = entry.value;
-      if (!completer.isCompleted) {
-        completer.complete(
-          WebVisitResponse(
-            requestId: entry.key,
-            success: false,
-            error: 'visit_web workspace closed',
-          ),
-        );
-      }
-    }
-    _webVisitCompleters.clear();
     unawaited(_terminalSessionSubscription?.cancel());
     _terminalSessionCount.dispose();
     _terminalSessionsNotifier.dispose();
@@ -294,7 +283,7 @@ class _WorkspacePanelState extends State<WorkspacePanel> {
     setState(_syncDockedPluginTabs);
   }
 
-  /// Reconciles docked plugin entries with the shared workspace tab list.
+  /// Projects globally docked plugins into every workspace's local tab list.
   void _syncDockedPluginTabs() {
     final controller = widget.sidebarDockController;
     if (controller == null) {
@@ -797,8 +786,24 @@ class _WorkspacePanelState extends State<WorkspacePanel> {
     }
   }
 
+  /// Registers presentation without granting the workspace task ownership.
   void _registerWebVisitControls() {
-    _webVisitSessionRegistry.setControls(openWebVisitTab: _openWebVisitTab);
+    for (final tabs in [_session.tabs, _session.secondaryTabs]) {
+      tabs.removeWhere(
+        (tab) =>
+            tab.kind == WorkspaceTabKind.webVisit &&
+            _webVisitSessionRegistry.sessionFor(tab.webVisitRequest!.requestId) == null,
+      );
+    }
+    _session.selectedIndex = _clampSelectedIndex(
+      _session.selectedIndex, _session.tabs,
+    );
+    _session.secondarySelectedIndex = _clampSelectedIndex(
+      _session.secondarySelectedIndex, _session.secondaryTabs,
+    );
+    _webVisitSessionRegistry.setControls(
+      owner: this, openWebVisitTab: _openWebVisitTab,
+    );
   }
 
   /// Watches actual history summaries and rejects events from a replaced chat core.
@@ -1150,20 +1155,33 @@ class _WorkspacePanelState extends State<WorkspacePanel> {
     }
   }
 
-  Future<WebVisitResponse> _openWebVisitTab(WebVisitRequest request) {
-    final completer = Completer<WebVisitResponse>();
-    _webVisitCompleters[request.requestId] = completer;
-    final tab = WorkspaceTab(
+  /// Opens an observer tab for an existing runtime visit.
+  void _openWebVisitTab(WebVisitRequest request) {
+    final existing = [..._session.tabs, ..._session.secondaryTabs]
+        .where((tab) => tab.webVisitRequest?.requestId == request.requestId)
+        .firstOrNull;
+    final tab = existing ?? WorkspaceTab(
       kind: WorkspaceTabKind.webVisit,
       title: _webVisitTabTitle(request),
       icon: Icons.travel_explore,
       webVisitRequest: request,
     );
-    setState(() {
-      _session.tabs.add(tab);
-      _session.selectedIndex = _session.tabs.length - 1;
-    });
-    return completer.future;
+    if (existing == null) {
+      setState(() {
+        _session.tabs.add(tab);
+        _session.selectedIndex = _session.tabs.length - 1;
+      });
+    }
+    final task = _webVisitSessionRegistry.sessionFor(request.requestId);
+    if (task != null) {
+      unawaited(task.response.then((_) {
+        if (!mounted) return;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _finishWebVisitTab(tab);
+        });
+        WidgetsBinding.instance.scheduleFrame();
+      }));
+    }
   }
 
   String _webVisitTabTitle(WebVisitRequest request) {
@@ -1178,6 +1196,9 @@ class _WorkspacePanelState extends State<WorkspacePanel> {
   Widget _buildTabContent(WorkspaceTab tab, {int paneIndex = 0}) {
     return WorkspaceTabContent(
       tab: tab,
+      pluginHostState: tab.kind == WorkspaceTabKind.plugin
+          ? _session.pluginHostState
+          : const {},
       workspacePath: widget.workspacePath,
       fileDirectory: widget.fileDirectory,
       workspaceUsage: _workspaceOverviewUsage(),
@@ -1214,7 +1235,7 @@ class _WorkspacePanelState extends State<WorkspacePanel> {
       onOpenWorkspaceFile: widget.onOpenWorkspaceFile,
       onOpenFile: _openFileTab,
       onOpenFolder: _openMountedFolder,
-      onAddFolder: _openWorkspaceBindingPickerTab,
+      onAddFolder: _openWorkspaceSettings,
       filesListingRevision: _filesListingRevision,
       terminalSessionsListenable: _terminalSessionsNotifier,
       onOpenTerminal: _createAndOpenTerminalSession,
@@ -1231,18 +1252,19 @@ class _WorkspacePanelState extends State<WorkspacePanel> {
         surface: 'workspace_home',
         instanceIdentity: (widget.currentChatId, widget.workspacePath),
         hostState: {
-          ..._session.pluginHostState,
+          if (_embeddedContributions.entries.any(
+            (entry) => entry.entry.surface == 'workspace_home',
+          ))
+            ..._session.pluginHostState,
           'workspacePath': widget.workspacePath,
         },
         entryPadding: const EdgeInsets.only(bottom: 12),
       ),
-      onFinishWebVisit: (tab, response) =>
-          _finishWebVisitTab(tab, response, paneIndex: paneIndex),
       onCloseCurrentTab: () => _closeWorkspaceTab(tab, paneIndex: paneIndex),
-      onOpenWorkspaceCreator: _showCreateWorkspaceDialog,
+      onOpenWorkspaceCreator: _openWorkspaceSettings,
       onBindWorkspace: _bindWorkspaceFolder,
       onUnbindWorkspace: _showUnbindWorkspaceDialog,
-      onChooseExistingWorkspace: _openWorkspaceBindingPickerTab,
+      onChooseExistingWorkspace: _chooseWorkspaceRecord,
       splitMarkdownContent: (content) =>
           widget.chatCore.splitMarkdownContent(content: content),
     );
@@ -1791,6 +1813,57 @@ class _WorkspacePanelState extends State<WorkspacePanel> {
     );
   }
 
+  void _openWorkspaceSettings() {
+    final entry = ScreenRouteRegistry.toEntry(
+      screen: const SettingsScreenRoute(category: SettingsCategory.workspace),
+    );
+    AppRouterGateway.navigate(
+      routeId: entry.routeId,
+      args: entry.args,
+      source: entry.source,
+    );
+  }
+
+  Future<void> _chooseWorkspaceRecord() async {
+    final chatId = widget.currentChatId;
+    if (chatId == null) return;
+    try {
+      final workspaces = await _coreClients.application
+          .workspaceService()
+          .listWorkspaces();
+      if (!mounted) return;
+      final id = await showDialog<String>(
+        context: context,
+        builder: (context) => SimpleDialog(
+          title: const Text('选择工作区'),
+          children: [
+            for (final workspace in workspaces)
+              SimpleDialogOption(
+                onPressed: () => Navigator.pop(context, workspace.id),
+                child: Text(workspace.name),
+              ),
+            if (workspaces.isEmpty)
+              const Padding(
+                padding: EdgeInsets.all(16),
+                child: Text('请先在设置中添加工作区。'),
+              ),
+          ],
+        ),
+      );
+      if (id != null && mounted && widget.currentChatId == chatId) {
+        await _coreClients.chatRuntimeHolderMain.moveChatToWorkspace(
+          chatId: chatId,
+          workspaceId: id,
+        );
+      }
+    } catch (error) {
+      if (mounted)
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('$error')));
+    }
+  }
+
   /// Confirms detaching only this chat, keeping workspace files intact.
   Future<void> _showUnbindWorkspaceDialog() async {
     final chatId = widget.currentChatId;
@@ -2103,14 +2176,7 @@ class _WorkspacePanelState extends State<WorkspacePanel> {
     if (tab.kind == WorkspaceTabKind.webVisit) {
       final request = tab.webVisitRequest;
       if (request != null) {
-        _completeWebVisitRequest(
-          request.requestId,
-          WebVisitResponse(
-            requestId: request.requestId,
-            success: false,
-            error: 'visit_web cancelled',
-          ),
-        );
+        _webVisitSessionRegistry.cancel(request.requestId);
       }
     }
   }
@@ -2126,17 +2192,9 @@ class _WorkspacePanelState extends State<WorkspacePanel> {
     unawaited(_closeTab(index, paneIndex: paneIndex));
   }
 
-  /// Completes a web visit and removes its tab from the owning pane.
-  void _finishWebVisitTab(
-    WorkspaceTab tab,
-    WebVisitResponse response, {
-    int paneIndex = 0,
-  }) {
-    final request = tab.webVisitRequest;
-    if (request == null) {
-      return;
-    }
-    _completeWebVisitRequest(request.requestId, response);
+  /// Removes the presentation of a completed runtime visit from its current pane.
+  void _finishWebVisitTab(WorkspaceTab tab) {
+    final paneIndex = _session.secondaryTabs.contains(tab) ? 1 : 0;
     final tabs = _tabsForPane(paneIndex);
     final index = tabs.indexOf(tab);
     if (index >= 0) {
@@ -2150,13 +2208,6 @@ class _WorkspacePanelState extends State<WorkspacePanel> {
         }
         _collapseEmptyPane();
       });
-    }
-  }
-
-  void _completeWebVisitRequest(String requestId, WebVisitResponse response) {
-    final completer = _webVisitCompleters.remove(requestId);
-    if (completer != null && !completer.isCompleted) {
-      completer.complete(response);
     }
   }
 
