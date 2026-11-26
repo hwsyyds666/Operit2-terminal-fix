@@ -376,14 +376,20 @@ class AndroidDocumentFileSystem(
         return Regex(out.toString(), if (caseInsensitive) setOf(RegexOption.IGNORE_CASE) else emptySet())
     }
 
-    private fun walk(root: Node, maximum: Int, visit: (Node, String) -> Unit) {
+    private fun walk(root: Node, maximum: Int, visit: (Node, String, Boolean) -> Boolean) {
         val seen = HashSet<String>()
-        fun descend(current: Node, relative: String, depth: Int) {
+        fun descend(current: Node, relative: String, depth: Int): Boolean {
             require(depth <= 128) { "Search exceeded the maximum document depth" }
-            if (current.isNativeSymlink() || !seen.add(current.identity())) return
-            visit(current, relative)
-            if (current.stat().getBoolean("isDirectory") && (maximum < 0 || depth < maximum))
-                current.children().forEach { descend(it, if (relative.isEmpty()) it.name() else "$relative/${it.name()}", depth + 1) }
+            if (current.isNativeSymlink() || !seen.add(current.identity())) return true
+            val directory = current.stat().getBoolean("isDirectory")
+            if (!visit(current, relative, directory)) return false
+            if (directory && (maximum < 0 || depth < maximum)) {
+                for (child in current.children()) {
+                    val path = if (relative.isEmpty()) child.name() else "$relative/${child.name()}"
+                    if (!descend(child, path, depth + 1)) return false
+                }
+            }
+            return true
         }
         descend(root, "", 0)
     }
@@ -391,9 +397,10 @@ class AndroidDocumentFileSystem(
         val root = node(request.getString("path"))
         val pattern = glob(request.getString("pattern"), request.optBoolean("caseInsensitive"))
         val matches = JSONArray()
-        walk(root, request.optInt("maxDepth", -1)) { current, relative ->
+        walk(root, request.optInt("maxDepth", -1)) { current, relative, _ ->
             if (relative.isNotEmpty() && pattern.matches(if (request.optBoolean("usePathPattern")) relative else current.name()))
                 matches.put(current.locator())
+            true
         }
         return matches
     }
@@ -401,31 +408,29 @@ class AndroidDocumentFileSystem(
         val pattern = Regex(request.getString("pattern"), if (request.optBoolean("caseInsensitive")) setOf(RegexOption.IGNORE_CASE) else emptySet())
         val filter = glob(request.optString("filePattern", "*").ifEmpty { "*" }, false)
         val matches = JSONArray()
-        val maximum = request.optInt("maxResults", 100).coerceAtLeast(0)
-        val context = request.optInt("contextLines", 0).coerceIn(0, 1000)
+        val maximum = request.optInt("maxResults", 100).coerceIn(0, 1000)
+        val context = request.optInt("contextLines", 0).coerceIn(0, 20)
         var total = 0
         var searched = 0
-        walk(node(request.getString("path")), -1) { current, relative ->
-            if (total < maximum && !current.stat().getBoolean("isDirectory") && (filter.matches(current.name()) || filter.matches(relative))) {
-                // Bound individual search reads so a provider cannot exhaust the runtime heap.
-                val bytes = current.input().use { readBounded(it, 8L * 1024 * 1024 + 1) }
-                require(bytes.size <= 8 * 1024 * 1024) { "Document exceeds the 8 MiB content-search limit: ${current.name()}" }
-                val text = bytes.toString(Charsets.UTF_8)
+        var skippedLongLines = 0
+        walk(node(request.getString("path")), -1) { current, relative, directory ->
+            if (total < maximum && !directory && (filter.matches(current.name()) || filter.matches(relative))) {
+                val result = current.input().use { DocumentTextSearch.scan(it, pattern, context, maximum - total) }
                 searched++
-                if (!text.contains('\u0000')) {
-                    val lines = text.lines()
-                    val hits = JSONArray()
-                    for ((index, line) in lines.withIndex()) if (total < maximum && pattern.containsMatchIn(line)) {
-                        val hit = JSONObject().put("lineNumber", index + 1).put("lineContent", line)
-                        hit.put("matchContext", if (context == 0) JSONObject.NULL else lines.subList(maxOf(0, index - context), minOf(lines.size, index + context + 1)).joinToString("\n"))
-                        hits.put(hit)
-                        total++
-                    }
-                    if (hits.length() > 0) matches.put(JSONObject().put("filePath", current.locator()).put("lineMatches", hits))
+                skippedLongLines += result.skippedLongLines
+                if (result.hits.isNotEmpty()) {
+                    val hits = JSONArray(result.hits.map { hit ->
+                        JSONObject().put("lineNumber", hit.lineNumber).put("lineContent", hit.line)
+                            .put("matchContext", if (hit.context.isEmpty()) JSONObject.NULL else hit.context.joinToString("\n"))
+                    })
+                    total += result.hits.size
+                    matches.put(JSONObject().put("filePath", current.locator()).put("lineMatches", hits))
                 }
             }
+            total < maximum
         }
         return JSONObject().put("matches", matches).put("totalMatches", total).put("filesSearched", searched)
+            .put("skippedLongLines", skippedLongLines)
     }
     private fun archive(source: Node, relative: String, zip: ZipOutputStream, depth: Int, seen: MutableSet<String>) {
         require(!source.isNativeSymlink()) { "Archiving native symbolic links through document mounts is unsupported" }

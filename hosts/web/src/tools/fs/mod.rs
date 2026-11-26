@@ -253,6 +253,7 @@ impl FileSystemHost for WebFileSystemHost {
             matches: grep_matches,
             totalMatches: read_usize_property(&value, "totalMatches")?,
             filesSearched: read_usize_property(&value, "filesSearched")?,
+            skippedLongLines: None,
         })
     }
 

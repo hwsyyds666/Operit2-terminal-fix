@@ -403,6 +403,7 @@ impl FileSystemHost for AppleFileSystemHost {
             matches,
             totalMatches,
             filesSearched,
+            skippedLongLines: None,
         })
     }
 

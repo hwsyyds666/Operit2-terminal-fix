@@ -266,6 +266,7 @@ mod tests {
             }],
             totalMatches: 1,
             filesSearched: 3,
+            skippedLongLines: None,
         });
         qualifyRemoteResultPaths(&mut grepData, "cas:/virtual/nas", "cas");
         let ToolResultData::GrepResultData(grep) = &grepData else { panic!() };

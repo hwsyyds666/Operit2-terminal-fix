@@ -100,12 +100,17 @@ void main(List<String> args) async {
     );
     output.dependencies.add(cargoBuildScript.uri);
 
-    await _run(_pythonExecutable(repoRoot), [
-      syncScript.path,
-      '--source',
-      'runtime',
-      '--no-hot-reload',
-    ], workingDirectory: repoRoot.path);
+    final pluginAssetsPrevalidated = File.fromUri(
+      packageRoot.uri.resolve('.dart_tool/operit_plugin_assets_prevalidated'),
+    );
+    if (!pluginAssetsPrevalidated.existsSync()) {
+      await _run(_pythonExecutable(repoRoot), [
+        syncScript.path,
+        '--source',
+        'runtime',
+        '--no-hot-reload',
+      ], workingDirectory: repoRoot.path);
+    }
 
     if (shouldBuildWebAssets) {
       final fontScript = File.fromUri(

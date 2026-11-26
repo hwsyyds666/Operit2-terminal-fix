@@ -570,6 +570,7 @@ class _MarkdownNodeColumnState extends State<_MarkdownNodeColumn> {
     final lastRenderableIndex = _lastRenderableNodeIndex(widget.nodes);
     final liveSingleKeys = <String>{};
     final liveGroupKeys = <String>{};
+    var virtualized = widget.scrollController != null;
 
     bool isVisibleAt(int index) {
       final states = widget.nodeAnimationStates;
@@ -667,7 +668,7 @@ class _MarkdownNodeColumnState extends State<_MarkdownNodeColumn> {
       );
       // Reuse visible widgets during zoom without retaining the whole file as
       // the user scrolls. Slivers still dispose offscreen elements and states.
-      while (widget.scrollController != null &&
+      while (virtualized &&
           _singleNodeCache.length > _markdownViewportWidgetCacheLimit) {
         _singleNodeCache.remove(_singleNodeCache.keys.first);
       }
@@ -827,7 +828,7 @@ class _MarkdownNodeColumnState extends State<_MarkdownNodeColumn> {
         nodeVisibilities: List<bool>.unmodifiable(nodeVisibilities),
         widget: rendered,
       );
-      while (widget.scrollController != null &&
+      while (virtualized &&
           _groupCache.length > _markdownViewportWidgetCacheLimit) {
         _groupCache.remove(_groupCache.keys.first);
       }
@@ -876,6 +877,7 @@ class _MarkdownNodeColumnState extends State<_MarkdownNodeColumn> {
     }
 
     if (builders.length >= 24 && TranscriptMarkdownScope.enabledOf(context)) {
+      virtualized = true;
       return TranscriptMarkdownViewport(
         key: ValueKey(widget.rendererId),
         blockCount: builders.length,

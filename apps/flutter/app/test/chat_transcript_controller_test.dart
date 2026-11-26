@@ -52,10 +52,12 @@ void main() {
         ),
       ]);
       expect(controller.messages.last.timestamp, 1001);
+      expect(controller.locatorRevision.value, 1);
       page.complete(_page(961, 980));
       await pending;
       expect(controller.messages.last.timestamp, 1001);
       expect(controller.messages.map((m) => m.timestamp).toSet().length, 41);
+      expect(controller.locatorRevision.value, 1);
     },
   );
 
@@ -117,6 +119,7 @@ void main() {
     final scroll = ScrollController();
     addTearDown(scroll.dispose);
     final built = <int>{};
+    final buildsPerBlock = <int, int>{};
     await tester.pumpWidget(
       MaterialApp(
         home: ListView(
@@ -126,6 +129,11 @@ void main() {
               blockCount: 100,
               builder: (context, index) {
                 built.add(index);
+                buildsPerBlock.update(
+                  index,
+                  (count) => count + 1,
+                  ifAbsent: () => 1,
+                );
                 return SizedBox(height: 64, child: Text('Block $index'));
               },
             ),
@@ -137,6 +145,11 @@ void main() {
     expect(built.length, lessThan(25));
     expect(find.text('Block 0'), findsOneWidget);
     expect(find.text('Block 50'), findsNothing);
+    for (var offset = 24.0; offset < 600; offset += 24) {
+      scroll.jumpTo(offset);
+      await tester.pump();
+    }
+    expect(buildsPerBlock.values, everyElement(1));
     scroll.jumpTo(50 * 64);
     await tester.pumpAndSettle();
     expect(find.text('Block 50'), findsOneWidget);

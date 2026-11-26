@@ -3,6 +3,8 @@
 import 'dart:async';
 import 'dart:collection';
 
+import 'package:flutter/foundation.dart';
+
 import '../../../../core/proxy/generated/CoreProxyModels.g.dart';
 
 /// Owns one chat's on-screen history. Core's generation history is separate.
@@ -26,6 +28,7 @@ class ChatTranscriptController {
   final bool Function() followLatest;
   final void Function() onChanged;
   final void Function(Object) onError;
+  final locatorRevision = ValueNotifier<int>(0);
 
   final _rows = SplayTreeMap<int, ChatMessage>();
   final _pending = <ChatTranscriptChange>[];
@@ -56,6 +59,7 @@ class ChatTranscriptController {
     }
     _waiting.clear();
     _details.clear();
+    locatorRevision.dispose();
   }
 
   void accept(List<ChatTranscriptChange> journal) {
@@ -68,8 +72,12 @@ class ChatTranscriptController {
     }
     final changes = journal.where((change) => change.sequence > sequence);
     if (changes.isEmpty) return;
-    if (changes.first.sequence > sequence + 1) _needsRefresh = true;
+    final missedChanges = changes.first.sequence > sequence + 1;
+    if (missedChanges) _needsRefresh = true;
     _sequence = changes.last.sequence;
+    if (missedChanges || changes.any(_changesLocator)) {
+      locatorRevision.value++;
+    }
     _pending.addAll(changes);
     if (_pending.length > 48) {
       _pending.removeRange(0, _pending.length - 24);
@@ -87,6 +95,17 @@ class ChatTranscriptController {
       _publish();
     }
     if (_needsRefresh) unawaited(_refresh());
+  }
+
+  bool _changesLocator(ChatTranscriptChange change) {
+    if (change.kind != 'upsert') return true;
+    final message = change.message;
+    if (message == null) return false;
+    final previous = _rows[message.timestamp];
+    return previous == null ||
+        previous.isFavorite != message.isFavorite ||
+        previous.sender != message.sender ||
+        previous.displayMode != message.displayMode;
   }
 
   Future<void> _refresh() async {
@@ -302,13 +321,15 @@ class ChatTranscriptController {
         for (final entry in batch.entries) {
           final (row, completer) = entry.value;
           final body = byTimestamp[entry.key];
-          completer.complete(
-            !_disposed &&
-                    identical(_rows[entry.key], row) &&
-                    body?.selectedVariantIndex == row.selectedVariantIndex
-                ? body
-                : null,
-          );
+          final current =
+              !_disposed &&
+              identical(_rows[entry.key], row) &&
+              body?.selectedVariantIndex == row.selectedVariantIndex;
+          // A remounted row can render immediately using its prepared body.
+          if (current && identical(_details[entry.key]?.$2, completer.future)) {
+            _details[entry.key] = (row, SynchronousFuture(body));
+          }
+          completer.complete(current ? body : null);
         }
       } catch (error, stackTrace) {
         for (final entry in batch.values) {

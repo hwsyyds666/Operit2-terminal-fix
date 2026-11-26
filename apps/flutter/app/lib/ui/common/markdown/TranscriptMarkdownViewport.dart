@@ -47,6 +47,7 @@ class TranscriptMarkdownViewport extends StatefulWidget {
 class _TranscriptMarkdownViewportState
     extends State<TranscriptMarkdownViewport> {
   final _measuredHeights = <int, double>{};
+  final _mountedBlocks = <int, Widget>{};
   late _BlockExtents _extents = _BlockExtents(
     widget.blockCount,
     _measuredHeights,
@@ -56,6 +57,7 @@ class _TranscriptMarkdownViewportState
   bool _measurementsChanged = false;
   int _first = 0;
   int _end = 6;
+  double? _layoutWidth;
 
   @override
   void didChangeDependencies() {
@@ -76,6 +78,7 @@ class _TranscriptMarkdownViewportState
       _measuredHeights.removeWhere((index, _) => index >= widget.blockCount);
       _extents = _BlockExtents(widget.blockCount, _measuredHeights);
     }
+    if (oldWidget.builder != widget.builder) _mountedBlocks.clear();
     _schedule();
   }
 
@@ -103,12 +106,24 @@ class _TranscriptMarkdownViewportState
       if (!top.isFinite) return;
       final changed = _measurementsChanged;
       _measurementsChanged = false;
-      const prefetch = 240.0;
-      final first = _extents.blockAt(-top - prefetch);
-      final end = math.min(
-        widget.blockCount,
-        _extents.blockAt(viewport.size.height - top + prefetch) + 1,
-      );
+      final visibleStart = -top;
+      final visibleEnd = viewport.size.height - top;
+      var first = _first;
+      var end = _end;
+      // Move the window in batches. Keep nearby blocks mounted through small
+      // movements and keep a buffer in both directions for fast flings.
+      if (end > widget.blockCount ||
+          (first > 0 && _extents.before(first) > visibleStart - 120) ||
+          (end < widget.blockCount &&
+              _extents.before(end) < visibleEnd + 120) ||
+          visibleStart - _extents.before(first) > 720 ||
+          _extents.before(end) - visibleEnd > 720) {
+        first = _extents.blockAt(visibleStart - 360);
+        end = math.min(
+          widget.blockCount,
+          _extents.blockAt(visibleEnd + 360) + 1,
+        );
+      }
       if (changed || first != _first || end != _end) {
         setState(() {
           _first = first;
@@ -120,7 +135,20 @@ class _TranscriptMarkdownViewportState
   }
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context) => LayoutBuilder(
+    builder: (context, constraints) {
+      final width = constraints.maxWidth;
+      if (_layoutWidth != width) {
+        _layoutWidth = width;
+        _measuredHeights.clear();
+        _extents = _BlockExtents(widget.blockCount, _measuredHeights);
+        _schedule();
+      }
+      return _buildBlocks(context);
+    },
+  );
+
+  Widget _buildBlocks(BuildContext context) {
     if (_position == null) {
       return Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -132,6 +160,7 @@ class _TranscriptMarkdownViewportState
     }
     final first = math.min(_first, widget.blockCount);
     final end = math.min(_end, widget.blockCount);
+    _mountedBlocks.removeWhere((index, _) => index < first || index >= end);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -149,7 +178,10 @@ class _TranscriptMarkdownViewportState
               _measurementsChanged = true;
               _schedule();
             },
-            child: widget.builder(context, index),
+            child: _mountedBlocks.putIfAbsent(
+              index,
+              () => widget.builder(context, index),
+            ),
           ),
         if (end < widget.blockCount)
           SizedBox(

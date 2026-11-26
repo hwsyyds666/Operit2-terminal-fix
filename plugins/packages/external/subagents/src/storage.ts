@@ -81,7 +81,9 @@ export class Repository implements AgentRepository {
       ]);
       this.committed.set(agent.id, summary(agent));
     });
-    this.writes = pending;
+    // Preserve the failed write for its caller without blocking other agents'
+    // later transactions. Each later write uses the last committed summaries.
+    this.writes = pending.catch(() => {});
     return pending;
   }
 }

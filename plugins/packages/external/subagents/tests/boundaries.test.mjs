@@ -100,6 +100,29 @@ test("real Repository atomically publishes sibling summaries and details", async
   assert.equal([...storage.observers.values()].reduce((count, observers) => count + observers.size, 0), 0);
 });
 
+test("a rejected snapshot write does not block a sibling agent", async () => {
+  const source = harness();
+  const one = await source.spawn();
+  const two = await source.spawn();
+  const storage = objectDatabase();
+  const commit = storage.database.commit;
+  storage.database.commit = async mutations => {
+    if (mutations[0].key === one.id) throw new Error("snapshot write failed");
+    return commit(mutations);
+  };
+  const runtime = modules({
+    ToolPkg: { getSpaceDataDir: () => "/space/subagents" },
+    Tools: { Storage: { objects: { async open() { return storage.database; } } } },
+  });
+  const { Repository } = runtime.load("./storage");
+  const repository = new Repository();
+  const failed = repository.save(source.repository.records.get(one.id));
+  const saved = repository.save(source.repository.records.get(two.id));
+  await assert.rejects(failed, /snapshot write failed/);
+  await saved;
+  assert.deepEqual(storage.collections.get("parents").get("parent").agents.map(agent => agent.id), [two.id]);
+});
+
 /** A new repository instance reads the same validated space setting. */
 test("concurrency settings survive repository recreation", async () => {
   const storage = objectDatabase();

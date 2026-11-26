@@ -2187,6 +2187,8 @@ pub struct GrepResultData {
     pub totalMatches: i32,
     #[serde(rename = "filesSearched")]
     pub filesSearched: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skippedLongLines: Option<u32>,
 }
 impl SleepResultData {
     /// Formats the actual sleep duration in milliseconds.
@@ -3065,6 +3067,11 @@ impl GrepResultData {
             self.matches.len()
         ));
         sb.push_str(&format!("Files Searched: {}\n\n", self.filesSearched));
+        if let Some(skipped) = self.skippedLongLines.filter(|count| *count > 0) {
+            sb.push_str(&format!(
+                "Search coverage: {skipped} lines exceeded the per-line search limit. Use targeted reads if those lines are needed.\n\n"
+            ));
+        }
         if self.matches.is_empty() {
             sb.push_str("No matches found\n");
         } else {

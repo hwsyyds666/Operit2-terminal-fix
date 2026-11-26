@@ -236,7 +236,7 @@ impl StandardFileSystemTools {
                     );
                 }
 
-                let bytes = match vfs.readFileBytes(&path) {
+                let bytes = match vfs.readFileBytesRange(&path, 0, 512) {
                     Ok(bytes) => bytes,
                     Err(error) => {
                         return toolError(
@@ -2256,6 +2256,7 @@ fn grepResultData(searchPath: &str, pattern: &str, result: &GrepCodeResult) -> G
             .collect(),
         totalMatches: result.totalMatches as i32,
         filesSearched: result.filesSearched as i32,
+        skippedLongLines: result.skippedLongLines,
     }
 }
 

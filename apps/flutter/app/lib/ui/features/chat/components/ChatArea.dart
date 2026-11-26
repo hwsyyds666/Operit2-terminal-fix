@@ -134,10 +134,7 @@ class _ChatAreaState extends State<ChatArea> {
   final Map<int, GlobalKey> _messageKeys = <int, GlobalKey>{};
   final Map<int, Object> _mountedRows = <int, Object>{};
   final Map<Key, ChatMessageExtent> _rowExtents = <Key, ChatMessageExtent>{};
-  final ValueNotifier<Map<int, ChatScrollMessageAnchor>>
-  _messageAnchorsNotifier = ValueNotifier<Map<int, ChatScrollMessageAnchor>>(
-    const <int, ChatScrollMessageAnchor>{},
-  );
+  final _navigatorTimestamp = ValueNotifier<int?>(null);
   final ValueNotifier<bool> _showNavigatorChipNotifier = ValueNotifier<bool>(
     false,
   );
@@ -311,11 +308,10 @@ class _ChatAreaState extends State<ChatArea> {
         ),
         AnimatedBuilder(
           animation: Listenable.merge(<Listenable>[
-            _messageAnchorsNotifier,
+            _navigatorTimestamp,
             _viewportHeightNotifier,
           ]),
           builder: (context, _) {
-            final messageAnchors = _messageAnchorsNotifier.value;
             return ValueListenableBuilder<bool>(
               valueListenable: widget.autoScrollToBottomListenable,
               builder: (context, autoScrollToBottom, _) {
@@ -332,7 +328,9 @@ class _ChatAreaState extends State<ChatArea> {
                         messages: widget.messages,
                         currentChatId: widget.currentChatId,
                         scrollController: widget.scrollController,
-                        messageAnchors: messageAnchors,
+                        messageAnchors: const {},
+                        activeTimestamp: _navigatorTimestamp.value,
+                        locatorRevision: widget.transcript?.locatorRevision,
                         viewportHeight: _viewportHeight,
                         autoScrollToBottom: autoScrollToBottom,
                         hasNewerDisplayHistory: widget.hasNewerDisplayHistory,
@@ -848,16 +846,19 @@ class _ChatAreaState extends State<ChatArea> {
         !scroll.position.hasPixels) {
       return;
     }
-    final anchors = <int, ChatScrollMessageAnchor>{};
     ChatScrollMessageAnchor? firstVisible;
     ChatScrollMessageAnchor? partiallyVisible;
+    int? centeredTimestamp;
+    var centerDistance = double.infinity;
+    final position = scroll.position;
+    final viewportHeight = position.viewportDimension;
     for (final timestamp in _mountedRows.keys) {
       final key = _messageKeys[timestamp];
       final index = _messageIndices[timestamp];
       if (index == null || key == null) continue;
       final measured = _measureRow(timestamp);
       if (measured == null ||
-          measured.top >= scroll.position.viewportDimension ||
+          measured.top >= viewportHeight ||
           measured.top + measured.height <= 0)
         continue;
       final anchor = ChatScrollMessageAnchor(
@@ -867,7 +868,12 @@ class _ChatAreaState extends State<ChatArea> {
         absoluteTopPx: scroll.offset + measured.top,
         heightPx: measured.height,
       );
-      anchors[timestamp] = anchor;
+      final distance = (measured.top + (measured.height - viewportHeight) / 2)
+          .abs();
+      if (distance < centerDistance) {
+        centerDistance = distance;
+        centeredTimestamp = timestamp;
+      }
       if (measured.top < -0.5) {
         partiallyVisible ??= anchor;
       } else if (firstVisible == null ||
@@ -877,9 +883,14 @@ class _ChatAreaState extends State<ChatArea> {
     }
     _visibleAnchor = firstVisible ?? partiallyVisible;
     widget.messageNavigation?.visibleTimestamp = _visibleAnchor?.timestamp;
-    if (_showNavigatorChipNotifier.value) {
-      _messageAnchorsNotifier.value = anchors;
-    }
+    _navigatorTimestamp.value =
+        position.hasContentDimensions &&
+            position.pixels == position.minScrollExtent
+        ? widget.messages.lastOrNull?.timestamp
+        : position.hasContentDimensions &&
+              position.pixels == position.maxScrollExtent
+        ? widget.messages.firstOrNull?.timestamp
+        : centeredTimestamp;
   }
 
   void _indexMessages() {
@@ -981,7 +992,7 @@ class _ChatAreaState extends State<ChatArea> {
       widget.messageNavigation?.visibleTimestamp = null;
       _messageRowCache.clear();
       _disposeRowExtents();
-      _messageAnchorsNotifier.value = const <int, ChatScrollMessageAnchor>{};
+      _navigatorTimestamp.value = null;
       _showNavigatorChipNotifier.value = false;
       _userScrollSessionActive = false;
       _userScrollDirection = ScrollDirection.idle;
@@ -1059,7 +1070,7 @@ class _ChatAreaState extends State<ChatArea> {
     _messageContributions.dispose();
     _navigatorHideTimer?.cancel();
     _viewportResizeTimer?.cancel();
-    _messageAnchorsNotifier.dispose();
+    _navigatorTimestamp.dispose();
     _viewportHeightNotifier.dispose();
     _showNavigatorChipNotifier.dispose();
     _chatBusyNotifier.dispose();

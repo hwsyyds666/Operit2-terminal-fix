@@ -1079,6 +1079,8 @@ pub struct GrepCodeResult {
     pub matches: Vec<GrepFileMatch>,
     pub totalMatches: usize,
     pub filesSearched: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skippedLongLines: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

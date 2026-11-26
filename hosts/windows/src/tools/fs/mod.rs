@@ -383,6 +383,7 @@ impl FileSystemHost for WindowsFileSystemHost {
             matches,
             totalMatches,
             filesSearched,
+            skippedLongLines: None,
         })
     }
 

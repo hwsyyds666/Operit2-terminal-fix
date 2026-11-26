@@ -150,7 +150,13 @@ def main() -> int:
         # Gradle project properties also arrive through ORG_GRADLE_PROJECT_*
         # environment variables, so the flutter CLI needs no extra flag.
         build_env = {"ORG_GRADLE_PROJECT_operitImpellerBackend": args.impeller_backend}
-    run(command, cwd=FLUTTER_APP_DIR, env=build_env)
+    plugin_assets_marker = FLUTTER_APP_DIR / ".dart_tool" / "operit_plugin_assets_prevalidated"
+    plugin_assets_marker.parent.mkdir(parents=True, exist_ok=True)
+    plugin_assets_marker.write_text("validated by build_flutter_android.py\n", encoding="utf-8")
+    try:
+        run(command, cwd=FLUTTER_APP_DIR, env=build_env)
+    finally:
+        plugin_assets_marker.unlink(missing_ok=True)
 
     apk_dir = FLUTTER_APP_DIR / "build" / "app" / "outputs" / "flutter-apk"
     apk_path = apk_dir / "app-arm64-v8a-release.apk"

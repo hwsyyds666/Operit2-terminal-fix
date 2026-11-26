@@ -67,6 +67,8 @@ class ChatScrollNavigator extends StatefulWidget {
     this.onLeft = false,
     this.reverse = false,
     this.loadPreview,
+    this.activeTimestamp,
+    this.locatorRevision,
     required this.messages,
     required this.currentChatId,
     required this.scrollController,
@@ -93,6 +95,8 @@ class ChatScrollNavigator extends StatefulWidget {
   final String? currentChatId;
   final ScrollController scrollController;
   final Map<int, ChatScrollMessageAnchor> messageAnchors;
+  final int? activeTimestamp;
+  final Listenable? locatorRevision;
   final double viewportHeight;
   final bool autoScrollToBottom;
   final bool hasNewerDisplayHistory;
@@ -121,6 +125,9 @@ class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
   int _locatorLoadGeneration = 0;
   Future<ChatUiMessage?>? _hoveredPreview;
   int? _hoveredTimestamp;
+  Timer? _indexRefreshTimer;
+  bool _indexLoading = false;
+  bool _indexRefreshPending = false;
 
   void _requestHoveredPreview(ChatMessageLocatorPreview entry) {
     if (_hoveredTimestamp == entry.timestamp) return;
@@ -137,6 +144,7 @@ class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
   void initState() {
     super.initState();
     widget.messageNavigation?.addListener(_onMessageNavigation);
+    widget.locatorRevision?.addListener(_scheduleIndexRefresh);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) _loadLocatorEntries();
     });
@@ -150,6 +158,11 @@ class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
       oldWidget.messageNavigation?.removeListener(_onMessageNavigation);
       widget.messageNavigation?.addListener(_onMessageNavigation);
     }
+    final locatorChanged = oldWidget.locatorRevision != widget.locatorRevision;
+    if (locatorChanged) {
+      oldWidget.locatorRevision?.removeListener(_scheduleIndexRefresh);
+      widget.locatorRevision?.addListener(_scheduleIndexRefresh);
+    }
     if (oldWidget.viewportHeight != widget.viewportHeight ||
         oldWidget.onLeft != widget.onLeft) {
       _hoveredEntryIndex = null;
@@ -161,16 +174,23 @@ class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
         oldWidget.messages.lastOrNull?.timestamp !=
             widget.messages.lastOrNull?.timestamp;
     final chatChanged = oldWidget.currentChatId != widget.currentChatId;
-    final needsIndexRefresh = messagesChanged
-        ? !_isIndexedWindowExpansion(oldWidget.messages)
-        : !identical(oldWidget.messages, widget.messages) &&
-              _favoritesChanged(oldWidget.messages, widget.messages);
-    if (chatChanged || needsIndexRefresh) {
+    final needsIndexRefresh =
+        widget.locatorRevision == null &&
+        (messagesChanged
+            ? !_isIndexedWindowExpansion(oldWidget.messages)
+            : !identical(oldWidget.messages, widget.messages) &&
+                  _favoritesChanged(oldWidget.messages, widget.messages));
+    if (chatChanged || locatorChanged || needsIndexRefresh) {
       _hoveredEntryIndex = null;
       if (chatChanged) {
         _hoveredTimestamp = null;
         _hoveredPreview = null;
         _replaceLocatorEntries(const []);
+      }
+      if (chatChanged || locatorChanged) {
+        _indexRefreshTimer?.cancel();
+        _indexLoading = false;
+        _indexRefreshPending = false;
       }
       _loadLocatorEntries();
     }
@@ -205,7 +225,7 @@ class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
     }
 
     final entries = _getEntries();
-    final activeTimestamp = _resolveActiveTimestamp();
+    final activeTimestamp = widget.activeTimestamp ?? _resolveActiveTimestamp();
     final geometry = entries.isEmpty
         ? null
         : ChatScrollRailGeometry(
@@ -421,11 +441,24 @@ class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
   @override
   void dispose() {
     widget.messageNavigation?.removeListener(_onMessageNavigation);
+    widget.locatorRevision?.removeListener(_scheduleIndexRefresh);
+    _indexRefreshTimer?.cancel();
     super.dispose();
+  }
+
+  void _scheduleIndexRefresh() {
+    _indexRefreshTimer?.cancel();
+    _indexRefreshTimer = Timer(const Duration(milliseconds: 250), () {
+      if (mounted) _loadLocatorEntries();
+    });
   }
 
   /// Reads the complete lightweight index and rejects responses from superseded chats.
   Future<void> _loadLocatorEntries() async {
+    if (_indexLoading) {
+      _indexRefreshPending = true;
+      return;
+    }
     final generation = ++_locatorLoadGeneration;
     final chatId = widget.currentChatId;
     if (chatId == null || chatId.trim().isEmpty) {
@@ -435,7 +468,8 @@ class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
       });
       return;
     }
-    setState(() => _locatorLoadFailed = false);
+    _indexLoading = true;
+    if (_locatorLoadFailed) setState(() => _locatorLoadFailed = false);
     try {
       final entries = await widget.loadLocatorEntries(chatId, '');
       if (!mounted || generation != _locatorLoadGeneration) return;
@@ -450,6 +484,14 @@ class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
         _hoveredEntryIndex = null;
         _locatorLoadFailed = true;
       });
+    } finally {
+      if (mounted && generation == _locatorLoadGeneration) {
+        _indexLoading = false;
+        if (_indexRefreshPending) {
+          _indexRefreshPending = false;
+          _scheduleIndexRefresh();
+        }
+      }
     }
   }
 }

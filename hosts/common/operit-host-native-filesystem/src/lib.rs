@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -5,7 +6,7 @@ use std::time::UNIX_EPOCH;
 
 use globset::GlobBuilder;
 use grep_regex::RegexMatcherBuilder;
-use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
+use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
 use ignore::WalkBuilder;
 use operit_host_contract::{
     FileEntry, FileExistence, FileInfo, FileSystemHost, FindFilesRequest, GrepCodeRequest,
@@ -422,41 +423,46 @@ impl FileSystemHost for PosixFileSystemHost {
             .build()
             .map_err(|error| HostError::new(format!("Invalid file pattern: {error}")))?
             .compile_matcher();
-        let mut searcher = SearcherBuilder::new()
+        let contextLines = request.contextLines.min(20);
+        let maximum = request.maxResults.min(1000);
+        let mut builder = SearcherBuilder::new();
+        builder
             .line_number(true)
             .binary_detection(BinaryDetection::quit(b'\x00'))
-            .max_matches(Some(request.maxResults as u64))
-            .build();
+            .before_context(contextLines)
+            .after_context(contextLines);
         let mut matches = Vec::new();
         let mut filesSearched = 0usize;
         let mut totalMatches = 0usize;
 
         for entry in WalkBuilder::new(&request.path).build() {
+            if totalMatches >= maximum {
+                break;
+            }
             let entry = entry.map_err(|error| HostError::new(format!("walk error: {error}")))?;
             let filePath = entry.path();
             if !filePath.is_file() || !fileMatcher.is_match(filePath) {
                 continue;
             }
             filesSearched += 1;
-            let mut sink = RipgrepGrepSink::new();
-            searcher
+            let mut sink = RipgrepGrepSink::default();
+            builder
+                .max_matches(Some((maximum - totalMatches) as u64))
+                .build()
                 .search_path(&matcher, filePath, &mut sink)
                 .map_err(HostError::from)?;
             if sink.lineMatches.is_empty() {
                 continue;
             }
-            let content = match fs::read_to_string(filePath) {
-                Ok(content) => content,
-                Err(_) => continue,
-            };
-            let lines = content.lines().collect::<Vec<_>>();
             let mut lineMatches = sink.lineMatches;
-            if request.contextLines > 0 {
+            if contextLines > 0 {
                 for lineMatch in &mut lineMatches {
-                    let lineIndex = lineMatch.lineNumber.saturating_sub(1);
-                    let start = lineIndex.saturating_sub(request.contextLines);
-                    let end = (lineIndex + request.contextLines + 1).min(lines.len());
-                    lineMatch.matchContext = Some(lines[start..end].join("\n"));
+                    let start = lineMatch.lineNumber.saturating_sub(contextLines);
+                    let end = lineMatch.lineNumber.saturating_add(contextLines);
+                    let lines = sink.lines.range(start..=end)
+                        .map(|(_, line)| line.clone())
+                        .collect::<Vec<_>>();
+                    lineMatch.matchContext = Some(lines.join("\n"));
                 }
             }
             totalMatches += lineMatches.len();
@@ -471,6 +477,7 @@ impl FileSystemHost for PosixFileSystemHost {
             matches,
             totalMatches,
             filesSearched,
+            skippedLongLines: None,
         })
     }
 
@@ -667,34 +674,92 @@ fn zip_file(
     Ok(())
 }
 
+#[derive(Default)]
 struct RipgrepGrepSink {
     lineMatches: Vec<GrepLineMatch>,
-}
-
-impl RipgrepGrepSink {
-    fn new() -> Self {
-        Self {
-            lineMatches: Vec::new(),
-        }
-    }
+    lines: BTreeMap<usize, String>,
 }
 
 impl Sink for RipgrepGrepSink {
     type Error = io::Error;
 
-    fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
+    fn matched(&mut self, searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
+        let lineNumber = mat.line_number().unwrap_or(0) as usize;
         let lineContent = bytes_to_search_line(mat.bytes());
+        if searcher.before_context() > 0 || searcher.after_context() > 0 {
+            self.lines.insert(lineNumber, lineContent.clone());
+        }
         self.lineMatches.push(GrepLineMatch {
-            lineNumber: mat.line_number().unwrap_or(0) as usize,
+            lineNumber,
             lineContent,
             matchContext: None,
         });
         Ok(true)
     }
+
+    fn context(&mut self, _: &Searcher, line: &SinkContext<'_>) -> Result<bool, Self::Error> {
+        let number = line.line_number().unwrap_or(0) as usize;
+        self.lines.insert(number, bytes_to_search_line(line.bytes()));
+        Ok(true)
+    }
 }
 
 fn bytes_to_search_line(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes)
+    const PREVIEW_BYTES: usize = 1024;
+    let truncated = bytes.len() > PREVIEW_BYTES;
+    let mut line = String::from_utf8_lossy(&bytes[..bytes.len().min(PREVIEW_BYTES)])
         .trim_end_matches(&['\r', '\n'][..])
-        .to_string()
+        .to_string();
+    if truncated {
+        line.push('…');
+    }
+    line
+}
+
+#[cfg(test)]
+mod grep_tests {
+    use super::*;
+
+    #[test]
+    fn searches_large_files_with_context_and_a_global_match_limit() {
+        let root = std::env::temp_dir().join(format!(
+            "operit-grep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("large.txt");
+        let mut file = File::create(&path).unwrap();
+        let page = format!("{}\n", "x".repeat(255)).repeat(1024);
+        for _ in 0..36 {
+            file.write_all(page.as_bytes()).unwrap();
+        }
+        file.write_all(b"before\nmatch\nafter\n").unwrap();
+        drop(file);
+        fs::write(root.join("sibling.txt"), "match\n").unwrap();
+        let host = PosixFileSystemHost::new();
+        let mut request = GrepCodeRequest {
+            path: path.to_string_lossy().into_owned(),
+            pattern: "match".into(),
+            filePattern: "*.txt".into(),
+            caseInsensitive: false,
+            contextLines: 1,
+            maxResults: 1,
+        };
+        let result = host.grepCode(request.clone()).unwrap();
+        let hit = &result.matches[0].lineMatches[0];
+        let number = 36 * 1024 + 2;
+        assert_eq!(hit.lineNumber, number);
+        assert_eq!(
+            hit.matchContext.as_deref(),
+            Some("before\nmatch\nafter"),
+        );
+        request.path = root.to_string_lossy().into_owned();
+        let result = host.grepCode(request).unwrap();
+        assert_eq!(result.totalMatches, 1);
+        assert_eq!(result.filesSearched, 1);
+        fs::remove_file(path).unwrap();
+        fs::remove_file(root.join("sibling.txt")).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
 }

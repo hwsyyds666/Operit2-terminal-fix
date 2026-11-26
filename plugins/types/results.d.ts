@@ -1797,6 +1797,7 @@ export interface GrepResultData {
   matches: GrepFileMatch[];
   totalMatches: number;
   filesSearched: number;
+  skippedLongLines?: number;
   /**
    * Formats search statistics and bounded, line-aware match context grouped by file.
    */

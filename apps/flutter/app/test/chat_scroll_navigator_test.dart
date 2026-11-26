@@ -917,6 +917,39 @@ void main() {
     expect(loads, 2);
   });
 
+  testWidgets('transcript paging and eviction reuse the locator index', (
+    tester,
+  ) async {
+    final messages = List<ChatMessage>.generate(1000, _message);
+    final revision = ValueNotifier(0);
+    final scroll = ScrollController();
+    addTearDown(revision.dispose);
+    addTearDown(scroll.dispose);
+    var loads = 0;
+    Future<void> render(int start) => _pumpNavigator(
+      tester,
+      messages: messages.sublist(start, start + 120),
+      locatorRevision: revision,
+      scrollController: scroll,
+      jumps: [],
+      loadLocatorEntries: (_, _) async {
+        loads++;
+        return messages.map((row) => _preview(row.timestamp)).toList();
+      },
+    );
+
+    await render(880);
+    for (var start = 860; start >= 700; start -= 20) {
+      await render(start);
+    }
+    expect(loads, 1);
+    revision.value++;
+    revision.value++;
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.pumpAndSettle();
+    expect(loads, 2);
+  });
+
   testWidgets('locator searches unloaded messages without changing the rail', (
     tester,
   ) async {
@@ -1166,6 +1199,7 @@ Future<void> _pumpNavigator(
   String chatId = 'rail-test',
   List<ChatMessage>? messages,
   LoadMessageLocatorEntries? loadLocatorEntries,
+  Listenable? locatorRevision,
   required List<int> jumps,
   VoidCallback? onTranscriptTap,
   PointerDownEventListener? onTranscriptPointerDown,
@@ -1237,6 +1271,7 @@ Future<void> _pumpNavigator(
                     currentChatId: chatId,
                     scrollController: scroll,
                     messageAnchors: messageAnchors,
+                    locatorRevision: locatorRevision,
                     viewportHeight: 500,
                     autoScrollToBottom: true,
                     hasNewerDisplayHistory: false,

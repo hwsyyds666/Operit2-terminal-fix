@@ -382,6 +382,7 @@ impl FileSystemHost for LinuxFileSystemHost {
             matches,
             totalMatches,
             filesSearched,
+            skippedLongLines: None,
         })
     }
 
